@@ -32,9 +32,16 @@ func (c *OpenAIChatClient) CallWithMessages(systemPrompt, userPrompt string) (st
     if c.MaxRetries < 0 { c.MaxRetries = 0 }
     maxRetries := c.MaxRetries
     if maxRetries == 0 { maxRetries = 2 }
+    // 规范化 BaseURL，避免用户把完整的 /chat/completions 也写进了配置导致重复路径
     url := c.BaseURL
     if url == "" {
         url = "https://api.openai.com/v1"
+    }
+    // 去掉尾部斜杠
+    url = strings.TrimRight(url, "/")
+    // 若已经包含 /chat/completions 则去掉，稍后统一追加一次
+    if strings.HasSuffix(url, "/chat/completions") {
+        url = strings.TrimSuffix(url, "/chat/completions")
     }
     url = url + "/chat/completions"
 

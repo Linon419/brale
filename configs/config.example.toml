@@ -23,6 +23,7 @@ periods = ["15m", "4h"]
 [ai]
 engine = "legacy"
 aggregation = "first-wins"
+log_each_model = false
 decision_interval_seconds = 60
 models = [
   # OpenAI compatible entries. Keep enabled=false and api_key empty in public config.
@@ -52,4 +53,3 @@ liquidity_filter_usd_m = 15
 min_risk_reward = 3.0
 open_cooldown_seconds = 180
 max_opens_per_cycle = 3
-

@@ -119,19 +119,20 @@ func main() {
 	case "weighted":
 		aggregator = ai.WeightedAggregator{Weights: map[string]float64{"deepseek": 1.0, "qwen": 1.0}}
 	}
-	engine := &ai.LegacyEngineAdapter{
-		Providers:      providers,
-		Agg:            aggregator,
-		PromptMgr:      pm,
-		SystemTemplate: cfg.Prompt.SystemTemplate,
-		KStore:         ks,
-		Intervals:      cfg.WS.Periods,
-		Parallel:       true,
-		Metrics:        brmarket.NewDefaultMetricsFetcher(""),
-		IncludeOI:      true,
-		IncludeFunding: true,
-		TimeoutSeconds: cfg.MCP.TimeoutSeconds,
-	}
+        engine := &ai.LegacyEngineAdapter{
+            Providers:      providers,
+            Agg:            aggregator,
+            PromptMgr:      pm,
+            SystemTemplate: cfg.Prompt.SystemTemplate,
+            KStore:         ks,
+            Intervals:      cfg.WS.Periods,
+            Parallel:       true,
+            LogEachModel:   cfg.AI.LogEachModel,
+            Metrics:        brmarket.NewDefaultMetricsFetcher(""),
+            IncludeOI:      true,
+            IncludeFunding: true,
+            TimeoutSeconds: cfg.MCP.TimeoutSeconds,
+        }
 
 	// Telegram 通知器（可选）
 	var tg *notify.Telegram

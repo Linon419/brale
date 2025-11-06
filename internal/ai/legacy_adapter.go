@@ -19,8 +19,8 @@ import (
 // 后续可替换为严格对接旧版 decision/engine.go（需要完整账户/持仓/指标上下文）。
 
 type LegacyEngineAdapter struct {
-	Providers []ModelProvider // 可配置多个模型
-	Agg       Aggregator      // 聚合策略（默认 first-wins）
+    Providers []ModelProvider // 可配置多个模型
+    Agg       Aggregator      // 聚合策略（默认 first-wins）
 
 	PromptMgr      *prompt.Manager // 提示词管理器
 	SystemTemplate string          // 使用的系统模板名
@@ -28,9 +28,12 @@ type LegacyEngineAdapter struct {
 	KStore    store.KlineStore // K线存储（用于构建 User 摘要）
 	Intervals []string         // 要在摘要中展示的周期
 
-	Name_ string
+    Name_ string
 
-	Parallel bool // 并行调用多个模型
+    Parallel bool // 并行调用多个模型
+
+    // 是否为每个模型分别输出思维链与JSON（便于对比调参）
+    LogEachModel bool
 
 	// 可选：补充 OI 与资金费率
 	Metrics interface {
@@ -112,18 +115,46 @@ func (e *LegacyEngineAdapter) Decide(ctx context.Context, input Context) (Decisi
 				outs = append(outs, callOne(ctx, p))
 			}
 		}
-	}
+    }
 
-	// 聚合选择一个有效输出
-	agg := e.Agg
-	if agg == nil {
-		agg = FirstWinsAggregator{}
-	}
-	best, err := agg.Aggregate(ctx, outs)
-	if err != nil {
-		return DecisionResult{}, err
-	}
-	return best.Parsed, nil
+    // 聚合选择一个有效输出
+    agg := e.Agg
+    if agg == nil {
+        agg = FirstWinsAggregator{}
+    }
+    // 可选：在聚合前输出每个模型的原始结果（思维链 + JSON）
+    if e.LogEachModel {
+        for _, o := range outs {
+            if o.Err != nil {
+                logger.Warnf("AI[%s] 调用失败: %v", o.ProviderID, o.Err)
+                continue
+            }
+            if o.Raw == "" {
+                logger.Warnf("AI[%s] 无输出", o.ProviderID)
+                continue
+            }
+            arr, start, ok := extractJSONArrayWithIndex(o.Raw)
+            if ok {
+                cot := strings.TrimSpace(o.Raw[:start])
+                if cot != "" {
+                    if len(cot) > 2000 { cot = cot[:2000] + "..." }
+                    logger.Infof("AI[%s] 思维链: %s", o.ProviderID, cot)
+                }
+                out := arr
+                if len(out) > 2000 { out = out[:2000] + "..." }
+                logger.Infof("AI[%s] 结果JSON: %s", o.ProviderID, out)
+            } else {
+                cot := o.Raw
+                if len(cot) > 2000 { cot = cot[:2000] + "..." }
+                logger.Infof("AI[%s] 原始输出: %s", o.ProviderID, cot)
+            }
+        }
+    }
+    best, err := agg.Aggregate(ctx, outs)
+    if err != nil {
+        return DecisionResult{}, err
+    }
+    return best.Parsed, nil
 }
 
 // loadSystem 从 PromptManager 读取系统模板
@@ -225,4 +256,25 @@ func extractJSONArrayCompat(s string) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+// extractJSONArrayWithIndex 提取首个 JSON 数组，并返回起始下标
+func extractJSONArrayWithIndex(s string) (string, int, bool) {
+    start := strings.Index(s, "[")
+    if start == -1 {
+        return "", -1, false
+    }
+    depth := 0
+    for i := start; i < len(s); i++ {
+        switch s[i] {
+        case '[':
+            depth++
+        case ']':
+            depth--
+            if depth == 0 {
+                return strings.TrimSpace(s[start : i+1]), start, true
+            }
+        }
+    }
+    return "", -1, false
 }
