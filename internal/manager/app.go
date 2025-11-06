@@ -257,6 +257,8 @@ func (a *App) Run(ctx context.Context) error {
 
 			newOpens := 0
 			for _, d := range res.Decisions {
+				// 记录入场价格（用于通知/展示）
+				entryPrice := 0.0
 				// 基础校验
 				if err := ai.Validate(&d); err != nil {
 					logger.Warnf("AI 决策不合规，已忽略: %v | %+v", err, d)
@@ -266,6 +268,7 @@ func (a *App) Run(ctx context.Context) error {
 				if validateIv != "" {
 					if kl, _ := a.ks.Get(ctx, d.Symbol, validateIv); len(kl) > 0 {
 						price := kl[len(kl)-1].Close
+						entryPrice = price
 						if err := ai.ValidateWithPrice(&d, price, a.cfg.Advanced.MinRiskReward); err != nil {
 							logger.Warnf("AI 决策RR校验失败，已忽略: %v | %+v", err, d)
 							continue
@@ -293,8 +296,39 @@ func (a *App) Run(ctx context.Context) error {
 					a.lastOpen[key] = time.Now()
 					newOpens++
 					if a.tg != nil {
-						msg := fmt.Sprintf("开仓信号\n币种: %s\n动作: %s\n杠杆: %dx\n仓位: %.0f USDT\n止损: %.4f\n止盈: %.4f\n信心: %d\n理由: %s",
-							d.Symbol, d.Action, d.Leverage, d.PositionSizeUSD, d.StopLoss, d.TakeProfit, d.Confidence, d.Reasoning)
+						// 可选的入场价与RR
+						rrStr := ""
+						rrVal := 0.0
+						if entryPrice > 0 {
+							var risk, reward float64
+							switch d.Action {
+							case "open_long":
+								risk = entryPrice - d.StopLoss
+								reward = d.TakeProfit - entryPrice
+							case "open_short":
+								risk = d.StopLoss - entryPrice
+								reward = entryPrice - d.TakeProfit
+							}
+							if risk > 0 && reward > 0 {
+								rrVal = reward / risk
+								rrStr = fmt.Sprintf("\n入场: %.4f\nRR: %.2f", entryPrice, rrVal)
+							} else {
+								rrStr = fmt.Sprintf("\n入场: %.4f", entryPrice)
+							}
+						}
+						// 控制台额外打印入场与RR
+						if entryPrice > 0 {
+							if rrVal > 0 {
+								logger.Infof("开仓详情: %s %s entry=%.4f RR=%.2f sl=%.4f tp=%.4f",
+									d.Symbol, d.Action, entryPrice, rrVal, d.StopLoss, d.TakeProfit)
+							} else {
+								logger.Infof("开仓详情: %s %s entry=%.4f sl=%.4f tp=%.4f",
+									d.Symbol, d.Action, entryPrice, d.StopLoss, d.TakeProfit)
+							}
+						}
+
+						msg := fmt.Sprintf("开仓信号\n币种: %s\n动作: %s%s\n杠杆: %dx\n仓位: %.0f USDT\n止损: %.4f\n止盈: %.4f\n信心: %d\n理由: %s",
+							d.Symbol, d.Action, rrStr, d.Leverage, d.PositionSizeUSD, d.StopLoss, d.TakeProfit, d.Confidence, d.Reasoning)
 						if err := a.tg.SendText(msg); err != nil {
 							logger.Warnf("Telegram 推送失败: %v", err)
 						}

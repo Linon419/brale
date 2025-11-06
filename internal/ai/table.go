@@ -144,7 +144,7 @@ func RenderFinalDecisionsTable(ds []Decision, width int) string {
     tw.Style().Options.SeparateRows = true
     tw.Style().Color.Header = text.Colors{text.FgHiCyan, text.Bold}
 
-    tw.AppendHeader(table.Row{"action", "symbol", "reasoning"})
+    tw.AppendHeader(table.Row{"action", "symbol", "sl", "tp", "reasoning"})
     for _, d := range ds {
         act := text.Colors{text.FgHiRed, text.Bold}.Sprint(d.Action)
         reason := d.Reasoning
@@ -152,13 +152,19 @@ func RenderFinalDecisionsTable(ds []Decision, width int) string {
         reason = TrimTo(reason, 7200)
         // 强制换行
         reason = forceWrap(reason, width)
-        tw.AppendRow(table.Row{act, d.Symbol, reason})
+        sl := ""
+        tp := ""
+        if d.StopLoss > 0 { sl = text.Colors{text.FgHiWhite}.Sprintf("%.4f", d.StopLoss) }
+        if d.TakeProfit > 0 { tp = text.Colors{text.FgHiWhite}.Sprintf("%.4f", d.TakeProfit) }
+        tw.AppendRow(table.Row{act, d.Symbol, sl, tp, reason})
     }
     if width <= 0 { width = 180 }
     tw.SetColumnConfigs([]table.ColumnConfig{
         {Number: 1, WidthMax: 16, Align: text.AlignLeft, VAlign: text.VAlignTop},
         {Number: 2, WidthMax: 18, Align: text.AlignLeft, VAlign: text.VAlignTop},
-        {Number: 3, WidthMax: width, Align: text.AlignLeft, VAlign: text.VAlignTop},
+        {Number: 3, WidthMax: 12, Align: text.AlignLeft, VAlign: text.VAlignTop},
+        {Number: 4, WidthMax: 12, Align: text.AlignLeft, VAlign: text.VAlignTop},
+        {Number: 5, WidthMax: width, Align: text.AlignLeft, VAlign: text.VAlignTop},
     })
     // 行整体标红（强调最终决策）
     tw.SetRowPainter(func(row table.Row) text.Colors { return text.Colors{text.FgHiRed} })
