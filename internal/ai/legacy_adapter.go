@@ -136,17 +136,20 @@ func (e *LegacyEngineAdapter) Decide(ctx context.Context, input Context) (Decisi
             arr, start, ok := ExtractJSONArrayWithIndex(o.Raw)
             if ok {
                 cot := strings.TrimSpace(o.Raw[:start])
-                if cot != "" {
-                    if len(cot) > 2000 { cot = cot[:2000] + "..." }
-                    logger.Infof("AI[%s] 思维链: %s", o.ProviderID, cot)
+                // 美化结果 JSON + 表格视图
+                pretty := PrettyJSON(arr)
+                table := ""
+                if ds, err := ParseDecisions(arr); err == nil {
+                    table = FormatDecisionsTable(ds)
                 }
-                out := arr
-                if len(out) > 2000 { out = out[:2000] + "..." }
-                logger.Infof("AI[%s] 结果JSON: %s", o.ProviderID, out)
+                // 适度裁剪，防止日志过长
+                cot = TrimTo(cot, 1200)
+                pretty = TrimTo(pretty, 1800)
+                if table != "" { table = TrimTo(table, 1200) }
+                logger.Infof("\n——— AI[%s] ———\n• 思维链:\n%s\n• 结果(JSON):\n%s\n• 表格:\n%s———————————", o.ProviderID, cot, pretty, table)
             } else {
-                cot := o.Raw
-                if len(cot) > 2000 { cot = cot[:2000] + "..." }
-                logger.Infof("AI[%s] 原始输出: %s", o.ProviderID, cot)
+                cot := TrimTo(o.Raw, 2000)
+                logger.Infof("\n——— AI[%s] ———\n• 原始输出:\n%s\n———————————", o.ProviderID, cot)
             }
         }
     }
