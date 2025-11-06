@@ -109,11 +109,25 @@ func (a MetaAggregator) Aggregate(ctx context.Context, outputs []ModelOutput) (M
             }
             if tie { finalA = "hold" }
             b.WriteString(fmt.Sprintf("%s → %s (权重%.2f)\n", s, finalA, bestW))
-            // 各模型选择与理由
+            // 各模型选择与理由（不再截断理由；换行缩进展示）
             for _, c := range details[s] {
+                b.WriteString(fmt.Sprintf("- %s[%.2f]: %s\n", c.ID, c.Weight, c.Action))
                 reason := strings.TrimSpace(c.Reason)
-                if len(reason) > 120 { reason = reason[:120] + "..." }
-                b.WriteString(fmt.Sprintf("- %s[%.2f]: %s | %s\n", c.ID, c.Weight, c.Action, reason))
+                if reason != "" {
+                    // 规范换行并缩进
+                    reason = strings.ReplaceAll(reason, "\r\n", "\n")
+                    reason = strings.ReplaceAll(reason, "\r", "\n")
+                    reason = strings.ReplaceAll(reason, "```", "'''")
+                    // 每行添加前缀缩进
+                    lines := strings.Split(reason, "\n")
+                    for i, ln := range lines {
+                        if i == 0 {
+                            b.WriteString("  reason: " + ln + "\n")
+                        } else {
+                            b.WriteString("           " + ln + "\n")
+                        }
+                    }
+                }
             }
         }
         summary = b.String()
@@ -122,4 +136,3 @@ func (a MetaAggregator) Aggregate(ctx context.Context, outputs []ModelOutput) (M
     res := DecisionResult{Decisions: decisions, MetaSummary: summary}
     return ModelOutput{ProviderID: "meta", Parsed: res}, nil
 }
-
