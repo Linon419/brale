@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <title>回测数据控制台</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <header>
+    <h1>回测数据控制台</h1>
+    <p>通过此面板发起 K 线拉取任务、查看进度并验证本地数据。</p>
+  </header>
+
+  <main>
+    <section>
+      <h2>发起 K 线拉取</h2>
+      <form id="fetchForm">
+        <div class="row">
+          <label>交易所</label>
+          <input type="text" id="exchange" placeholder="默认为配置中的 default_exchange" />
+        </div>
+        <div class="row">
+          <label>交易对 *</label>
+          <input type="text" id="symbol" placeholder="如 BTCUSDT" required />
+        </div>
+        <div class="row">
+          <label>周期 *</label>
+          <select id="timeframe" required></select>
+        </div>
+        <div class="row">
+          <label>起始时间 *</label>
+          <input type="datetime-local" id="start" required />
+        </div>
+        <div class="row">
+          <label>结束时间 *</label>
+          <input type="datetime-local" id="end" required />
+        </div>
+        <button type="submit">提交拉取</button>
+      </form>
+      <div id="fetchMessage" class="message"></div>
+    </section>
+
+    <section>
+      <div class="section-head">
+        <h2>任务进度</h2>
+        <button id="refreshJobs">刷新</button>
+      </div>
+      <div class="table-wrapper">
+        <table>
+          <thead>
+            <tr>
+              <th>ID</th>
+              <th>交易对/周期</th>
+              <th>区间</th>
+              <th>状态</th>
+              <th>进度</th>
+              <th>更新时间</th>
+            </tr>
+          </thead>
+          <tbody id="jobsBody">
+            <tr><td colspan="6" class="muted">暂无任务</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section>
+      <h2>本地 K 线数据</h2>
+      <form id="candlesForm">
+        <div class="row">
+          <label>交易对 *</label>
+          <input type="text" id="dataSymbol" required />
+        </div>
+        <div class="row">
+          <label>周期 *</label>
+          <select id="dataTimeframe" required></select>
+        </div>
+        <button type="submit">加载全部本地数据</button>
+      </form>
+      <div id="manifestInfo" class="muted"></div>
+      <div class="table-wrapper">
+        <table>
+          <thead>
+            <tr>
+              <th>Open Time</th>
+              <th>Close</th>
+              <th>High</th>
+              <th>Low</th>
+              <th>Volume</th>
+              <th>Trades</th>
+            </tr>
+          </thead>
+          <tbody id="candlesBody">
+            <tr><td colspan="6" class="muted">等待查询</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <small>回测服务端口：9991 · API 前缀 /api/backtest</small>
+  </footer>
+
+  <script src="/static/app.js" defer></script>
+</body>
+</html>
