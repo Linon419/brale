@@ -1,35 +1,51 @@
 # Example config for GitHub (no secrets). Copy to configs/config.toml for local use.
 
 [app]
+# env：运行环境名（仅用于日志/通知提示，可自定义）
 env = "dev"
+# log_level：日志粒度，debug|info|warn|error
 log_level = "info"
 
 [exchange]
+# name：交易所名称（展示用）
 name = "binance-futures"
+# ws_batch_size：WS 合并订阅批大小，过大可能被限流
 ws_batch_size = 150
 
 [symbols]
+# provider：default 读取 default_list；http 时从 REST 服务取数
 provider = "default"
+# default_list：预设币种，provider=default 时生效
 default_list = ["BTCUSDT", "ETHUSDT"]
+# api_url：provider=http 生效，需返回数组或 {"symbols": []}
 # api_url = "http://your-service/symbols" # when provider=http
 
 [kline]
-# 若留空将自动根据 active horizon 推导
+# periods：REST 预热所需的周期；空则跟随 active_horizon
 periods = []
+# max_cached：每个 symbol × period 缓存的最大 K 线数
 max_cached = 100
 
 [ws]
-# 若留空将自动根据 active horizon 推导
+# periods：WS 实时订阅周期；空则自动推导
 periods = []
 
 [ai]
+# aggregation：模型聚合策略，可选 first-wins | meta
 aggregation = "first-wins" # 可选："meta"（多模型加权多数决）
+# log_each_model：调试模式，打印每个模型的完整请求与响应
 log_each_model = false
+# decision_interval_seconds：AI 决策之间的间隔（秒）
 decision_interval_seconds = 60
+# active_horizon：选择一个 holding_horizon_profiles 下的配置
 active_horizon = "one_hour"
+# include_last_decision：是否把上一轮决策内容传给下一轮模型
 include_last_decision = true
+# last_decision_max_age_seconds：上一轮决策的最大保留时长
 last_decision_max_age_seconds = 3600
+# decision_log_path：实时决策日志的存储位置（SQLite），留空禁用
 decision_log_path = "data/live/decisions.db"
+# models：在此列出所有可能调用的模型，采用 OpenAI 兼容协议
 models = [
   # OpenAI compatible entries. Keep enabled=false and api_key empty in public config.
   { id = "openai",  provider = "openai",  enabled = false, api_url = "https://api.openai.com/v1", api_key = "", model = "gpt-4o-mini" },
@@ -37,45 +53,53 @@ models = [
   { id = "vanchin", provider = "openai",  enabled = false, api_url = "https://vanchin.streamlake.ai/api/gateway/v1/endpoints", api_key = "", model = "YOUR_MODEL_ID" }
 ]
 
-# 可选：当 aggregation = "meta" 时，按 Provider ID 配置权重（缺省均为 1.0）。
-# 提示：id 来自 models[] 的 id；若未设置，程序会自动生成如 "openai:gpt-4o-mini"。
-weights = {}
+# weights：Meta 聚合专用，为每个模型 id 设置权重；未配置的默认 1.0
+weights = { openai = 1.0, deepseek = 1.0, qwen = 1.0, vanchin = 1.0 }
 
 [ai.holding_horizon_profiles.one_hour]
+# entry_timeframes/confirm/background：定义入场、确认、背景所用的周期集合
 entry_timeframes = ["5m", "15m"]
 confirm_timeframes = ["1h"]
 background_timeframes = ["4h"]
 [ai.holding_horizon_profiles.one_hour.indicators.ema]
+# fast/mid/slow：EMA 周期（单位：K 线数）
 fast = 21
 mid = 50
 slow = 200
 [ai.holding_horizon_profiles.one_hour.indicators.rsi]
+# period/over*：RSI 窗口与上下阈值
 period = 14
 oversold = 33
 overbought = 68
 
 [ai.holding_horizon_profiles.four_hour]
+# 周期配置与指标含义与 one_hour 相同，仅针对更长持仓
 entry_timeframes = ["15m", "30m"]
 confirm_timeframes = ["4h"]
 background_timeframes = ["1d"]
 [ai.holding_horizon_profiles.four_hour.indicators.ema]
+# fast/mid/slow：EMA 周期
 fast = 21
 mid = 50
 slow = 200
 [ai.holding_horizon_profiles.four_hour.indicators.rsi]
+# RSI 参数
 period = 14
 oversold = 30
 overbought = 70
 
 [ai.holding_horizon_profiles.one_day]
+# 日线级别策略配置
 entry_timeframes = ["1h"]
 confirm_timeframes = ["4h", "1d"]
 background_timeframes = ["1w"]
 [ai.holding_horizon_profiles.one_day.indicators.ema]
+# EMA 周期
 fast = 21
 mid = 50
 slow = 200
 [ai.holding_horizon_profiles.one_day.indicators.rsi]
+# RSI 参数
 period = 14
 oversold = 35
 overbought = 65
@@ -85,28 +109,44 @@ overbought = 65
 #   headers = { "X-API-Key" = "<set-locally>" } }
 
 [mcp]
+# timeout_seconds：单次模型推理最长等待时间（秒）
 timeout_seconds = 120
 
 [prompt]
+# dir：提示词模板目录，建议只读
 dir = "prompts"
+# system_template：默认系统提示模板名（不含 .txt）
 system_template = "default"
 
 [backtest]
+# enabled：是否启用回测子系统
 enabled = false
+# data_dir：回测数据存储路径
 data_dir = "data/backtest"
+# http_addr：回测 HTTP 服务监听端口
 http_addr = ":9991"
+# default_exchange：默认回测交易所
 default_exchange = "binance"
+# rate_limit_per_min：下载行情时的速率限制
 rate_limit_per_min = 600
+# max_batch：单次下载最大条数
 max_batch = 1000
+# max_concurrent：允许的回测并发任务数
 max_concurrent = 2
 
 [notify.telegram]
+# enabled：是否启用 Telegram 推送
 enabled = false
+# bot_token/chat_id：请在本地填写真实值
 bot_token = ""  # set locally
 chat_id = ""    # set locally
 
 [advanced]
+# liquidity_filter_usd_m：按 OI×价格估算的最低流动性（百万 USD）
 liquidity_filter_usd_m = 15
+# min_risk_reward：允许的最小风险回报比
 min_risk_reward = 3.0
+# open_cooldown_seconds：同一币种同方向的最小开仓间隔（秒）
 open_cooldown_seconds = 180
+# max_opens_per_cycle：每个决策周期可新开的最大仓位数
 max_opens_per_cycle = 3
