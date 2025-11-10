@@ -32,7 +32,7 @@ periods = []
 
 [ai]
 # aggregation：模型聚合策略，可选 first-wins | meta
-aggregation = "first-wins" # 可选："meta"（多模型加权多数决）
+aggregation = "meta" # 可选："meta"（多模型加权多数决）
 # log_each_model：调试模式，打印每个模型的完整请求与响应
 log_each_model = false
 # decision_interval_seconds：AI 决策之间的间隔（秒）
@@ -47,10 +47,15 @@ last_decision_max_age_seconds = 3600
 decision_log_path = "data/live/decisions.db"
 # models：在此列出所有可能调用的模型，采用 OpenAI 兼容协议
 models = [
-  # OpenAI compatible entries. Keep enabled=false and api_key empty in public config.
-  { id = "openai",  provider = "openai",  enabled = false, api_url = "https://api.openai.com/v1", api_key = "", model = "gpt-4o-mini" },
-  # Example: vanchin.streamlake (OpenAI-compatible). Fill api_key/model locally and set enabled=true.
-  { id = "vanchin", provider = "openai",  enabled = false, api_url = "https://vanchin.streamlake.ai/api/gateway/v1/endpoints", api_key = "", model = "YOUR_MODEL_ID" }
+  # 直接在此处配置 OpenAI / DeepSeek / Qwen 的 API URL、Key 与模型名
+  # id：自定义标识；provider：openai|deepseek|qwen（皆按 OpenAI 兼容接口调用）
+  # api_url：OpenAI 兼容 BaseURL；api_key：密钥；model：模型名
+  { id = "openai",   provider = "openai",   enabled = true, api_url = "", api_key = "", model = "gpt-oss-20b" },
+  { id = "deepseek", provider = "deepseek", enabled = true, api_url = "",  api_key = "sc10f2cd660c09a4c2", model = "deepseek/deepseek-v3.2-exp" },
+  { id = "qwen",     provider = "qwen",     enabled = true, api_url = "ht", api_key = "s02c027494", model = "qwen3-next-80b-a3b-thinking" },
+  { id = "kimi",     provider = "kimi",     enabled = false, api_url = "https://v1", api_key = "sf77bee2a171e4", model = "moonshotai/kimi-k2-thinking" },
+  { id = "vanchin",  provider = "openai",   enabled = true,  api_url = "hmlake.andpoints",api_key = "", model = "ep-z5gybo-1762362617887467865" },
+  { id = "doubao",  provider = "doubao",   enabled = true,  api_url = "https://1",api_key = "e2a171e4", model = "doubao-seed-1.6-flash" }
 ]
 
 # weights：Meta 聚合专用，为每个模型 id 设置权重；未配置的默认 1.0
