@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"brale/internal/decision"
 	"brale/internal/gateway/provider"
@@ -25,7 +26,7 @@ func (f *AIProxyFactory) NewStrategy(spec StrategySpec) (Strategy, error) {
 	if f == nil {
 		return nil, fmt.Errorf("空策略工厂")
 	}
-	providers := provider.BuildProvidersFromConfig(f.Models)
+	providers := provider.BuildProvidersFromConfig(f.Models, time.Duration(f.TimeoutSeconds)*time.Second)
 	if len(providers) == 0 {
 		return nil, fmt.Errorf("未启用任何模型 Provider")
 	}

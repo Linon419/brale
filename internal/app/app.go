@@ -93,7 +93,7 @@ func NewApp(cfg *brcfg.Config) (*App, error) {
 	for _, m := range cfg.AI.Models {
 		modelCfgs = append(modelCfgs, provider.ModelCfg{ID: m.ID, Provider: m.Provider, Enabled: m.Enabled, APIURL: m.APIURL, APIKey: m.APIKey, Model: m.Model, Headers: m.Headers})
 	}
-	providers := provider.BuildProvidersFromConfig(modelCfgs)
+	providers := provider.BuildProvidersFromConfig(modelCfgs, time.Duration(cfg.MCP.TimeoutSeconds)*time.Second)
 	if len(providers) == 0 {
 		logger.Warnf("未启用任何 AI 模型（请检查 ai.models 配置）")
 	} else {
