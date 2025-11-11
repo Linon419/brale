@@ -12,6 +12,7 @@ import (
 	"brale/internal/coins"
 	brcfg "brale/internal/config"
 	"brale/internal/decision"
+	"brale/internal/gateway"
 	"brale/internal/gateway/database"
 	"brale/internal/gateway/notifier"
 	"brale/internal/gateway/provider"
@@ -77,12 +78,22 @@ func NewApp(cfg *brcfg.Config) (*App, error) {
 	}
 
 	// 存储与 WS 更新器
+	src, err := gateway.NewSourceFromConfig(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("初始化行情源失败: %w", err)
+	}
+	defer func() {
+		if err != nil && src != nil {
+			_ = src.Close()
+		}
+	}()
+
 	ks := store.NewMemoryKlineStore()
-	updater := brmarket.NewWSUpdater(ks, cfg.Kline.MaxCached)
+	updater := brmarket.NewWSUpdater(ks, cfg.Kline.MaxCached, src)
 
 	// 预热
 	lookbacks := horizon.LookbackMap(20)
-	preheater := brmarket.NewPreheater(ks, cfg.Kline.MaxCached)
+	preheater := brmarket.NewPreheater(ks, cfg.Kline.MaxCached, src)
 	preheater.Warmup(ctx, syms, lookbacks)
 	preheater.Preheat(ctx, syms, hIntervals, cfg.Kline.MaxCached)
 	logger.Infof("✓ Warmup 完成，最小条数=%v", lookbacks)

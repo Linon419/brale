@@ -30,6 +30,17 @@ max_cached = 100
 # periods：WS 实时订阅周期；空则自动推导
 periods = []
 
+[market]
+active_source = "binance"
+
+[[market.sources]]
+  name = "binance"
+  enabled = true
+  rest_base_url = "https://fapi.binance.com"
+  ws_base_url = "wss://fstream.binance.com/stream"
+  rate_limit_per_min = 1200
+  ws_batch_size = 150
+
 [ai]
 # aggregation：模型聚合策略，可选 first-wins | meta
 aggregation = "meta" # 可选："meta"（多模型加权多数决）

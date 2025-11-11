@@ -70,8 +70,8 @@ func RenderThoughtsTable(rows []ThoughtRow, width int) string {
         wrapW := width - 26
         if wrapW < 60 { wrapW = 60 }
         // 经验：限制为约 8 行的字符量，先截断再换行
-        maxChars := wrapW * 8
-        content = TrimTo(content, maxChars)
+        // maxChars := wrapW * 8
+        // content = TrimTo(content, maxChars)
         content = forceWrap(content, wrapW)
         tw.AppendRow(table.Row{aiCell, content})
     }
@@ -149,7 +149,7 @@ func RenderFinalDecisionsTable(ds []Decision, width int) string {
         act := text.Colors{text.FgHiRed, text.Bold}.Sprint(d.Action)
         reason := d.Reasoning
         // 尽量不裁剪，但仍设置较大上限
-        reason = TrimTo(reason, 7200)
+        // reason = TrimTo(reason, 7200)
         // 强制换行
         reason = forceWrap(reason, width)
         sl := ""

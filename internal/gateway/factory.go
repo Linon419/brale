@@ -1,0 +1,30 @@
+package gateway
+
+import (
+	"fmt"
+	"strings"
+
+	brcfg "brale/internal/config"
+	"brale/internal/gateway/binance"
+	"brale/internal/market"
+)
+
+// NewSourceFromConfig 根据配置创建市场数据源。
+func NewSourceFromConfig(cfg *brcfg.Config) (market.Source, error) {
+	if cfg == nil {
+		return nil, fmt.Errorf("nil config")
+	}
+	active := cfg.Market.ResolveActiveSource()
+	name := strings.ToLower(active.Name)
+	switch name {
+	case "", "binance", "binance-futures":
+		return binance.New(binance.Config{
+			RESTBaseURL:     active.RESTBaseURL,
+			WSBaseURL:       active.WSBaseURL,
+			RateLimitPerMin: active.RateLimitPerMin,
+			WSBatchSize:     active.WSBatchSize,
+		})
+	default:
+		return nil, fmt.Errorf("unsupported market source: %s", active.Name)
+	}
+}

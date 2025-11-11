@@ -37,6 +37,8 @@ type Config struct {
 		Periods []string `toml:"periods"`
 	} `toml:"ws"`
 
+	Market MarketConfig `toml:"market"`
+
 	AI struct {
 		Aggregation             string                    `toml:"aggregation"`
 		LogEachModel            bool                      `toml:"log_each_model"`
@@ -104,6 +106,20 @@ type TradingConfig struct {
 	DefaultLeverage    int     `toml:"default_leverage"`     // 缺省杠杆
 }
 
+type MarketConfig struct {
+	ActiveSource string         `toml:"active_source"`
+	Sources      []MarketSource `toml:"sources"`
+}
+
+type MarketSource struct {
+	Name            string `toml:"name"`
+	Enabled         bool   `toml:"enabled"`
+	RESTBaseURL     string `toml:"rest_base_url"`
+	WSBaseURL       string `toml:"ws_base_url"`
+	RateLimitPerMin int    `toml:"rate_limit_per_min"`
+	WSBatchSize     int    `toml:"ws_batch_size"`
+}
+
 // HorizonProfile 描述特定持仓周期所需的时间段与指标参数。
 type HorizonProfile struct {
 	EntryTimeframes      []string          `toml:"entry_timeframes"`
@@ -150,6 +166,33 @@ type RSIConfig struct {
 	Period     int     `toml:"period"`
 	Oversold   float64 `toml:"oversold"`
 	Overbought float64 `toml:"overbought"`
+}
+
+func (m MarketConfig) ResolveActiveSource() MarketSource {
+	if len(m.Sources) == 0 {
+		return MarketSource{
+			Name:            "binance",
+			Enabled:         true,
+			RESTBaseURL:     "https://fapi.binance.com",
+			WSBaseURL:       "wss://fstream.binance.com/stream",
+			RateLimitPerMin: 1200,
+			WSBatchSize:     150,
+		}
+	}
+	active := strings.ToLower(strings.TrimSpace(m.ActiveSource))
+	var fallback MarketSource
+	for _, src := range m.Sources {
+		if fallback.Name == "" {
+			fallback = src
+		}
+		if !src.Enabled {
+			continue
+		}
+		if active == "" || strings.ToLower(src.Name) == active {
+			return src
+		}
+	}
+	return fallback
 }
 
 // PositionSizeUSD 返回默认仓位大小（若设置 default_position_usd 则直接返回，
@@ -231,6 +274,19 @@ func normalizeHorizonProfile(p HorizonProfile) HorizonProfile {
 		p.Indicators.RSI.Overbought = 70
 	}
 	return p
+}
+
+func firstEnabledMarket(sources []MarketSource) string {
+	for _, src := range sources {
+		name := strings.TrimSpace(src.Name)
+		if src.Enabled && name != "" {
+			return name
+		}
+	}
+	if len(sources) > 0 && sources[0].Name != "" {
+		return sources[0].Name
+	}
+	return "binance"
 }
 
 func defaultHorizonProfiles() map[string]HorizonProfile {
@@ -343,6 +399,40 @@ func applyDefaults(c *Config) {
 	if len(c.WS.Periods) == 0 {
 		c.WS.Periods = append([]string(nil), derivedIntervals...)
 	}
+	if len(c.Market.Sources) == 0 {
+		c.Market.Sources = []MarketSource{{
+			Name:            "binance",
+			Enabled:         true,
+			RESTBaseURL:     "https://fapi.binance.com",
+			WSBaseURL:       "wss://fstream.binance.com/stream",
+			RateLimitPerMin: 1200,
+			WSBatchSize:     c.Exchange.WSBatchSize,
+		}}
+	}
+	for i := range c.Market.Sources {
+		src := &c.Market.Sources[i]
+		if src.RESTBaseURL == "" {
+			src.RESTBaseURL = "https://fapi.binance.com"
+		}
+		if src.WSBaseURL == "" {
+			src.WSBaseURL = "wss://fstream.binance.com/stream"
+		}
+		if src.RateLimitPerMin <= 0 {
+			src.RateLimitPerMin = 1200
+		}
+		if src.WSBatchSize <= 0 {
+			src.WSBatchSize = c.Exchange.WSBatchSize
+		}
+		if src.WSBatchSize <= 0 {
+			src.WSBatchSize = 150
+		}
+		if src.Name == "" {
+			src.Name = fmt.Sprintf("market_%d", i)
+		}
+	}
+	if c.Market.ActiveSource == "" {
+		c.Market.ActiveSource = firstEnabledMarket(c.Market.Sources)
+	}
 	if c.AI.DecisionLogPath == "" {
 		c.AI.DecisionLogPath = filepath.Join("data", "live", "decisions.db")
 	}
@@ -441,6 +531,31 @@ func validate(c *Config) error {
 		if !isValidInterval(p) {
 			return fmt.Errorf("非法 ws 周期: %s", p)
 		}
+	}
+	if len(c.Market.Sources) == 0 {
+		return fmt.Errorf("market.sources 至少需要一个数据源")
+	}
+	activeName := strings.ToLower(strings.TrimSpace(c.Market.ActiveSource))
+	enabled := 0
+	activeFound := false
+	for _, src := range c.Market.Sources {
+		if !src.Enabled {
+			continue
+		}
+		enabled++
+		if strings.TrimSpace(src.RESTBaseURL) == "" || strings.TrimSpace(src.WSBaseURL) == "" {
+			return fmt.Errorf("market source %s 需配置 rest_base_url 与 ws_base_url", src.Name)
+		}
+		name := strings.ToLower(strings.TrimSpace(src.Name))
+		if activeName == "" || name == activeName {
+			activeFound = true
+		}
+	}
+	if enabled == 0 {
+		return fmt.Errorf("market.sources 至少启用一个数据源")
+	}
+	if !activeFound {
+		return fmt.Errorf("未找到启用的 market.active_source=%s", c.Market.ActiveSource)
 	}
 	if c.Notify.Telegram.Enabled {
 		if c.Notify.Telegram.BotToken == "" || c.Notify.Telegram.ChatID == "" {

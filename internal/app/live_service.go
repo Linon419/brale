@@ -72,7 +72,18 @@ func (s *LiveService) Run(ctx context.Context) error {
 		}
 		_ = s.tg.SendText(msg)
 	}
-	go s.updater.StartRealWS(s.symbols, s.hIntervals, cfg.Exchange.WSBatchSize)
+	batchSize := cfg.Market.ResolveActiveSource().WSBatchSize
+	if batchSize <= 0 {
+		batchSize = cfg.Exchange.WSBatchSize
+	}
+	if batchSize <= 0 {
+		batchSize = 150
+	}
+	go func() {
+		if err := s.updater.Start(ctx, s.symbols, s.hIntervals, batchSize); err != nil {
+			logger.Errorf("启动行情订阅失败: %v", err)
+		}
+	}()
 
 	decisionInterval := time.Duration(cfg.AI.DecisionIntervalSeconds) * time.Second
 	if decisionInterval <= 0 {
@@ -110,12 +121,12 @@ func (s *LiveService) Run(ctx context.Context) error {
 				}
 			}
 		case <-statsTicker.C:
-			if s.updater != nil && s.updater.Client != nil {
-				r, se, last := s.updater.Client.Stats()
-				if last != "" {
-					logger.Errorf("WS统计: 最后错误=%s", last)
+			if s.updater != nil {
+				stats := s.updater.Stats()
+				if stats.LastError != "" {
+					logger.Errorf("WS统计: 最后错误=%s", stats.LastError)
 				}
-				logger.Debugf("ws 统计:重连 = %v,订阅错误=%v", r, se)
+				logger.Debugf("ws 统计:重连 = %v,订阅错误=%v", stats.Reconnects, stats.SubscribeErrors)
 			}
 		case <-decisionTicker.C:
 			if err := s.tickDecision(ctx); err != nil {
@@ -129,6 +140,9 @@ func (s *LiveService) Run(ctx context.Context) error {
 func (s *LiveService) Close() {
 	if s == nil {
 		return
+	}
+	if s.updater != nil {
+		s.updater.Close()
 	}
 	if s.decLogs != nil {
 		_ = s.decLogs.Close()
@@ -154,19 +168,19 @@ func (s *LiveService) tickDecision(ctx context.Context) error {
 		return nil
 	}
 	if res.RawOutput != "" {
-		arr, start, ok := decision.ExtractJSONArrayWithIndex(res.RawOutput)
+		_, start, ok := decision.ExtractJSONArrayWithIndex(res.RawOutput)
 		if ok {
 			cot := strings.TrimSpace(res.RawOutput[:start])
-			pretty := decision.PrettyJSON(arr)
-			cot = decision.TrimTo(cot, 2400)
-			pretty = decision.TrimTo(pretty, 3600)
+			// pretty := decision.PrettyJSON(arr)
+			cot = decision.TrimTo(cot, 4800)
+			// pretty = decision.TrimTo(pretty, 3600)
 			t1 := decision.RenderBlockTable("AI[final] 思维链", cot)
-			t2 := decision.RenderBlockTable("AI[final] 结果(JSON)", pretty)
-			logger.Infof("\n%s\n%s", t1, t2)
+			// t2 := decision.RenderBlockTable("AI[final] 结果(JSON)", pretty)
+			logger.Infof("\n%s", t1)
 		} else {
 			t1 := decision.RenderBlockTable("AI[final] 思维链", "失败")
-			t2 := decision.RenderBlockTable("AI[final] 结果(JSON)", "失败")
-			logger.Infof("\n%s\n%s", t1, t2)
+			// t2 := decision.RenderBlockTable("AI[final] 结果(JSON)", "失败")
+			logger.Infof("\n%s", t1)
 		}
 	}
 	if s.tg != nil && cfg.AI.Aggregation == "meta" && strings.TrimSpace(res.MetaSummary) != "" {

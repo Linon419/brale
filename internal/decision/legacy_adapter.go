@@ -283,17 +283,17 @@ func (e *LegacyEngineAdapter) buildUserSummary(ctx context.Context, input Contex
 			}
 			fullPrev = append(fullPrev, m.Decisions...)
 		}
-		if raw := strings.TrimSpace(input.LastRawJSON); raw != "" {
-			b.WriteString("\n```json\n")
-			b.WriteString(PrettyJSON(raw))
-			b.WriteString("\n```\n")
-		} else if len(fullPrev) > 0 {
-			if rawJSON, err := json.MarshalIndent(fullPrev, "", "  "); err == nil {
-				b.WriteString("\n```json\n")
-				b.Write(rawJSON)
-				b.WriteString("\n```\n")
-			}
-		}
+		// if raw := strings.TrimSpace(input.LastRawJSON); raw != "" {
+		// 	b.WriteString("\n```json\n")
+		// 	b.WriteString(PrettyJSON(raw))
+		// 	b.WriteString("\n```\n")
+		// } else if len(fullPrev) > 0 {
+		// 	if rawJSON, err := json.MarshalIndent(fullPrev, "", "  "); err == nil {
+		// 		b.WriteString("\n```json\n")
+		// 		b.Write(rawJSON)
+		// 		b.WriteString("\n```\n")
+		// 	}
+		// }
 		b.WriteString("请结合上一轮思路评估是否需要延续/调整。\n")
 	}
 
@@ -438,9 +438,18 @@ func (e *LegacyEngineAdapter) buildUserSummary(ctx context.Context, input Contex
 		}
 		b.WriteString("请结合上述仓位判断是否需要平仓、加仓或调整计划。\n")
 	}
+	req := `请先输出简短的【思维链】（1句，说明判断依据与结论），换行后仅输出 JSON 数组。
+数组中每项需含：symbol、action、reasoning。
+reasoning中当多空信号差距在20以上时，需要包含bull_score，bear_score，resistance_upper，resistance_lower
+如已有仓位且需要部分止盈/减仓，添加 close_ratio（0-1），无仓位时勿返回。
+若 action 为 open_long 或 open_short，必须返回 take_profit、stop_loss（绝对价，浮点）及 leverage（2–50，依信号强度）。
+若 action 为 adjust_stop_loss，必须返回新 stop_loss。
+示例:
+思维链: 4h 供需不明、15m 无形态。
+[{"symbol":"BTCUSDT","action":"hold","reasoning":"多空信号不足"}]
+`
+	b.WriteString(req)
 
-	b.WriteString("\n请先输出一段简短的【思维链】（最多3句，说明判断依据与步骤），然后换行仅输出 JSON 数组作为最终结果；数组中每项必须包含 symbol、action，并附带简短的 reasoning 字段。仅当已有对应方向仓位且需要部分减仓/止盈时，才在 JSON 中提供 close_ratio（0-1，表示释放仓位比例）或 position_size_usd；无仓位时不要返回 close_ratio。当 action 为 open_long/open_short 时，务必返回 take_profit 与 stop_loss 字段（使用绝对价格，浮点数）,leverage字段(根据信号强度判断2到50之间)。当 action 为 adjust_stop_loss 时，必须返回新的 stop_loss 价格，否则视为无效。\n")
-	b.WriteString("示例:\n思维链: 4h 供需区不明确，15m 未出现有效形态，MACD 未确认，bull_score 与 bear_score分数均不满足。\n[ {\"symbol\":\"BTCUSDT\",\"action\":\"hold\",\"reasoning\":\"bull_score 与 bear_score分数均不满足\"} ]\n")
 	return b.String()
 }
 
