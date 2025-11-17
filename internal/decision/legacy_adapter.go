@@ -13,7 +13,15 @@ import (
 	"brale/internal/logger"
 	"brale/internal/market"
 	"brale/internal/strategy"
+
+	"github.com/google/uuid"
+	"golang.org/x/sync/errgroup"
 )
+
+// TextNotifier 定义最小化的通知接口，便于注入 Telegram 等实现。
+type TextNotifier interface {
+	SendText(text string) error
+}
 
 // 中文说明：
 // LegacyEngineAdapter：沿用“旧版思路”的提示词结构（System 模板 + User 数据摘要），
@@ -21,9 +29,10 @@ import (
 // 后续可替换为严格对接旧版 decision/engine.go（需要完整账户/持仓/指标上下文）。
 
 type LegacyEngineAdapter struct {
-	Providers []provider.ModelProvider
-	Agg       Aggregator
-	Observer  DecisionObserver
+	Providers     []provider.ModelProvider
+	Agg           Aggregator
+	Observer      DecisionObserver
+	AgentNotifier TextNotifier
 
 	PromptMgr      *strategy.Manager // 提示词管理器
 	SystemTemplate string            // 使用的系统模板名
@@ -32,6 +41,7 @@ type LegacyEngineAdapter struct {
 	Intervals   []string          // 要在摘要中展示的周期
 	Horizon     brcfg.HorizonProfile
 	HorizonName string
+	MultiAgent  brcfg.MultiAgentConfig
 
 	Name_ string
 
@@ -39,6 +49,8 @@ type LegacyEngineAdapter struct {
 
 	// 是否为每个模型分别输出思维链与JSON（便于对比调参）
 	LogEachModel bool
+	// 是否在日志中输出 Structured Blocks 调试提示
+	DebugStructuredBlocks bool
 
 	// 可选：补充 OI 与资金费率
 	Metrics interface {
@@ -61,7 +73,9 @@ func (e *LegacyEngineAdapter) Name() string {
 
 // Decide 构建 System/User 提示词 → 调用多个模型 → 聚合 → 解析 JSON 决策
 func (e *LegacyEngineAdapter) Decide(ctx context.Context, input Context) (DecisionResult, error) {
-	sys, usr := e.ComposePrompts(ctx, input)
+	insights := e.runMultiAgents(ctx, input)
+	sys, usr := e.ComposePrompts(ctx, input, insights)
+	visionPayloads := e.collectVisionPayloads(input.Analysis)
 
 	// 调用所有已启用模型（可并行），带超时控制
 	outs := make([]ModelOutput, 0, len(e.Providers))
@@ -74,7 +88,16 @@ func (e *LegacyEngineAdapter) Decide(ctx context.Context, input Context) (Decisi
 			defer cancel()
 		}
 		logger.Debugf("调用模型: %s", p.ID())
-		raw, err := p.Call(cctx, sys, usr)
+		payload := provider.ChatPayload{
+			System:     sys,
+			User:       usr,
+			ExpectJSON: p.ExpectsJSON(),
+		}
+		if p.SupportsVision() {
+			payload.Images = visionPayloads
+		}
+		logAIInput("main", p.ID(), fmt.Sprintf("final decision (images=%d)", len(payload.Images)), payload.System, payload.User)
+		raw, err := p.Call(cctx, payload)
 		parsed := DecisionResult{}
 		if err == nil {
 			if arr, ok := ExtractJSONArrayCompat(raw); ok {
@@ -99,7 +122,13 @@ func (e *LegacyEngineAdapter) Decide(ctx context.Context, input Context) (Decisi
 		} else {
 			logger.Warnf("模型 %s 调用失败: %v", p.ID(), err)
 		}
-		return ModelOutput{ProviderID: p.ID(), Raw: raw, Parsed: parsed, Err: err}
+		return ModelOutput{
+			ProviderID: p.ID(),
+			Raw:        raw,
+			Parsed:     parsed,
+			Err:        err,
+			Images:     cloneImagePayloads(payload.Images),
+		}
 	}
 	if e.Parallel {
 		enabled := 0
@@ -183,266 +212,115 @@ func (e *LegacyEngineAdapter) Decide(ctx context.Context, input Context) (Decisi
 	best.Parsed.Decisions = result.Decisions
 
 	if e.Observer != nil {
+		traceID := uuid.NewString()
 		e.Observer.AfterDecide(ctx, DecisionTrace{
-			SystemPrompt: sys,
-			UserPrompt:   usr,
-			Outputs:      cloneOutputs(outs),
-			Best:         best,
-			Candidates:   cloneStrings(input.Candidates),
-			Timeframes:   cloneStrings(e.Intervals),
-			HorizonName:  e.HorizonName,
-			Positions:    cloneSnapshots(input.Positions),
+			TraceID:       traceID,
+			SystemPrompt:  sys,
+			UserPrompt:    usr,
+			Outputs:       cloneOutputs(outs),
+			Best:          best,
+			Candidates:    cloneStrings(input.Candidates),
+			Timeframes:    cloneStrings(e.Intervals),
+			HorizonName:   e.HorizonName,
+			Positions:     cloneSnapshots(input.Positions),
+			AgentInsights: cloneAgentInsights(insights),
 		})
 	}
 	return result, nil
 }
 
 // ComposePrompts 返回当前配置下的 System/User 提示词。
-func (e *LegacyEngineAdapter) ComposePrompts(ctx context.Context, input Context) (string, string) {
-	return e.loadSystem(), e.buildUserSummary(ctx, input)
+func (e *LegacyEngineAdapter) ComposePrompts(ctx context.Context, input Context, insights []AgentInsight) (string, string) {
+	return e.loadSystem(), e.buildUserSummary(ctx, input, insights)
 }
 
 // loadSystem 从 PromptManager 读取系统模板
 func (e *LegacyEngineAdapter) loadSystem() string {
-	if e.PromptMgr == nil {
-		return ""
-	}
-	if s, ok := e.PromptMgr.Get(e.SystemTemplate); ok {
-		return s
+	if tpl := e.loadTemplate(e.SystemTemplate); tpl != "" {
+		return tpl
 	}
 	return "你是专业的加密货币交易AI。请根据市场数据与风险控制做出决策。\n"
 }
 
+func (e *LegacyEngineAdapter) loadTemplate(name string) string {
+	if e.PromptMgr == nil {
+		return ""
+	}
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return ""
+	}
+	if s, ok := e.PromptMgr.Get(name); ok {
+		return s
+	}
+	return ""
+}
+
 // buildUserSummary 将候选币种与当前仓位的摘要组装为 User 提示词
-func (e *LegacyEngineAdapter) buildUserSummary(ctx context.Context, input Context) string {
+func (e *LegacyEngineAdapter) buildUserSummary(ctx context.Context, input Context, insights []AgentInsight) string {
 	var b strings.Builder
-	horizonName := e.HorizonName
-	if horizonName == "" {
-		horizonName = "default"
-	}
-	b.WriteString(fmt.Sprintf("# 候选币种数据摘要（持仓周期：%s）\n\n", horizonName))
-	profile := e.Horizon
-	emaCfg := profile.Indicators.EMA
-	if emaCfg.Fast <= 0 {
-		emaCfg.Fast = 21
-	}
-	if emaCfg.Mid <= 0 {
-		emaCfg.Mid = 50
-	}
-	if emaCfg.Slow <= 0 {
-		emaCfg.Slow = 200
-	}
-	rsiCfg := profile.Indicators.RSI
-	if rsiCfg.Period <= 0 {
-		rsiCfg.Period = 14
-	}
-	if rsiCfg.Oversold == 0 {
-		rsiCfg.Oversold = 30
-	}
-	if rsiCfg.Overbought == 0 {
-		rsiCfg.Overbought = 70
-	}
-	if rsiCfg.Overbought <= rsiCfg.Oversold {
-		rsiCfg.Oversold = 30
-		rsiCfg.Overbought = 70
-	}
-
-	// 确定成交量回看周期，并加入保护
-	lookbackPeriod := rsiCfg.Period
-	const maxLookback = 50 // 硬性上限保护
-	if lookbackPeriod <= 0 {
-		lookbackPeriod = 14 // 无效周期保护
-	}
-	if lookbackPeriod > maxLookback {
-		lookbackPeriod = maxLookback // 上限保护
-	}
-
-	if len(input.LastDecisions) > 0 {
-		b.WriteString("\n## 上次 AI 决策概览\n")
-		mem := append([]DecisionMemory(nil), input.LastDecisions...)
-		sort.Slice(mem, func(i, j int) bool {
-			if strings.EqualFold(mem[i].Symbol, mem[j].Symbol) {
-				return mem[i].DecidedAt.After(mem[j].DecidedAt)
-			}
-			return mem[i].Symbol < mem[j].Symbol
-		})
-		var fullPrev []Decision
-		for _, m := range mem {
-			age := time.Since(m.DecidedAt).Round(time.Minute)
-			if age < 0 {
-				age = 0
-			}
-			b.WriteString(fmt.Sprintf("- %s (%s 前)\n", strings.ToUpper(m.Symbol), age))
-			for _, d := range m.Decisions {
-				reason := strings.TrimSpace(d.Reasoning)
-				if len(reason) > 120 {
-					reason = reason[:120] + "…"
-				}
-				b.WriteString(fmt.Sprintf("    • %s size=%.0f tp=%.4f sl=%.4f %s\n",
-					strings.ToLower(d.Action), d.PositionSizeUSD, d.TakeProfit, d.StopLoss, reason))
-			}
-			fullPrev = append(fullPrev, m.Decisions...)
-		}
-		// if raw := strings.TrimSpace(input.LastRawJSON); raw != "" {
-		// 	b.WriteString("\n```json\n")
-		// 	b.WriteString(PrettyJSON(raw))
-		// 	b.WriteString("\n```\n")
-		// } else if len(fullPrev) > 0 {
-		// 	if rawJSON, err := json.MarshalIndent(fullPrev, "", "  "); err == nil {
-		// 		b.WriteString("\n```json\n")
-		// 		b.Write(rawJSON)
-		// 		b.WriteString("\n```\n")
-		// 	}
-		// }
-		b.WriteString("请结合上一轮思路评估是否需要延续/调整。\n")
-	}
-
-	group := map[string]string{}
-	for _, tf := range profile.EntryTimeframes {
-		group[tf] = "entry"
-	}
-	for _, tf := range profile.ConfirmTimeframes {
-		group[tf] = "confirm"
-	}
-	for _, tf := range profile.BackgroundTimeframes {
-		group[tf] = "background"
-	}
-	labelText := func(tf string) string {
-		switch group[tf] {
-		case "entry":
-			return "入场"
-		case "confirm":
-			return "确认"
-		case "background":
-			return "背景"
-		default:
-			return ""
-		}
-	}
-	intervals := e.Intervals
-	if len(intervals) == 0 {
-		intervals = profile.AllTimeframes()
-	}
-	for _, sym := range input.Candidates {
-		b.WriteString(sym)
-		b.WriteString(": ")
-		first := true
-		for _, iv := range intervals {
-			if e.KStore == nil {
+	b.WriteString("# 决策输入（Multi-Agent 汇总）\n")
+	e.appendLastDecisions(&b, input.LastDecisions)
+	e.appendCurrentPositions(&b, input.Positions)
+	e.logStructuredBlocksDebug(input.Analysis)
+	if len(insights) > 0 {
+		stageOrder := []string{agentStageIndicator, agentStagePattern, agentStageTrend}
+		stageMap := make(map[string]AgentInsight, len(insights))
+		for _, ins := range insights {
+			if ins.Stage == "" {
 				continue
 			}
-			ks, _ := e.KStore.Get(ctx, sym, iv)
-			if len(ks) == 0 {
+			stageMap[ins.Stage] = ins
+		}
+		writeInsight := func(ins AgentInsight) {
+			if ins.Stage == "" {
+				return
+			}
+			title := formatAgentStageTitle(ins.Stage)
+			provider := strings.TrimSpace(ins.ProviderID)
+			if provider == "" {
+				provider = "-"
+			}
+			prefix := fmt.Sprintf("- [%s | 模型:%s] ", title, provider)
+			if out := strings.TrimSpace(ins.Output); out != "" {
+				b.WriteString(prefix)
+				b.WriteString(TrimTo(out, 3600))
+				b.WriteString("\n")
+				return
+			}
+			status := "无可用结论"
+			if ins.Warned {
+				status += "（已通知）"
+			}
+			if errTxt := strings.TrimSpace(ins.Error); errTxt != "" {
+				errTxt = TrimTo(errTxt, 240)
+				status += ": " + errTxt
+			}
+			b.WriteString(prefix + status + "\n")
+		}
+		b.WriteString("\n## Multi-Agent Insights\n")
+		used := map[string]bool{}
+		for _, stage := range stageOrder {
+			if ins, ok := stageMap[stage]; ok {
+				writeInsight(ins)
+				used[stage] = true
+			}
+		}
+		for _, ins := range insights {
+			if used[ins.Stage] {
 				continue
 			}
-
-			// 提取OHLC和成交量序列
-			lastCandle := ks[len(ks)-1]
-			closes := make([]float64, 0, len(ks))
-			for _, k := range ks {
-				closes = append(closes, k.Close)
-			}
-
-			actualLookback := lookbackPeriod
-			if len(ks) < lookbackPeriod {
-				actualLookback = len(ks) // 数据不足时，取实际长度
-			}
-			volumeSlice := make([]float64, actualLookback)
-			for i := 0; i < actualLookback; i++ {
-				volumeSlice[i] = ks[len(ks)-actualLookback+i].Volume
-			}
-			volumeStr := formatVolumeSlice(volumeSlice)
-
-			emaFast := strategy.EMA(closes, emaCfg.Fast)
-			emaMid := strategy.EMA(closes, emaCfg.Mid)
-			emaSlow := strategy.EMA(closes, emaCfg.Slow)
-			macd := strategy.MACD(closes)
-			rsi := strategy.RSI(closes, rsiCfg.Period)
-			rsiState := "中性"
-			if rsi >= rsiCfg.Overbought {
-				rsiState = "超买"
-			} else if rsi <= rsiCfg.Oversold {
-				rsiState = "超卖"
-			}
-			trendRef := emaMid
-			refName := fmt.Sprintf("EMA%d", emaCfg.Mid)
-			switch group[iv] {
-			case "entry":
-				if emaFast != 0 {
-					trendRef = emaFast
-					refName = fmt.Sprintf("EMA%d", emaCfg.Fast)
-				}
-			case "background":
-				if emaSlow != 0 {
-					trendRef = emaSlow
-					refName = fmt.Sprintf("EMA%d", emaCfg.Slow)
-				}
-			}
-			trend := ""
-			if trendRef != 0 {
-				if lastCandle.Close >= trendRef {
-					trend = fmt.Sprintf(" | 趋势: 收盘在%s上方", refName)
-				} else {
-					trend = fmt.Sprintf(" | 趋势: 收盘在%s下方", refName)
-				}
-			}
-			tag := labelText(iv)
-			if tag != "" {
-				tag = "[" + tag + "]"
-			}
-			if !first {
-				b.WriteString(" || ")
-			}
-			b.WriteString(fmt.Sprintf("%s%s O=%.4f H=%.4f L=%.4f C=%.4f | EMA(%d/%d/%d)=%.3f/%.3f/%.3f%s | RSI%d=%.2f(%s, 阈=%.0f/%.0f) | MACD=%.3f | Vol(%d)=%s",
-				iv, tag, lastCandle.Open, lastCandle.High, lastCandle.Low, lastCandle.Close,
-				emaCfg.Fast, emaCfg.Mid, emaCfg.Slow, emaFast, emaMid, emaSlow, trend,
-				rsiCfg.Period, rsi, rsiState, rsiCfg.Oversold, rsiCfg.Overbought,
-				macd,
-				len(volumeSlice), volumeStr))
-			first = false
+			writeInsight(ins)
 		}
-		if first {
-			b.WriteString("(暂无数据)")
-		}
-		// 附加 OI 与资金费率（若启用）
-		if e.Metrics != nil {
-			if e.IncludeOI {
-				if v, err := e.Metrics.OI(ctx, sym); err == nil && v > 0 {
-					b.WriteString(fmt.Sprintf(" | OI=%.2f", v))
-				}
-			}
-			if e.IncludeFunding {
-				if v, err := e.Metrics.Funding(ctx, sym); err == nil {
-					b.WriteString(fmt.Sprintf(" | Funding=%.5f", v))
-				}
-			}
-		}
-		b.WriteString("\n")
-	}
-	if len(input.Positions) > 0 {
-		b.WriteString("\n## 当前持仓\n")
-		for _, pos := range input.Positions {
-			upnl := fmt.Sprintf("未实现PnL=%.2f", pos.UnrealizedPn)
-			if pos.UnrealizedPnPct != 0 {
-				upnl = fmt.Sprintf("未实现PnL=%.2f (%.2f%%)", pos.UnrealizedPn, pos.UnrealizedPnPct*100)
-			}
-			line := fmt.Sprintf("- %s %s 入场=%.4f 数量=%.4f RR=%.2f %s",
-				pos.Symbol, strings.ToUpper(pos.Side), pos.EntryPrice, pos.Quantity, pos.RR, upnl)
-			if pos.TakeProfit > 0 {
-				line += fmt.Sprintf(" TP=%.4f", pos.TakeProfit)
-			}
-			if pos.StopLoss > 0 {
-				line += fmt.Sprintf(" SL=%.4f", pos.StopLoss)
-			}
-			b.WriteString(line + "\n")
-		}
-		b.WriteString("请结合上述仓位判断是否需要平仓、加仓或调整计划。\n")
+		b.WriteString("请基于这些多 Agent 结论与风险约束输出最终 JSON 决策。\n")
+	} else {
+		b.WriteString("\n## Multi-Agent Insights\n- 暂无可用结论，请谨慎观望或输出空决策。\n")
 	}
 	req := `请先输出简短的【思维链】（1句，说明判断依据与结论），换行后仅输出 JSON 数组。
-数组中每项需含：symbol、action、reasoning。
-reasoning中当多空信号差距在20以上时，需要包含bull_score，bear_score，resistance_upper，resistance_lower
-如已有仓位且需要部分止盈/减仓，添加 close_ratio（0-1），无仓位时勿返回。
-若 action 为 open_long 或 open_short，必须返回 take_profit、stop_loss（绝对价，浮点）及 leverage（2–50，依信号强度）。
+	数组中每项需含：symbol、action、reasoning。
+	reasoning中当多空信号差距在20以上时，需要包含bull_score，bear_score，resistance_upper，resistance_lower
+	如已有仓位且需要部分止盈/减仓，添加 close_ratio（0-1），无仓位时勿返回。
+	若 action 为 open_long 或 open_short，必须返回 take_profit、stop_loss（绝对价，浮点）及 leverage（2–50，依信号强度）。
 若 action 为 adjust_stop_loss，必须返回新 stop_loss。
 示例:
 思维链: 4h 供需不明、15m 无形态。
@@ -453,11 +331,173 @@ reasoning中当多空信号差距在20以上时，需要包含bull_score，bear_
 	return b.String()
 }
 
+type agentStageConfig struct {
+	name       string
+	tplName    string
+	providerID string
+	builder    func([]AnalysisContext, brcfg.MultiAgentConfig) string
+}
+
+func (e *LegacyEngineAdapter) runMultiAgents(ctx context.Context, input Context) []AgentInsight {
+	cfg := e.MultiAgent
+	if !cfg.Enabled || len(input.Analysis) == 0 || e.PromptMgr == nil {
+		return nil
+	}
+	stages := []agentStageConfig{
+		{name: agentStageIndicator, tplName: cfg.IndicatorTemplate, providerID: cfg.IndicatorProvider, builder: buildIndicatorAgentPrompt},
+		{name: agentStagePattern, tplName: cfg.PatternTemplate, providerID: cfg.PatternProvider, builder: buildPatternAgentPrompt},
+		{name: agentStageTrend, tplName: cfg.TrendTemplate, providerID: cfg.TrendProvider, builder: buildTrendAgentPrompt},
+	}
+	results := make([]AgentInsight, len(stages))
+	groupCtx := ctx
+	if groupCtx == nil {
+		groupCtx = context.Background()
+	}
+	eg, egCtx := errgroup.WithContext(groupCtx)
+	for i, stage := range stages {
+		i, stage := i, stage
+		eg.Go(func() error {
+			results[i] = e.executeAgentStage(egCtx, stage, input.Analysis, cfg)
+			return nil
+		})
+	}
+	if err := eg.Wait(); err != nil {
+		logger.Debugf("multi-agent errgroup: %v", err)
+	}
+	out := make([]AgentInsight, 0, len(results))
+	for _, ins := range results {
+		if ins.Stage == "" {
+			continue
+		}
+		out = append(out, ins)
+	}
+	return out
+}
+
+func (e *LegacyEngineAdapter) executeAgentStage(ctx context.Context, stage agentStageConfig, ctxs []AnalysisContext, cfg brcfg.MultiAgentConfig) AgentInsight {
+	tpl := strings.TrimSpace(e.loadTemplate(stage.tplName))
+	if tpl == "" {
+		return AgentInsight{}
+	}
+	user := strings.TrimSpace(stage.builder(ctxs, cfg))
+	ins := AgentInsight{Stage: stage.name, System: tpl, User: user}
+	if user == "" {
+		ins.Error = "输入为空"
+		ins.Warned = e.emitAgentWarning(stage.name, stage.providerID, ins.Error)
+		return ins
+	}
+	preferred := strings.TrimSpace(stage.providerID)
+	provider := e.findAgentProvider(preferred)
+	if provider == nil {
+		if preferred != "" {
+			ins.Error = fmt.Sprintf("未找到模型 %s", preferred)
+		} else {
+			ins.Error = "无可用模型"
+		}
+		ins.Warned = e.emitAgentWarning(stage.name, preferred, ins.Error)
+		return ins
+	}
+	ins.ProviderID = provider.ID()
+	logAIInput(fmt.Sprintf("multi-agent:%s", stage.name), provider.ID(), describeAgentPurpose(stage.name), tpl, user)
+	out, err := e.invokeAgentProvider(ctx, provider, tpl, user)
+	if err != nil {
+		ins.Error = err.Error()
+		ins.Warned = e.emitAgentWarning(stage.name, provider.ID(), ins.Error)
+		logger.Warnf("%s agent 调用失败: %v", stage.name, err)
+		return ins
+	}
+	trimmed := strings.TrimSpace(TrimTo(out, 4000))
+	if trimmed == "" {
+		ins.Error = "模型返回空文本"
+		ins.Warned = e.emitAgentWarning(stage.name, provider.ID(), ins.Error)
+		return ins
+	}
+	ins.Output = trimmed
+	return ins
+}
+
+func (e *LegacyEngineAdapter) findAgentProvider(preferred string) provider.ModelProvider {
+	if len(e.Providers) == 0 {
+		return nil
+	}
+	preferred = strings.TrimSpace(preferred)
+	if preferred != "" {
+		for _, p := range e.Providers {
+			if p != nil && p.Enabled() && strings.EqualFold(p.ID(), preferred) {
+				return p
+			}
+		}
+		return nil
+	}
+	for _, p := range e.Providers {
+		if p != nil && p.Enabled() {
+			return p
+		}
+	}
+	return nil
+}
+
+func (e *LegacyEngineAdapter) invokeAgentProvider(ctx context.Context, p provider.ModelProvider, system, user string) (string, error) {
+	if p == nil {
+		return "", fmt.Errorf("agent provider 未配置")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	timeout := e.TimeoutSeconds
+	var cancel context.CancelFunc
+	if timeout > 0 {
+		ctx, cancel = context.WithTimeout(ctx, time.Duration(timeout)*time.Second)
+		defer cancel()
+	}
+	payload := provider.ChatPayload{System: system, User: user}
+	return p.Call(ctx, payload)
+}
+
+func (e *LegacyEngineAdapter) collectVisionPayloads(ctxs []AnalysisContext) []provider.ImagePayload {
+	if len(ctxs) == 0 {
+		return nil
+	}
+	out := make([]provider.ImagePayload, 0, 4)
+	for _, ac := range ctxs {
+		if ac.ImageB64 == "" {
+			continue
+		}
+		desc := fmt.Sprintf("%s %s %s", ac.Symbol, ac.Interval, ac.ImageNote)
+		out = append(out, provider.ImagePayload{DataURI: ac.ImageB64, Description: strings.TrimSpace(desc)})
+		if len(out) >= cap(out) {
+			break
+		}
+	}
+	return out
+}
+
 func cloneOutputs(src []ModelOutput) []ModelOutput {
 	if len(src) == 0 {
 		return nil
 	}
 	dst := make([]ModelOutput, len(src))
+	for i := range src {
+		dst[i] = src[i]
+		dst[i].Images = cloneImagePayloads(src[i].Images)
+	}
+	return dst
+}
+
+func cloneAgentInsights(src []AgentInsight) []AgentInsight {
+	if len(src) == 0 {
+		return nil
+	}
+	dst := make([]AgentInsight, len(src))
+	copy(dst, src)
+	return dst
+}
+
+func cloneImagePayloads(src []provider.ImagePayload) []provider.ImagePayload {
+	if len(src) == 0 {
+		return nil
+	}
+	dst := make([]provider.ImagePayload, len(src))
 	copy(dst, src)
 	return dst
 }
@@ -480,6 +520,29 @@ func cloneStrings(src []string) []string {
 	return dst
 }
 
+func describeAgentPurpose(stage string) string {
+	switch stage {
+	case agentStageIndicator:
+		return "指标洞察"
+	case agentStagePattern:
+		return "形态叙事"
+	case agentStageTrend:
+		return "趋势/支撑阻力分析"
+	default:
+		return "通用分析"
+	}
+}
+
+func logAIInput(kind, providerID, purpose, systemPrompt, userPrompt string) {
+	if strings.TrimSpace(kind) == "" {
+		kind = "unknown"
+	}
+	sysPreview := TrimTo(systemPrompt, 2000)
+	userPreview := TrimTo(userPrompt, 4000)
+	logger.Debugf("[AI][request] kind=%s provider=%s purpose=%s system_prompt=%q user_prompt=%q",
+		kind, strings.TrimSpace(providerID), purpose, sysPreview, userPreview)
+}
+
 // formatVolumeSlice 将成交量切片格式化为紧凑的字符串，例如 "[123, 456, 789]"
 func formatVolumeSlice(volumes []float64) string {
 	if len(volumes) == 0 {
@@ -490,4 +553,175 @@ func formatVolumeSlice(volumes []float64) string {
 		parts[i] = fmt.Sprintf("%.0f", v)
 	}
 	return "[" + strings.Join(parts, ", ") + "]"
+}
+
+func (e *LegacyEngineAdapter) emitAgentWarning(stage, providerID, reason string) bool {
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		return false
+	}
+	title := formatAgentStageTitle(stage)
+	providerID = strings.TrimSpace(providerID)
+	msg := fmt.Sprintf("[Multi-Agent 警告] %s 无输出: %s", title, reason)
+	if providerID != "" {
+		msg = fmt.Sprintf("[Multi-Agent 警告] %s(%s) 无输出: %s", title, providerID, reason)
+	}
+	logger.Warnf(msg)
+	n := e.AgentNotifier
+	if n == nil {
+		return false
+	}
+	if err := n.SendText(msg); err != nil {
+		logger.Warnf("multi-agent 警告推送失败: %v", err)
+		return false
+	}
+	return true
+}
+
+func (e *LegacyEngineAdapter) logStructuredBlocksDebug(ctxs []AnalysisContext) {
+	if !e.DebugStructuredBlocks || len(ctxs) == 0 {
+		return
+	}
+	limit := 4
+	if len(ctxs) < limit {
+		limit = len(ctxs)
+	}
+	var b strings.Builder
+	b.WriteString("--- Structured Debug ---\n")
+	for i := 0; i < limit; i++ {
+		ac := ctxs[i]
+		b.WriteString(fmt.Sprintf("* %s %s (%s)\n", strings.ToUpper(ac.Symbol), ac.Interval, ac.ForecastHorizon))
+		if ac.PatternReport != "" {
+			b.WriteString("  形态: " + TrimTo(ac.PatternReport, 240) + "\n")
+		}
+		if ac.TrendReport != "" {
+			b.WriteString("  趋势: " + TrimTo(ac.TrendReport, 240) + "\n")
+		}
+		if ac.ImageNote != "" {
+			b.WriteString("  图示: " + TrimTo(ac.ImageNote, 160) + "\n")
+		}
+		if ac.IndicatorJSON != "" {
+			b.WriteString("  指标JSON:\n")
+			b.WriteString(TrimTo(PrettyJSON(ac.IndicatorJSON), 600))
+			b.WriteString("\n")
+		}
+		if ac.KlineJSON != "" {
+			b.WriteString("  RawKline:\n")
+			b.WriteString(TrimTo(ac.KlineJSON, 600))
+			b.WriteString("\n")
+		}
+	}
+	b.WriteString("--- End Structured Debug ---")
+	logger.Debugf("%s", b.String())
+}
+
+func (e *LegacyEngineAdapter) appendLastDecisions(b *strings.Builder, records []DecisionMemory) {
+	if len(records) == 0 || b == nil {
+		return
+	}
+	mem := append([]DecisionMemory(nil), records...)
+	sort.Slice(mem, func(i, j int) bool {
+		if strings.EqualFold(mem[i].Symbol, mem[j].Symbol) {
+			return mem[i].DecidedAt.After(mem[j].DecidedAt)
+		}
+		return mem[i].Symbol < mem[j].Symbol
+	})
+	b.WriteString("\n## 上次 AI 决策概览\n")
+	for _, m := range mem {
+		age := time.Since(m.DecidedAt).Round(time.Minute)
+		if age < 0 {
+			age = 0
+		}
+		b.WriteString(fmt.Sprintf("- %s (%s 前)\n", strings.ToUpper(m.Symbol), age))
+		for _, d := range m.Decisions {
+			reason := trimReasoning(d.Reasoning, 360)
+			if reason == "" {
+				reason = "无可用理由"
+			}
+			line := fmt.Sprintf("    • %s ", strings.ToLower(d.Action))
+			if isOpenAction(d.Action) {
+				parts := make([]string, 0, 6)
+				if d.PositionSizeUSD > 0 {
+					parts = append(parts, fmt.Sprintf("size=%.0f", d.PositionSizeUSD))
+				}
+				if d.Leverage > 0 {
+					parts = append(parts, fmt.Sprintf("lev=%dx", d.Leverage))
+				}
+				if d.TakeProfit > 0 {
+					parts = append(parts, fmt.Sprintf("tp=%.4f", d.TakeProfit))
+				}
+				if d.StopLoss > 0 {
+					parts = append(parts, fmt.Sprintf("sl=%.4f", d.StopLoss))
+				}
+				if len(parts) > 0 {
+					line += strings.Join(parts, " ") + " "
+				}
+			} else if d.CloseRatio > 0 {
+				line += fmt.Sprintf("close_ratio=%.2f ", d.CloseRatio)
+			}
+			line += reason
+			b.WriteString(line + "\n")
+		}
+	}
+	b.WriteString("请结合上轮思路判断是否需要延续。\n")
+}
+
+func trimReasoning(text string, max int) string {
+	text = strings.TrimSpace(text)
+	if max <= 0 || len(text) == 0 {
+		return text
+	}
+	runes := []rune(text)
+	if len(runes) <= max {
+		return text
+	}
+	return string(runes[:max]) + "…"
+}
+
+func isOpenAction(action string) bool {
+	action = strings.ToLower(strings.TrimSpace(action))
+	return strings.HasPrefix(action, "open_")
+}
+
+func (e *LegacyEngineAdapter) appendCurrentPositions(b *strings.Builder, positions []PositionSnapshot) {
+	if len(positions) == 0 || b == nil {
+		return
+	}
+	b.WriteString("\n## 当前持仓\n")
+	for _, pos := range positions {
+		line := fmt.Sprintf("- %s %s entry=%.4f",
+			strings.ToUpper(pos.Symbol), strings.ToUpper(pos.Side), pos.EntryPrice)
+		if pos.Quantity > 0 {
+			line += fmt.Sprintf(" size=%.0f", pos.Quantity)
+		}
+		if pos.TakeProfit > 0 {
+			line += fmt.Sprintf(" tp=%.4f", pos.TakeProfit)
+		}
+		if pos.StopLoss > 0 {
+			line += fmt.Sprintf(" sl=%.4f", pos.StopLoss)
+		}
+		if pos.HoldingMs > 0 {
+			line += fmt.Sprintf(" holding=%s", formatHoldingDuration(pos.HoldingMs))
+		}
+		b.WriteString(line + "\n")
+	}
+	b.WriteString("请结合上述仓位判断是否需要平仓、加仓或调整计划。\n")
+}
+
+func formatHoldingDuration(ms int64) string {
+	if ms <= 0 {
+		return "-"
+	}
+	d := time.Duration(ms) * time.Millisecond
+	h := d / time.Hour
+	d -= h * time.Hour
+	m := d / time.Minute
+	d -= m * time.Minute
+	if h > 0 {
+		return fmt.Sprintf("%dh%dm", h, m)
+	}
+	if m > 0 {
+		return fmt.Sprintf("%dm%ds", m, d/time.Second)
+	}
+	return fmt.Sprintf("%ds", d/time.Second)
 }

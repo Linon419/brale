@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"brale/internal/analysis/visual"
 	"brale/internal/backtest"
 	"brale/internal/coins"
 	brcfg "brale/internal/config"
@@ -76,6 +77,9 @@ func NewApp(cfg *brcfg.Config) (*App, error) {
 	} else {
 		logger.Warnf("未找到提示词模板 '%s'", cfg.Prompt.SystemTemplate)
 	}
+	if err := visual.EnsureHeadlessAvailable(ctx); err != nil {
+		return nil, fmt.Errorf("初始化可视化渲染失败(请安装 headless Chrome): %w", err)
+	}
 
 	// 存储与 WS 更新器
 	src, err := gateway.NewSourceFromConfig(cfg)
@@ -101,8 +105,18 @@ func NewApp(cfg *brcfg.Config) (*App, error) {
 
 	// 模型 Providers
 	var modelCfgs []provider.ModelCfg
-	for _, m := range cfg.AI.Models {
-		modelCfgs = append(modelCfgs, provider.ModelCfg{ID: m.ID, Provider: m.Provider, Enabled: m.Enabled, APIURL: m.APIURL, APIKey: m.APIKey, Model: m.Model, Headers: m.Headers})
+	for _, m := range cfg.AI.MustResolveModelConfigs() {
+		modelCfgs = append(modelCfgs, provider.ModelCfg{
+			ID:             m.ID,
+			Provider:       m.Provider,
+			Enabled:        m.Enabled,
+			APIURL:         m.APIURL,
+			APIKey:         m.APIKey,
+			Model:          m.Model,
+			Headers:        m.Headers,
+			SupportsVision: m.SupportsVision,
+			ExpectJSON:     m.ExpectJSON,
+		})
 	}
 	providers := provider.BuildProvidersFromConfig(modelCfgs, time.Duration(cfg.MCP.TimeoutSeconds)*time.Second)
 	if len(providers) == 0 {
@@ -125,26 +139,31 @@ func NewApp(cfg *brcfg.Config) (*App, error) {
 
 	// 引擎
 	engine := &decision.LegacyEngineAdapter{
-		Providers:      providers,
-		Agg:            aggregator,
-		PromptMgr:      pm,
-		SystemTemplate: cfg.Prompt.SystemTemplate,
-		KStore:         ks,
-		Intervals:      hIntervals,
-		Horizon:        horizon,
-		HorizonName:    cfg.AI.ActiveHorizon,
-		Parallel:       true,
-		LogEachModel:   cfg.AI.LogEachModel,
-		Metrics:        brmarket.NewDefaultMetricsFetcher(""),
-		IncludeOI:      true,
-		IncludeFunding: true,
-		TimeoutSeconds: cfg.MCP.TimeoutSeconds,
+		Providers:             providers,
+		Agg:                   aggregator,
+		PromptMgr:             pm,
+		SystemTemplate:        cfg.Prompt.SystemTemplate,
+		KStore:                ks,
+		Intervals:             hIntervals,
+		Horizon:               horizon,
+		HorizonName:           cfg.AI.ActiveHorizon,
+		MultiAgent:            cfg.AI.MultiAgent,
+		Parallel:              true,
+		LogEachModel:          cfg.AI.LogEachModel,
+		DebugStructuredBlocks: cfg.AI.LogEachModel,
+		Metrics:               brmarket.NewDefaultMetricsFetcher(""),
+		IncludeOI:             true,
+		IncludeFunding:        true,
+		TimeoutSeconds:        cfg.MCP.TimeoutSeconds,
 	}
 
 	// Telegram（可选）
 	var tg *notifier.Telegram
 	if cfg.Notify.Telegram.Enabled {
 		tg = notifier.NewTelegram(cfg.Notify.Telegram.BotToken, cfg.Notify.Telegram.ChatID)
+	}
+	if tg != nil {
+		engine.AgentNotifier = tg
 	}
 
 	var decisionStore *database.DecisionLogStore
@@ -197,6 +216,7 @@ func NewApp(cfg *brcfg.Config) (*App, error) {
 		symbols:             syms,
 		hIntervals:          append([]string(nil), hIntervals...),
 		horizonName:         cfg.AI.ActiveHorizon,
+		profile:             horizon,
 		hSummary:            hSummary,
 		warmupSummary:       warmupSummary,
 		lastOpen:            map[string]time.Time{},
@@ -238,6 +258,7 @@ func NewApp(cfg *brcfg.Config) (*App, error) {
 			Aggregator:     aggregator,
 			Parallel:       true,
 			TimeoutSeconds: cfg.MCP.TimeoutSeconds,
+			MultiAgent:     cfg.AI.MultiAgent,
 		}
 		btSim, err := backtest.NewSimulator(backtest.SimulatorConfig{
 			CandleStore:    btStore,

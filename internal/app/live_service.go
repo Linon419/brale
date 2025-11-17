@@ -14,6 +14,7 @@ import (
 	"brale/internal/logger"
 	"brale/internal/market"
 	brmarket "brale/internal/market"
+	"brale/internal/store"
 )
 
 // LiveService 负责实时行情、AI 决策循环与通知。
@@ -31,6 +32,7 @@ type LiveService struct {
 	symbols       []string
 	hIntervals    []string
 	horizonName   string
+	profile       brcfg.HorizonProfile
 	hSummary      string
 	warmupSummary string
 
@@ -73,9 +75,6 @@ func (s *LiveService) Run(ctx context.Context) error {
 		_ = s.tg.SendText(msg)
 	}
 	batchSize := cfg.Market.ResolveActiveSource().WSBatchSize
-	if batchSize <= 0 {
-		batchSize = cfg.Exchange.WSBatchSize
-	}
 	if batchSize <= 0 {
 		batchSize = 150
 	}
@@ -152,6 +151,26 @@ func (s *LiveService) Close() {
 func (s *LiveService) tickDecision(ctx context.Context) error {
 	cfg := s.cfg
 	input := decision.Context{Candidates: s.symbols}
+	if exp, ok := s.ks.(store.SnapshotExporter); ok {
+		symbols := append([]string(nil), input.Candidates...)
+		if max := 6; len(symbols) > max {
+			symbols = symbols[:max]
+		}
+		input.Analysis = decision.BuildAnalysisContexts(decision.AnalysisBuildInput{
+			Context:     ctx,
+			Exporter:    exp,
+			Symbols:     symbols,
+			Intervals:   s.hIntervals,
+			Limit:       cfg.Kline.MaxCached,
+			SliceLength: s.profile.AnalysisSlice,
+			SliceDrop:   s.profile.SliceDropTail,
+			HorizonName: s.horizonName,
+			Indicators:  s.profile.Indicators,
+		})
+	}
+	if snaps := s.loadLivePositionSnapshots(ctx); len(snaps) > 0 {
+		input.Positions = snaps
+	}
 	if s.includeLastDecision && s.lastDec != nil {
 		snap := s.lastDec.Snapshot(time.Now())
 		if len(snap) > 0 {
@@ -200,14 +219,12 @@ func (s *LiveService) tickDecision(ctx context.Context) error {
 	validateIv := ""
 	if len(s.hIntervals) > 0 {
 		validateIv = s.hIntervals[0]
-	} else if len(cfg.Kline.Periods) > 0 {
-		validateIv = cfg.Kline.Periods[0]
 	}
 
 	accepted := make([]decision.Decision, 0, len(res.Decisions))
 	newOpens := 0
 	for _, d := range res.Decisions {
-		entryPrice := 0.0
+		marketPrice := 0.0
 		s.applyTradingDefaults(&d)
 		if err := decision.Validate(&d); err != nil {
 			logger.Warnf("AI 决策不合规，已忽略: %v | %+v", err, d)
@@ -216,7 +233,7 @@ func (s *LiveService) tickDecision(ctx context.Context) error {
 		if validateIv != "" {
 			if kl, _ := s.ks.Get(ctx, d.Symbol, validateIv); len(kl) > 0 {
 				price := kl[len(kl)-1].Close
-				entryPrice = price
+				marketPrice = price
 				if err := decision.ValidateWithPrice(&d, price, cfg.Advanced.MinRiskReward); err != nil {
 					logger.Warnf("AI 决策RR校验失败，已忽略: %v | %+v", err, d)
 					continue
@@ -225,6 +242,7 @@ func (s *LiveService) tickDecision(ctx context.Context) error {
 		}
 		accepted = append(accepted, d)
 		s.logDecision(d)
+		s.updateLivePositions(ctx, d, marketPrice)
 
 		if d.Action == "open_long" || d.Action == "open_short" {
 			if newOpens >= cfg.Advanced.MaxOpensPerCycle {
@@ -241,8 +259,8 @@ func (s *LiveService) tickDecision(ctx context.Context) error {
 			}
 			s.lastOpen[key] = time.Now()
 			newOpens++
-			s.recordLiveOrder(ctx, d, entryPrice, validateIv)
-			s.notifyOpen(ctx, d, entryPrice, validateIv)
+			s.recordLiveOrder(ctx, d, marketPrice, validateIv)
+			s.notifyOpen(ctx, d, marketPrice, validateIv)
 		}
 	}
 	if len(accepted) > 0 {
@@ -408,6 +426,94 @@ func (s *LiveService) persistLastDecisions(ctx context.Context, decisions []deci
 	}
 }
 
+func (s *LiveService) loadLivePositionSnapshots(ctx context.Context) []decision.PositionSnapshot {
+	if s.decLogs == nil {
+		return nil
+	}
+	positions, err := s.decLogs.ListOpenPositions(ctx)
+	if err != nil {
+		logger.Warnf("加载当前持仓失败: %v", err)
+		return nil
+	}
+	now := time.Now()
+	out := make([]decision.PositionSnapshot, 0, len(positions))
+	for _, p := range positions {
+		qty := p.Notional
+		if qty == 0 {
+			qty = p.Quantity
+		}
+		holding := int64(0)
+		if p.OpenedAt > 0 {
+			holding = now.Sub(time.UnixMilli(p.OpenedAt)).Milliseconds()
+		}
+		out = append(out, decision.PositionSnapshot{
+			Symbol:     strings.ToUpper(p.Symbol),
+			Side:       p.Side,
+			EntryPrice: p.Entry,
+			Quantity:   qty,
+			TakeProfit: p.TakeProfit,
+			StopLoss:   p.StopLoss,
+			HoldingMs:  holding,
+		})
+	}
+	return out
+}
+
+func (s *LiveService) updateLivePositions(ctx context.Context, d decision.Decision, marketPrice float64) {
+	if s.decLogs == nil {
+		return
+	}
+	symbol := strings.ToUpper(strings.TrimSpace(d.Symbol))
+	if symbol == "" {
+		return
+	}
+	switch d.Action {
+	case "open_long", "open_short":
+		side := deriveSide(d.Action)
+		pos := database.LivePosition{
+			Symbol:     symbol,
+			Side:       side,
+			Entry:      marketPrice,
+			Notional:   d.PositionSizeUSD,
+			Leverage:   float64(d.Leverage),
+			TakeProfit: d.TakeProfit,
+			StopLoss:   d.StopLoss,
+		}
+		if err := s.decLogs.UpsertLivePosition(ctx, pos); err != nil {
+			logger.Warnf("记录持仓失败(open): %v", err)
+		}
+	case "close_long", "close_short":
+		side := deriveSide(d.Action)
+		ratio := clampCloseRatio(d.CloseRatio)
+		if ratio > 0 && ratio < 1 {
+			if err := s.decLogs.ReduceLivePosition(ctx, symbol, side, ratio); err != nil {
+				logger.Warnf("部分减仓失败: %v", err)
+			}
+		} else {
+			if err := s.decLogs.CloseLivePosition(ctx, symbol, side, marketPrice); err != nil {
+				logger.Warnf("关闭持仓失败: %v", err)
+			}
+		}
+	case "adjust_stop_loss":
+		updated, err := s.decLogs.UpdateLivePositionStops(ctx, symbol, "", d.StopLoss, d.TakeProfit)
+		if err != nil {
+			logger.Warnf("更新止盈止损失败: %v", err)
+		} else if !updated {
+			logger.Debugf("未找到待调整的持仓: %s", symbol)
+		}
+	}
+}
+
+func clampCloseRatio(ratio float64) float64 {
+	if ratio < 0 {
+		return 0
+	}
+	if ratio > 1 {
+		return 1
+	}
+	return ratio
+}
+
 func (s *LiveService) logDecision(d decision.Decision) {
 	switch d.Action {
 	case "open_long", "open_short":
@@ -500,9 +606,9 @@ func (s *LiveService) sendMetaSummaryTelegram(summary string) error {
 
 func deriveSide(action string) string {
 	switch action {
-	case "open_long", "close_long", "adjust_stop_loss":
+	case "open_long", "close_long":
 		return "long"
-	case "open_short", "close_short", "partial_close_short":
+	case "open_short", "close_short":
 		return "short"
 	default:
 		return ""

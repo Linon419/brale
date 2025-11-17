@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"brale/internal/analysis/visual"
 	brcfg "brale/internal/config"
 	"brale/internal/decision"
 	"brale/internal/logger"
@@ -65,6 +66,9 @@ func NewSimulator(cfg SimulatorConfig) (*Simulator, error) {
 	}
 	if len(cfg.Profiles) == 0 {
 		return nil, fmt.Errorf("profiles 不能为空")
+	}
+	if err := visual.EnsureHeadlessAvailable(context.Background()); err != nil {
+		return nil, fmt.Errorf("headless chrome 不可用: %w", err)
 	}
 	defaultProf := cfg.DefaultProfile
 	if defaultProf == "" {

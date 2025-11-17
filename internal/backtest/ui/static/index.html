@@ -9,37 +9,10 @@
 <body>
   <header>
     <h1>回测数据控制台</h1>
-    <p>通过此面板发起 K 线拉取任务、查看进度并验证本地数据。</p>
+    <p>通过此面板查看数据拉取进度、启动回测并调试实时 AI 日志。</p>
   </header>
 
   <main>
-    <section>
-      <h2>发起 K 线拉取</h2>
-      <form id="fetchForm">
-        <div class="row">
-          <label>交易所</label>
-          <input type="text" id="exchange" placeholder="默认为配置中的 default_exchange" />
-        </div>
-        <div class="row">
-          <label>交易对 *</label>
-          <input type="text" id="symbol" placeholder="如 BTCUSDT" required />
-        </div>
-        <div class="row">
-          <label>周期 *</label>
-          <select id="timeframe" required></select>
-        </div>
-        <div class="row">
-          <label>起始时间 *</label>
-          <input type="datetime-local" id="start" required />
-        </div>
-        <div class="row">
-          <label>结束时间 *</label>
-          <input type="datetime-local" id="end" required />
-        </div>
-        <button type="submit">提交拉取</button>
-      </form>
-      <div id="fetchMessage" class="message"></div>
-    </section>
 
     <section>
       <div class="section-head">
@@ -60,39 +33,6 @@
           </thead>
           <tbody id="jobsBody">
             <tr><td colspan="6" class="muted">暂无任务</td></tr>
-          </tbody>
-        </table>
-      </div>
-    </section>
-
-    <section>
-      <h2>本地 K 线数据</h2>
-      <form id="candlesForm">
-        <div class="row">
-          <label>交易对 *</label>
-          <input type="text" id="dataSymbol" required />
-        </div>
-        <div class="row">
-          <label>周期 *</label>
-          <select id="dataTimeframe" required></select>
-        </div>
-        <button type="submit">加载全部本地数据</button>
-      </form>
-      <div id="manifestInfo" class="muted"></div>
-      <div class="table-wrapper">
-        <table>
-          <thead>
-            <tr>
-              <th>Open Time</th>
-              <th>Close</th>
-              <th>High</th>
-              <th>Low</th>
-              <th>Volume</th>
-              <th>Trades</th>
-            </tr>
-          </thead>
-          <tbody id="candlesBody">
-            <tr><td colspan="6" class="muted">等待查询</td></tr>
           </tbody>
         </table>
       </div>
@@ -224,7 +164,14 @@
     <section class="full-width">
       <div class="section-head">
         <h2>实时 AI 日志</h2>
-        <button id="refreshLiveLogs" type="button">刷新</button>
+        <div class="section-actions">
+          <button id="refreshLiveLogs" type="button">刷新</button>
+          <button id="collapseTimelineDetails" type="button">收起全部详情</button>
+        </div>
+      </div>
+      <div class="card live-summary-card">
+        <h3>最新聚合结果</h3>
+        <div id="liveFinalSummary" class="final-summary muted">暂无聚合记录</div>
       </div>
       <form id="liveFilterForm">
         <div class="filter-grid">
@@ -248,10 +195,20 @@
             <label>条数</label>
             <input type="number" id="liveLimit" min="10" max="500" value="100" />
           </div>
+          <div class="field checkbox-field">
+            <label>Provider 详情</label>
+            <label class="checkbox-inline">
+              <input type="checkbox" id="liveShowProviders" checked />
+              显示
+            </label>
+          </div>
         </div>
         <button type="submit">应用筛选</button>
       </form>
       <div id="liveLogsMessage" class="message"></div>
+      <div id="liveTimeline" class="live-timeline muted">
+        <p class="muted">暂无实时决策轨迹</p>
+      </div>
       <div class="table-wrapper">
         <table>
           <thead>

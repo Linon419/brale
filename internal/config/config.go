@@ -17,11 +17,6 @@ type Config struct {
 		LogLevel string `toml:"log_level"`
 	} `toml:"app"`
 
-	Exchange struct {
-		Name        string `toml:"name"`
-		WSBatchSize int    `toml:"ws_batch_size"`
-	} `toml:"exchange"`
-
 	Symbols struct {
 		Provider    string   `toml:"provider"`
 		DefaultList []string `toml:"default_list"`
@@ -29,36 +24,12 @@ type Config struct {
 	} `toml:"symbols"`
 
 	Kline struct {
-		Periods   []string `toml:"periods"`
-		MaxCached int      `toml:"max_cached"`
+		MaxCached int `toml:"max_cached"`
 	} `toml:"kline"`
-
-	WS struct {
-		Periods []string `toml:"periods"`
-	} `toml:"ws"`
 
 	Market MarketConfig `toml:"market"`
 
-	AI struct {
-		Aggregation             string                    `toml:"aggregation"`
-		LogEachModel            bool                      `toml:"log_each_model"`
-		Weights                 map[string]float64        `toml:"weights"`
-		DecisionIntervalSeconds int                       `toml:"decision_interval_seconds"`
-		DecisionLogPath         string                    `toml:"decision_log_path"`
-		IncludeLastDecision     bool                      `toml:"include_last_decision"`
-		LastDecisionMaxAgeSec   int                       `toml:"last_decision_max_age_seconds"`
-		ActiveHorizon           string                    `toml:"active_horizon"`
-		HoldingProfiles         map[string]HorizonProfile `toml:"holding_horizon_profiles"`
-		Models                  []struct {
-			ID       string            `toml:"id"`       // 唯一标识（如 openai/deepseek/qwen_自定义名）
-			Provider string            `toml:"provider"` // openai | deepseek | qwen（均按 OpenAI 兼容接口调用）
-			Enabled  bool              `toml:"enabled"`
-			APIURL   string            `toml:"api_url"` // OpenAI 兼容 BaseURL，如 https://api.openai.com/v1
-			APIKey   string            `toml:"api_key"`
-			Model    string            `toml:"model"`   // 模型名，如 gpt-4o-mini / deepseek-chat / qwen3-max
-			Headers  map[string]string `toml:"headers"` // 可选：自定义请求头（例如 X-API-Key、OpenAI-Organization 等）
-		} `toml:"models"`
-	} `toml:"ai"`
+	AI AIConfig `toml:"ai"`
 
 	MCP struct {
 		TimeoutSeconds int `toml:"timeout_seconds"`
@@ -106,6 +77,94 @@ type TradingConfig struct {
 	DefaultLeverage    int     `toml:"default_leverage"`     // 缺省杠杆
 }
 
+// AIConfig 包含与模型、持仓周期相关的所有设置。
+type AIConfig struct {
+	Aggregation             string                    `toml:"aggregation"`
+	LogEachModel            bool                      `toml:"log_each_model"`
+	Weights                 map[string]float64        `toml:"weights"`
+	DecisionIntervalSeconds int                       `toml:"decision_interval_seconds"`
+	DecisionLogPath         string                    `toml:"decision_log_path"`
+	IncludeLastDecision     bool                      `toml:"include_last_decision"`
+	LastDecisionMaxAgeSec   int                       `toml:"last_decision_max_age_seconds"`
+	ActiveHorizon           string                    `toml:"active_horizon"`
+	HoldingProfiles         map[string]HorizonProfile `toml:"holding_horizon_profiles"`
+	ProfileDefaults         HorizonProfileDefaults    `toml:"profile_defaults"`
+	ProviderPresets         map[string]ModelPreset    `toml:"provider_presets"`
+	Models                  []AIModelConfig           `toml:"models"`
+	MultiAgent              MultiAgentConfig          `toml:"multi_agent"`
+}
+
+// ModelPreset 描述可复用的 API 连接配置。
+type ModelPreset struct {
+	APIURL         string            `toml:"api_url"`
+	APIKey         string            `toml:"api_key"`
+	Headers        map[string]string `toml:"headers"`
+	SupportsVision bool              `toml:"supports_vision"`
+	ExpectJSON     bool              `toml:"expect_json"`
+}
+
+// AIModelConfig 代表一个最终参与投票的模型条目。
+type AIModelConfig struct {
+	ID       string            `toml:"id"`
+	Provider string            `toml:"provider"`
+	Preset   string            `toml:"preset"`
+	Enabled  bool              `toml:"enabled"`
+	APIURL   string            `toml:"api_url"`
+	APIKey   string            `toml:"api_key"`
+	Model    string            `toml:"model"`
+	Headers  map[string]string `toml:"headers"`
+	// SupportsVision/ExpectJSON 使用指针以区分“显式 false”与“沿用预设值”。
+	SupportsVision *bool `toml:"supports_vision"`
+	ExpectJSON     *bool `toml:"expect_json"`
+}
+
+// ResolvedModelConfig 是合并预设后的最终模型配置。
+type ResolvedModelConfig struct {
+	ID             string
+	Provider       string
+	Enabled        bool
+	APIURL         string
+	APIKey         string
+	Model          string
+	Headers        map[string]string
+	SupportsVision bool
+	ExpectJSON     bool
+}
+
+// MultiAgentConfig 描述多阶段 Agent 编排的配置。
+type MultiAgentConfig struct {
+	Enabled           bool   `toml:"enabled"`
+	IndicatorProvider string `toml:"indicator_provider"`
+	PatternProvider   string `toml:"pattern_provider"`
+	TrendProvider     string `toml:"trend_provider"`
+	IndicatorTemplate string `toml:"indicator_template"`
+	PatternTemplate   string `toml:"pattern_template"`
+	TrendTemplate     string `toml:"trend_template"`
+	MaxBlocks         int    `toml:"max_blocks"`
+	MaxCharsPerBlock  int    `toml:"max_chars_per_block"`
+}
+
+func (m *MultiAgentConfig) applyDefaults() {
+	if m == nil {
+		return
+	}
+	if m.IndicatorTemplate == "" {
+		m.IndicatorTemplate = "agent_indicator"
+	}
+	if m.PatternTemplate == "" {
+		m.PatternTemplate = "agent_pattern"
+	}
+	if m.TrendTemplate == "" {
+		m.TrendTemplate = "agent_trend"
+	}
+	if m.MaxBlocks <= 0 {
+		m.MaxBlocks = 4
+	}
+	if m.MaxCharsPerBlock <= 0 {
+		m.MaxCharsPerBlock = 1600
+	}
+}
+
 type MarketConfig struct {
 	ActiveSource string         `toml:"active_source"`
 	Sources      []MarketSource `toml:"sources"`
@@ -126,6 +185,116 @@ type HorizonProfile struct {
 	ConfirmTimeframes    []string          `toml:"confirm_timeframes"`
 	BackgroundTimeframes []string          `toml:"background_timeframes"`
 	Indicators           HorizonIndicators `toml:"indicators"`
+	AnalysisSlice        int               `toml:"analysis_slice"`
+	SliceDropTail        int               `toml:"slice_drop_tail"`
+}
+
+// HorizonProfileDefaults 定义“持仓模板”的共享指标与窗口设置。
+type HorizonProfileDefaults struct {
+	Indicators    HorizonIndicators `toml:"indicators"`
+	AnalysisSlice int               `toml:"analysis_slice"`
+	SliceDropTail int               `toml:"slice_drop_tail"`
+}
+
+func (d *HorizonProfileDefaults) normalize() {
+	if d.Indicators.EMA.Fast <= 0 {
+		d.Indicators.EMA.Fast = 21
+	}
+	if d.Indicators.EMA.Mid <= 0 {
+		d.Indicators.EMA.Mid = 50
+	}
+	if d.Indicators.EMA.Slow <= 0 {
+		d.Indicators.EMA.Slow = 200
+	}
+	if d.Indicators.RSI.Period <= 0 {
+		d.Indicators.RSI.Period = 14
+	}
+	if d.Indicators.RSI.Oversold == 0 {
+		d.Indicators.RSI.Oversold = 33
+	}
+	if d.Indicators.RSI.Overbought == 0 {
+		d.Indicators.RSI.Overbought = 68
+	}
+	if d.AnalysisSlice <= 0 {
+		d.AnalysisSlice = 46
+	}
+	minSlice := d.Indicators.LookbackBars()
+	if d.AnalysisSlice > 0 && d.AnalysisSlice < minSlice {
+		d.AnalysisSlice = minSlice
+	}
+	if d.SliceDropTail < 0 {
+		d.SliceDropTail = 0
+	}
+	if d.SliceDropTail == 0 && d.AnalysisSlice > 0 {
+		// 默认丢弃最近 3 根，避免未收盘蜡烛干扰。
+		d.SliceDropTail = 3
+		if d.SliceDropTail >= d.AnalysisSlice {
+			d.SliceDropTail = d.AnalysisSlice / 2
+		}
+	}
+}
+
+// ResolveModelConfigs 合并 provider 预设与模型条目，返回最终配置。
+func (a AIConfig) ResolveModelConfigs() ([]ResolvedModelConfig, error) {
+	out := make([]ResolvedModelConfig, 0, len(a.Models))
+	presets := a.ProviderPresets
+	for _, raw := range a.Models {
+		presetName := strings.TrimSpace(raw.Preset)
+		var preset ModelPreset
+		if presetName != "" {
+			var ok bool
+			if presets != nil {
+				preset, ok = presets[presetName]
+			}
+			if !ok {
+				return nil, fmt.Errorf("找不到 ai.provider_presets.%s", presetName)
+			}
+		}
+		apiURL := strings.TrimSpace(raw.APIURL)
+		if apiURL == "" {
+			apiURL = strings.TrimSpace(preset.APIURL)
+		}
+		apiKey := strings.TrimSpace(raw.APIKey)
+		if apiKey == "" {
+			apiKey = strings.TrimSpace(preset.APIKey)
+		}
+		headers := make(map[string]string, len(preset.Headers)+len(raw.Headers))
+		for k, v := range preset.Headers {
+			headers[k] = v
+		}
+		for k, v := range raw.Headers {
+			headers[k] = v
+		}
+		supportsVision := preset.SupportsVision
+		if raw.SupportsVision != nil {
+			supportsVision = *raw.SupportsVision
+		}
+		expectJSON := preset.ExpectJSON
+		if raw.ExpectJSON != nil {
+			expectJSON = *raw.ExpectJSON
+		}
+		out = append(out, ResolvedModelConfig{
+			ID:             strings.TrimSpace(raw.ID),
+			Provider:       strings.TrimSpace(raw.Provider),
+			Enabled:        raw.Enabled,
+			APIURL:         apiURL,
+			APIKey:         apiKey,
+			Model:          strings.TrimSpace(raw.Model),
+			Headers:        headers,
+			SupportsVision: supportsVision,
+			ExpectJSON:     expectJSON,
+		})
+	}
+	return out, nil
+}
+
+// MustResolveModelConfigs 在配置已通过校验时使用，忽略错误。
+func (a AIConfig) MustResolveModelConfigs() []ResolvedModelConfig {
+	out, err := a.ResolveModelConfigs()
+	if err != nil {
+		return nil
+	}
+	return out
 }
 
 // HorizonIndicators 组合该周期要使用的关键指标参数。
@@ -251,27 +420,47 @@ func (p HorizonProfile) LookbackMap(buffer int) map[string]int {
 	return out
 }
 
-func normalizeHorizonProfile(p HorizonProfile) HorizonProfile {
+func normalizeHorizonProfile(p HorizonProfile, defaults HorizonProfileDefaults) HorizonProfile {
+	defaults.normalize()
 	if len(p.EntryTimeframes) == 0 && len(p.ConfirmTimeframes) == 0 && len(p.BackgroundTimeframes) == 0 {
 		p.EntryTimeframes = []string{"15m"}
 	}
 	if p.Indicators.EMA.Fast <= 0 {
-		p.Indicators.EMA.Fast = 21
+		p.Indicators.EMA.Fast = defaults.Indicators.EMA.Fast
 	}
 	if p.Indicators.EMA.Mid <= 0 {
-		p.Indicators.EMA.Mid = 50
+		p.Indicators.EMA.Mid = defaults.Indicators.EMA.Mid
 	}
 	if p.Indicators.EMA.Slow <= 0 {
-		p.Indicators.EMA.Slow = 200
+		p.Indicators.EMA.Slow = defaults.Indicators.EMA.Slow
 	}
 	if p.Indicators.RSI.Period <= 0 {
-		p.Indicators.RSI.Period = 14
+		p.Indicators.RSI.Period = defaults.Indicators.RSI.Period
 	}
 	if p.Indicators.RSI.Oversold == 0 {
-		p.Indicators.RSI.Oversold = 30
+		p.Indicators.RSI.Oversold = defaults.Indicators.RSI.Oversold
 	}
 	if p.Indicators.RSI.Overbought == 0 {
-		p.Indicators.RSI.Overbought = 70
+		p.Indicators.RSI.Overbought = defaults.Indicators.RSI.Overbought
+	}
+	if p.AnalysisSlice <= 0 {
+		p.AnalysisSlice = defaults.AnalysisSlice
+	}
+	minSlice := p.Indicators.LookbackBars()
+	if p.AnalysisSlice > 0 && p.AnalysisSlice < minSlice {
+		p.AnalysisSlice = minSlice
+	}
+	if p.SliceDropTail < 0 {
+		p.SliceDropTail = 0
+	}
+	if p.SliceDropTail == 0 && defaults.SliceDropTail > 0 {
+		p.SliceDropTail = defaults.SliceDropTail
+	}
+	if p.AnalysisSlice > 0 && p.SliceDropTail >= p.AnalysisSlice {
+		p.SliceDropTail = p.AnalysisSlice - 1
+		if p.SliceDropTail < 0 {
+			p.SliceDropTail = 0
+		}
 	}
 	return p
 }
@@ -289,7 +478,7 @@ func firstEnabledMarket(sources []MarketSource) string {
 	return "binance"
 }
 
-func defaultHorizonProfiles() map[string]HorizonProfile {
+func defaultHorizonProfiles(defaults HorizonProfileDefaults) map[string]HorizonProfile {
 	return map[string]HorizonProfile{
 		"one_hour": normalizeHorizonProfile(HorizonProfile{
 			EntryTimeframes:      []string{"5m", "15m"},
@@ -299,7 +488,7 @@ func defaultHorizonProfiles() map[string]HorizonProfile {
 				EMA: EMAConfig{Fast: 21, Mid: 50, Slow: 200},
 				RSI: RSIConfig{Period: 14, Oversold: 33, Overbought: 68},
 			},
-		}),
+		}, defaults),
 		"four_hour": normalizeHorizonProfile(HorizonProfile{
 			EntryTimeframes:      []string{"15m", "30m"},
 			ConfirmTimeframes:    []string{"4h"},
@@ -308,7 +497,7 @@ func defaultHorizonProfiles() map[string]HorizonProfile {
 				EMA: EMAConfig{Fast: 21, Mid: 50, Slow: 200},
 				RSI: RSIConfig{Period: 14, Oversold: 30, Overbought: 70},
 			},
-		}),
+		}, defaults),
 		"one_day": normalizeHorizonProfile(HorizonProfile{
 			EntryTimeframes:      []string{"1h"},
 			ConfirmTimeframes:    []string{"4h", "1d"},
@@ -317,25 +506,97 @@ func defaultHorizonProfiles() map[string]HorizonProfile {
 				EMA: EMAConfig{Fast: 21, Mid: 50, Slow: 200},
 				RSI: RSIConfig{Period: 14, Oversold: 35, Overbought: 65},
 			},
-		}),
+		}, defaults),
 	}
 }
 
 // Load 读取并解析 TOML 配置文件，并设置缺省值与基本校验
 func Load(path string) (*Config, error) {
-	data, err := os.ReadFile(path)
+	files, err := resolveConfigIncludes(path)
 	if err != nil {
-		return nil, fmt.Errorf("读取配置文件失败: %w", err)
+		return nil, err
 	}
 	var cfg Config
-	if err := toml.Unmarshal(data, &cfg); err != nil {
-		return nil, fmt.Errorf("解析 TOML 失败: %w", err)
+	for _, file := range files {
+		data, err := os.ReadFile(file)
+		if err != nil {
+			return nil, fmt.Errorf("读取配置文件失败(%s): %w", file, err)
+		}
+		if err := toml.Unmarshal(data, &cfg); err != nil {
+			return nil, fmt.Errorf("解析 TOML 失败(%s): %w", file, err)
+		}
 	}
 	applyDefaults(&cfg)
 	if err := validate(&cfg); err != nil {
 		return nil, err
 	}
 	return &cfg, nil
+}
+
+type includeHeader struct {
+	Include []string `toml:"include"`
+}
+
+func resolveConfigIncludes(path string) ([]string, error) {
+	if path == "" {
+		return nil, fmt.Errorf("config path 不能为空")
+	}
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return nil, err
+	}
+	seen := make(map[string]bool)
+	stack := make(map[string]bool)
+	files, err := collectConfigFiles(abs, seen, stack)
+	if err != nil {
+		return nil, err
+	}
+	if len(files) == 0 {
+		return []string{abs}, nil
+	}
+	return files, nil
+}
+
+func collectConfigFiles(path string, seen, stack map[string]bool) ([]string, error) {
+	path = filepath.Clean(path)
+	if stack[path] {
+		return nil, fmt.Errorf("检测到 include 循环: %s", path)
+	}
+	if seen[path] {
+		return nil, nil
+	}
+	stack[path] = true
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("读取配置失败(%s): %w", path, err)
+	}
+	var header includeHeader
+	if err := toml.Unmarshal(data, &header); err != nil {
+		return nil, fmt.Errorf("解析 include 失败(%s): %w", path, err)
+	}
+	dir := filepath.Dir(path)
+	var ordered []string
+	for _, inc := range header.Include {
+		inc = strings.TrimSpace(inc)
+		if inc == "" {
+			continue
+		}
+		incPath := inc
+		if !filepath.IsAbs(inc) {
+			incPath = filepath.Join(dir, inc)
+		}
+		sub, err := collectConfigFiles(incPath, seen, stack)
+		if err != nil {
+			return nil, err
+		}
+		if len(sub) > 0 {
+			ordered = append(ordered, sub...)
+		}
+	}
+	delete(stack, path)
+	seen[path] = true
+	ordered = append(ordered, path)
+	return ordered, nil
 }
 
 // 默认值设置
@@ -346,9 +607,6 @@ func applyDefaults(c *Config) {
 	if c.App.LogLevel == "" {
 		c.App.LogLevel = "info"
 	}
-	if c.Exchange.WSBatchSize <= 0 {
-		c.Exchange.WSBatchSize = 150
-	}
 	if c.Kline.MaxCached <= 0 {
 		c.Kline.MaxCached = 100
 	}
@@ -358,14 +616,27 @@ func applyDefaults(c *Config) {
 	if c.Prompt.SystemTemplate == "" {
 		c.Prompt.SystemTemplate = "default"
 	}
+	if c.AI.ProviderPresets == nil {
+		c.AI.ProviderPresets = make(map[string]ModelPreset)
+	}
+	profileDefaults := c.AI.ProfileDefaults
+	profileDefaults.normalize()
+	if profileDefaults.AnalysisSlice <= 0 {
+		// 再兜底一次，防止 normalize 被重置。
+		profileDefaults.AnalysisSlice = 46
+		if profileDefaults.SliceDropTail <= 0 {
+			profileDefaults.SliceDropTail = 3
+		}
+	}
+	c.AI.ProfileDefaults = profileDefaults
 
 	// Horizon profiles 与周期派生
 	if len(c.AI.HoldingProfiles) == 0 {
-		c.AI.HoldingProfiles = defaultHorizonProfiles()
+		c.AI.HoldingProfiles = defaultHorizonProfiles(profileDefaults)
 	} else {
 		normalized := make(map[string]HorizonProfile, len(c.AI.HoldingProfiles))
 		for name, profile := range c.AI.HoldingProfiles {
-			normalized[name] = normalizeHorizonProfile(profile)
+			normalized[name] = normalizeHorizonProfile(profile, profileDefaults)
 		}
 		c.AI.HoldingProfiles = normalized
 	}
@@ -393,12 +664,6 @@ func applyDefaults(c *Config) {
 	if c.Kline.MaxCached < maxLookback+50 {
 		c.Kline.MaxCached = maxLookback + 50
 	}
-	if len(c.Kline.Periods) == 0 {
-		c.Kline.Periods = append([]string(nil), derivedIntervals...)
-	}
-	if len(c.WS.Periods) == 0 {
-		c.WS.Periods = append([]string(nil), derivedIntervals...)
-	}
 	if len(c.Market.Sources) == 0 {
 		c.Market.Sources = []MarketSource{{
 			Name:            "binance",
@@ -406,7 +671,7 @@ func applyDefaults(c *Config) {
 			RESTBaseURL:     "https://fapi.binance.com",
 			WSBaseURL:       "wss://fstream.binance.com/stream",
 			RateLimitPerMin: 1200,
-			WSBatchSize:     c.Exchange.WSBatchSize,
+			WSBatchSize:     150,
 		}}
 	}
 	for i := range c.Market.Sources {
@@ -419,9 +684,6 @@ func applyDefaults(c *Config) {
 		}
 		if src.RateLimitPerMin <= 0 {
 			src.RateLimitPerMin = 1200
-		}
-		if src.WSBatchSize <= 0 {
-			src.WSBatchSize = c.Exchange.WSBatchSize
 		}
 		if src.WSBatchSize <= 0 {
 			src.WSBatchSize = 150
@@ -442,6 +704,7 @@ func applyDefaults(c *Config) {
 	if !c.AI.IncludeLastDecision {
 		c.AI.IncludeLastDecision = true
 	}
+	c.AI.MultiAgent.applyDefaults()
 
 	if c.Backtest.DataDir == "" {
 		c.Backtest.DataDir = "data/backtest"
@@ -513,24 +776,26 @@ func validate(c *Config) error {
 			return err
 		}
 	}
-	if len(c.Kline.Periods) == 0 {
-		return fmt.Errorf("kline.periods 至少需要一个周期")
+	models, err := c.AI.ResolveModelConfigs()
+	if err != nil {
+		return err
 	}
-	if len(c.WS.Periods) == 0 {
-		return fmt.Errorf("ws.periods 至少需要一个周期")
+	if len(models) == 0 {
+		return fmt.Errorf("ai.models 至少需要配置一个模型")
+	}
+	for _, m := range models {
+		if strings.TrimSpace(m.Model) == "" {
+			return fmt.Errorf("ai.models 中存在未配置 model 的条目 (id=%s)", m.ID)
+		}
+		if strings.TrimSpace(m.APIURL) == "" {
+			return fmt.Errorf("ai.models.%s 缺少 api_url（可通过 preset 继承）", m.ID)
+		}
+		if strings.TrimSpace(m.Provider) == "" {
+			return fmt.Errorf("ai.models.%s 缺少 provider", m.ID)
+		}
 	}
 	if c.Kline.MaxCached < 50 || c.Kline.MaxCached > 1000 {
 		return fmt.Errorf("kline.max_cached 需在 [50,1000]")
-	}
-	for _, p := range c.Kline.Periods {
-		if !isValidInterval(p) {
-			return fmt.Errorf("非法 kline 周期: %s", p)
-		}
-	}
-	for _, p := range c.WS.Periods {
-		if !isValidInterval(p) {
-			return fmt.Errorf("非法 ws 周期: %s", p)
-		}
 	}
 	if len(c.Market.Sources) == 0 {
 		return fmt.Errorf("market.sources 至少需要一个数据源")
@@ -573,6 +838,24 @@ func validate(c *Config) error {
 			return fmt.Errorf("backtest.rate_limit_per_min 需 > 0")
 		}
 	}
+	if c.AI.MultiAgent.Enabled {
+		ma := c.AI.MultiAgent
+		if strings.TrimSpace(ma.IndicatorTemplate) == "" {
+			return fmt.Errorf("ai.multi_agent.indicator_template 不能为空")
+		}
+		if strings.TrimSpace(ma.PatternTemplate) == "" {
+			return fmt.Errorf("ai.multi_agent.pattern_template 不能为空")
+		}
+		if strings.TrimSpace(ma.TrendTemplate) == "" {
+			return fmt.Errorf("ai.multi_agent.trend_template 不能为空")
+		}
+		if ma.MaxBlocks <= 0 {
+			return fmt.Errorf("ai.multi_agent.max_blocks 需 > 0")
+		}
+		if ma.MaxCharsPerBlock <= 0 {
+			return fmt.Errorf("ai.multi_agent.max_chars_per_block 需 > 0")
+		}
+	}
 	if c.Trading.Mode == "" {
 		c.Trading.Mode = "static"
 	}
@@ -608,6 +891,15 @@ func validateHorizonProfile(name string, p HorizonProfile) error {
 	}
 	if p.Indicators.RSI.Overbought <= p.Indicators.RSI.Oversold {
 		return fmt.Errorf("holding profile %s 的 RSI overbought 需大于 oversold", name)
+	}
+	if p.AnalysisSlice < 0 {
+		return fmt.Errorf("holding profile %s 的 analysis_slice 需 >= 0", name)
+	}
+	if p.SliceDropTail < 0 {
+		return fmt.Errorf("holding profile %s 的 slice_drop_tail 需 >= 0", name)
+	}
+	if p.AnalysisSlice > 0 && p.SliceDropTail >= p.AnalysisSlice {
+		return fmt.Errorf("holding profile %s 的 analysis_slice 需大于 slice_drop_tail", name)
 	}
 	return nil
 }

@@ -14,6 +14,11 @@ type KlineStore interface {
 	Get(ctx context.Context, symbol, interval string) ([]market.Candle, error)
 }
 
+// SnapshotExporter 导出固定窗口 K 线的抽象。
+type SnapshotExporter interface {
+	Export(ctx context.Context, symbol, interval string, limit int) ([]market.Candle, error)
+}
+
 // MemoryKlineStore 内存实现
 type MemoryKlineStore struct {
 	mu   sync.RWMutex
@@ -40,7 +45,15 @@ func (s *MemoryKlineStore) Put(ctx context.Context, symbol, interval string, ks 
 	defer s.mu.Unlock()
 	k := key(symbol, interval)
 	cur := s.data[k]
-	cur = append(cur, ks...)
+	for _, candle := range ks {
+		n := len(cur)
+		if n > 0 && cur[n-1].OpenTime == candle.OpenTime {
+			// 同一根 K 线的增量更新，覆盖末尾而非重复追加。
+			cur[n-1] = candle
+			continue
+		}
+		cur = append(cur, candle)
+	}
 	if len(cur) > max {
 		cur = cur[len(cur)-max:]
 	}
@@ -69,5 +82,27 @@ func (s *MemoryKlineStore) Get(ctx context.Context, symbol, interval string) ([]
 	cur := s.data[key(symbol, interval)]
 	out := make([]market.Candle, len(cur))
 	copy(out, cur)
+	return out, nil
+}
+
+// Export 返回最近 limit 根 K 线（按时间升序）
+func (s *MemoryKlineStore) Export(ctx context.Context, symbol, interval string, limit int) ([]market.Candle, error) {
+	if symbol == "" || interval == "" {
+		return nil, errors.New("symbol/interval 不能为空")
+	}
+	if limit <= 0 {
+		return nil, nil
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	cur := s.data[key(symbol, interval)]
+	if len(cur) == 0 {
+		return nil, nil
+	}
+	if limit > len(cur) {
+		limit = len(cur)
+	}
+	out := make([]market.Candle, limit)
+	copy(out, cur[len(cur)-limit:])
 	return out, nil
 }

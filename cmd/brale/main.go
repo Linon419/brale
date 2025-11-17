@@ -23,7 +23,8 @@ func main() {
 		log.Fatalf("读取配置失败: %v", err)
 	}
 	logger.SetLevel(cfg.App.LogLevel)
-	logger.Infof("✓ 配置加载成功（环境=%s，持仓周期=%s，订阅周期=%v）", cfg.App.Env, cfg.AI.ActiveHorizon, cfg.WS.Periods)
+	subIntervals := cfg.AI.HoldingProfiles[cfg.AI.ActiveHorizon].AllTimeframes()
+	logger.Infof("✓ 配置加载成功（环境=%s，持仓周期=%s，订阅周期=%v）", cfg.App.Env, cfg.AI.ActiveHorizon, subIntervals)
 
 	app, err := app.NewApp(cfg)
 	if err != nil {

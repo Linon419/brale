@@ -1,180 +1,243 @@
 # Example config for GitHub (no secrets). Copy to configs/config.toml for local use.
+# 若要拆分公共模板，可在任意文件顶部添加 include，如：
+# include = ["./base.toml", "./secrets.toml"]
 
 [app]
-# env：运行环境名（仅用于日志/通知提示，可自定义）
+# env：用于区分运行环境（只影响日志/通知），自由填写。
 env = "dev"
-# log_level：日志粒度，debug|info|warn|error
+# log_level：日志级别（debug|info|warn|error）。
 log_level = "info"
 
-[exchange]
-# name：交易所名称（展示用）
-name = "binance-futures"
-# ws_batch_size：WS 合并订阅批大小，过大可能被限流
-ws_batch_size = 150
-
 [symbols]
-# provider：default 读取 default_list；http 时从 REST 服务取数
+# provider：default 使用本地列表，http 则从远端拉取。
 provider = "default"
-# default_list：预设币种，provider=default 时生效
+# default_list：default 模式下的币种集合。
 default_list = ["BTCUSDT", "ETHUSDT"]
-# api_url：provider=http 生效，需返回数组或 {"symbols": []}
-# api_url = "http://your-service/symbols" # when provider=http
+# api_url：http 模式的远端地址（返回数组或 {"symbols": []}）。
+api_url = ""
 
 [kline]
-# periods：REST 预热所需的周期；空则跟随 active_horizon
-periods = []
-# max_cached：每个 symbol × period 缓存的最大 K 线数
-max_cached = 100
-
-[ws]
-# periods：WS 实时订阅周期；空则自动推导
-periods = []
+# max_cached：内存中每个 symbol×周期最多缓存的 K 线根数。
+max_cached = 200
 
 [market]
+# active_source：选择一个启用的数据源。
 active_source = "binance"
 
 [[market.sources]]
-  name = "binance"
-  enabled = true
-  rest_base_url = "https://fapi.binance.com"
-  ws_base_url = "wss://fstream.binance.com/stream"
-  rate_limit_per_min = 1200
-  ws_batch_size = 150
+# name：行情源唯一名称。
+name = "binance"
+# enabled：是否启用该数据源。
+enabled = true
+# rest_base_url：REST K 线接口根地址。
+rest_base_url = "https://fapi.binance.com"
+# ws_base_url：WS 合并流根地址，提供实时 K 线。
+ws_base_url = "wss://fstream.binance.com/stream"
+# rate_limit_per_min：REST 速率上限（每分钟请求数）。
+rate_limit_per_min = 1200
+# ws_batch_size：WS 订阅时的单批 symbol×interval 数，避免过大被限流。
+ws_batch_size = 150
 
 [ai]
-# aggregation：模型聚合策略，可选 first-wins | meta
-aggregation = "meta" # 可选："meta"（多模型加权多数决）
-# log_each_model：调试模式，打印每个模型的完整请求与响应
+# aggregation：模型聚合策略（first-wins | meta）。
+aggregation = "meta"
+# log_each_model：是否输出每个模型的请求/响应，调试时可开启。
 log_each_model = false
-# decision_interval_seconds：AI 决策之间的间隔（秒）
+# decision_interval_seconds：两次 AI 决策之间的时间间隔（秒）。
 decision_interval_seconds = 60
-# active_horizon：选择一个 holding_horizon_profiles 下的配置
-active_horizon = "one_hour"
-# include_last_decision：是否把上一轮决策内容传给下一轮模型
-include_last_decision = true
-# last_decision_max_age_seconds：上一轮决策的最大保留时长
-last_decision_max_age_seconds = 3600
-# decision_log_path：实时决策日志的存储位置（SQLite），留空禁用
+# decision_log_path：实时决策日志 SQLite 路径，留空则不落盘。
 decision_log_path = "data/live/decisions.db"
-# models：在此列出所有可能调用的模型，采用 OpenAI 兼容协议
-models = [
-  # 直接在此处配置 OpenAI / DeepSeek / Qwen 的 API URL、Key 与模型名
-  # id：自定义标识；provider：openai|deepseek|qwen（皆按 OpenAI 兼容接口调用）
-  # api_url：OpenAI 兼容 BaseURL；api_key：密钥；model：模型名
-  { id = "openai",   provider = "openai",   enabled = true, api_url = "", api_key = "", model = "gpt-oss-20b" },
-  { id = "deepseek", provider = "deepseek", enabled = true, api_url = "",  api_key = "sc10f2cd660c09a4c2", model = "deepseek/deepseek-v3.2-exp" },
-  { id = "qwen",     provider = "qwen",     enabled = true, api_url = "ht", api_key = "s02c027494", model = "qwen3-next-80b-a3b-thinking" },
-  { id = "kimi",     provider = "kimi",     enabled = false, api_url = "https://v1", api_key = "sf77bee2a171e4", model = "moonshotai/kimi-k2-thinking" },
-  { id = "vanchin",  provider = "openai",   enabled = true,  api_url = "hmlake.andpoints",api_key = "", model = "ep-z5gybo-1762362617887467865" },
-  { id = "doubao",  provider = "doubao",   enabled = true,  api_url = "https://1",api_key = "e2a171e4", model = "doubao-seed-1.6-flash" }
-]
+# include_last_decision：是否把上一轮决策作为上下文提示模型。
+include_last_decision = true
+# last_decision_max_age_seconds：上一轮决策可复用的最长时间（秒）。
+last_decision_max_age_seconds = 3600
+# active_horizon：当前持仓周期的名称，对应 holding_horizon_profiles.*。
+active_horizon = "one_hour"
+# weights：meta 聚合使用的模型权重（键为模型 id，值为浮点权重）。
+weights = { openai_main = 1.0, deepseek_backup = 1.0, qwen_helper = 1.0 }
 
-# weights：Meta 聚合专用，为每个模型 id 设置权重；未配置的默认 1.0
-weights = { openai = 1.0, deepseek = 1.0, qwen = 1.0, vanchin = 1.0 }
-
-[ai.holding_horizon_profiles.one_hour]
-# entry_timeframes/confirm/background：定义入场、确认、背景所用的周期集合
-entry_timeframes = ["5m", "15m"]
-confirm_timeframes = ["1h"]
-background_timeframes = ["4h"]
-[ai.holding_horizon_profiles.one_hour.indicators.ema]
-# fast/mid/slow：EMA 周期（单位：K 线数）
+[ai.profile_defaults]
+# analysis_slice：若 profile 未指定，默认让 LLM 查看最近多少根。
+analysis_slice = 46
+# slice_drop_tail：默认丢弃最新多少根未收盘蜡烛。
+slice_drop_tail = 3
+[ai.profile_defaults.indicators.ema]
+# fast/mid/slow：默认 EMA 周期（单位：根）。
 fast = 21
 mid = 50
 slow = 200
-[ai.holding_horizon_profiles.one_hour.indicators.rsi]
-# period/over*：RSI 窗口与上下阈值
+[ai.profile_defaults.indicators.rsi]
+# period/oversold/overbought：默认 RSI 参数。
 period = 14
 oversold = 33
 overbought = 68
 
+[ai.provider_presets.openai]
+# api_url：OpenAI 兼容接口的 BaseURL。
+api_url = "https://api.openai.com/v1"
+# api_key：对应接口的密钥（示例为空，请本地填写）。
+api_key = ""
+# supports_vision：该 Provider 是否支持 image_url 多模态。
+supports_vision = true
+# expect_json：是否强制 response_format=json（强烈推荐）。
+expect_json = true
+
+[ai.provider_presets.deepseek]
+# api_url：DeepSeek OpenAI 兼容入口。
+api_url = "https://api.deepseek.com/v1"
+# api_key：DeepSeek API 密钥。
+api_key = ""
+# supports_vision：DeepSeek 模型是否支持图像。
+supports_vision = false
+# expect_json：是否强制 JSON 输出。
+expect_json = true
+
+[ai.provider_presets.qwen]
+# api_url：Qwen OpenAI 兼容入口。
+api_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+# api_key：Qwen API 密钥。
+api_key = ""
+# supports_vision：Qwen 是否支持图像。
+supports_vision = true
+# expect_json：是否强制 JSON 输出。
+expect_json = true
+
+[[ai.models]]
+# id：模型唯一标识，用于打权重/日志。
+id = "openai_main"
+# provider：业务层识别用的 Provider 名称（openai/deepseek/qwen...）。
+provider = "openai"
+# preset：引用上方 provider_presets 的名称，省去重复填写 api_url/api_key。
+preset = "openai"
+# enabled：true 表示参与决策，false 仅保留配置。
+enabled = true
+# model：具体模型名称。
+model = "gpt-4o-mini"
+# supports_vision/expect_json：可按需覆盖预设值。
+supports_vision = true
+expect_json = true
+
+[[ai.models]]
+# id：第二个模型
+id = "deepseek_backup"
+# provider：DeepSeek
+provider = "deepseek"
+# preset：复用 deepseek 预设
+preset = "deepseek"
+# enabled：启用
+enabled = true
+# model：DeepSeek 模型名
+model = "deepseek-chat"
+
+[[ai.models]]
+# id：第三个模型
+id = "qwen_helper"
+# provider：Qwen
+provider = "qwen"
+# preset：引用 qwen 预设
+preset = "qwen"
+# enabled：启用
+enabled = false
+# model：Qwen 模型名
+model = "qwen-max"
+
+[ai.multi_agent]
+# enabled：是否启用多阶段 Agent（指标→形态→趋势→决策）。
+enabled = true
+# indicator_provider/pattern_provider/trend_provider：可指定由哪个模型执行（留空则使用模型列表顺序）。
+indicator_provider = ""
+pattern_provider = ""
+trend_provider = ""
+# indicator_template/pattern_template/trend_template：对应 prompts 目录下的模板名称。
+indicator_template = "agent_indicator"
+pattern_template = "agent_pattern"
+trend_template = "agent_trend"
+# max_blocks：单次拆分的 symbol×interval 最大组合数。
+max_blocks = 4
+# max_chars_per_block：传给子 Agent 的 JSON 字符上限。
+max_chars_per_block = 1600
+
+[ai.holding_horizon_profiles.one_hour]
+# entry_timeframes：入场判断使用的周期列表。
+entry_timeframes = ["5m", "15m"]
+# confirm_timeframes：信号确认用周期。
+confirm_timeframes = ["1h"]
+# background_timeframes：趋势背景周期。
+background_timeframes = ["4h"]
+# 若未指定指标，将继承 profile_defaults。此处示例：沿用默认指标。
+
 [ai.holding_horizon_profiles.four_hour]
-# 周期配置与指标含义与 one_hour 相同，仅针对更长持仓
+# 更长持仓的配置，仅列出差异化指标。
 entry_timeframes = ["15m", "30m"]
 confirm_timeframes = ["4h"]
 background_timeframes = ["1d"]
-[ai.holding_horizon_profiles.four_hour.indicators.ema]
-# fast/mid/slow：EMA 周期
-fast = 21
-mid = 50
-slow = 200
 [ai.holding_horizon_profiles.four_hour.indicators.rsi]
-# RSI 参数
-period = 14
+# four_hour 对 RSI 阈值更保守。
 oversold = 30
 overbought = 70
 
 [ai.holding_horizon_profiles.one_day]
-# 日线级别策略配置
+# 日线级策略示例。
 entry_timeframes = ["1h"]
 confirm_timeframes = ["4h", "1d"]
 background_timeframes = ["1w"]
-[ai.holding_horizon_profiles.one_day.indicators.ema]
-# EMA 周期
-fast = 21
-mid = 50
-slow = 200
 [ai.holding_horizon_profiles.one_day.indicators.rsi]
-# RSI 参数
-period = 14
+# 日线对 RSI 阈值更宽松。
 oversold = 35
 overbought = 65
 
-# If your provider requires a non-standard header (e.g., X-API-Key), you can add:
-# { id = "custom", provider = "openai", enabled = false, api_url = "https://your-base/v1", model = "your-model",
-#   headers = { "X-API-Key" = "<set-locally>" } }
-
 [mcp]
-# timeout_seconds：单次模型推理最长等待时间（秒）
+# timeout_seconds：单次模型推理超时时间（秒）。
 timeout_seconds = 120
 
 [prompt]
-# dir：提示词模板目录，建议只读
+# dir：提示词模板目录。
 dir = "prompts"
-# system_template：默认系统提示模板名（不含 .txt）
+# system_template：默认系统提示模板名（不含 .txt）。
 system_template = "default"
 
 [backtest]
-# enabled：是否启用回测子系统
+# enabled：是否启用回测 HTTP 服务。
 enabled = false
-# data_dir：回测数据存储路径
+# data_dir：回测数据存储目录。
 data_dir = "data/backtest"
-# http_addr：回测 HTTP 服务监听端口
+# http_addr：回测 HTTP 监听地址。
 http_addr = ":9991"
-# default_exchange：默认回测交易所
+# default_exchange：回测任务默认使用的数据源。
 default_exchange = "binance"
-# rate_limit_per_min：下载行情时的速率限制
+# rate_limit_per_min：历史 K 线下载的速率限制。
 rate_limit_per_min = 600
-# max_batch：单次下载最大条数
+# max_batch：单次拉取的最大根数。
 max_batch = 1000
-# max_concurrent：允许的回测并发任务数
+# max_concurrent：允许的并发回测/拉取任务数。
 max_concurrent = 2
 
 [notify.telegram]
-# enabled：是否启用 Telegram 推送
+# enabled：是否开启 Telegram 推送。
 enabled = false
-# bot_token/chat_id：请在本地填写真实值
-bot_token = ""  # set locally
-chat_id = ""    # set locally
+# bot_token：Bot 的 Token（示例置空，请本地填写）。
+bot_token = ""
+# chat_id：接收通知的聊天 ID。
+chat_id = ""
 
 [advanced]
-# liquidity_filter_usd_m：按 OI×价格估算的最低流动性（百万 USD）
+# liquidity_filter_usd_m：按 OI×价格估算的最低流动性（百万 USD）。
 liquidity_filter_usd_m = 15
-# min_risk_reward：允许的最小风险回报比
+# min_risk_reward：最小允许的风险回报比。
 min_risk_reward = 3.0
-# open_cooldown_seconds：同一币种同方向的最小开仓间隔（秒）
+# open_cooldown_seconds：同 symbol 同方向开仓的最小冷却间隔（秒）。
 open_cooldown_seconds = 180
-# max_opens_per_cycle：每个决策周期可新开的最大仓位数
+# max_opens_per_cycle：单个决策周期内允许的新开仓数量。
 max_opens_per_cycle = 3
 
 [trading]
-# mode：资金来源模式，现阶段仅支持 static，后续可扩展 live 读取真实余额
+# mode：资金来源策略，当前仅支持 static。
 mode = "static"
-# static_balance：静态账户初始资金（USDT）；后续可接入真实余额替换
+# static_balance：静态账户初始资金（USDT）。
 static_balance = 10000
-# max_position_pct：单笔最大仓位占用比例（0-1），用于推导默认开仓规模
+# max_position_pct：单笔最大仓位占总资金的比例 (0~1]。
 max_position_pct = 0.05
-# default_position_usd：若填写则固定为该仓位金额；留 0 则使用 static_balance × max_position_pct
+# default_position_usd：若 >0 则固定仓位金额；为 0 时按 static_balance×max_position_pct 推导。
 default_position_usd = 0
-# default_leverage：当模型未给出 leverage 时的兜底倍数
+# default_leverage：当决策未给出 leverage 时的兜底倍数。
 default_leverage = 2

@@ -7,11 +7,13 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 
 	"brale/internal/decision"
+	"brale/internal/gateway/provider"
 	"brale/internal/logger"
 
 	_ "modernc.org/sqlite"
@@ -26,23 +28,58 @@ type DecisionLogStore struct {
 
 // DecisionLogRecord 代表一条日志记录，会持久化模型输入/输出摘要。
 type DecisionLogRecord struct {
-	ID         int64                     `json:"id"`
-	Timestamp  int64                     `json:"ts"`
-	Candidates []string                  `json:"candidates,omitempty"`
-	Timeframes []string                  `json:"timeframes,omitempty"`
-	Horizon    string                    `json:"horizon"`
-	ProviderID string                    `json:"provider_id"`
-	Stage      string                    `json:"stage"`
-	System     string                    `json:"system_prompt"`
-	User       string                    `json:"user_prompt"`
-	RawOutput  string                    `json:"raw_output"`
-	RawJSON    string                    `json:"raw_json"`
-	Meta       string                    `json:"meta_summary"`
-	Decisions  []decision.Decision       `json:"decisions"`
+	TraceID    string                      `json:"trace_id"`
+	ID         int64                       `json:"id"`
+	Timestamp  int64                       `json:"ts"`
+	Candidates []string                    `json:"candidates,omitempty"`
+	Timeframes []string                    `json:"timeframes,omitempty"`
+	Horizon    string                      `json:"horizon"`
+	ProviderID string                      `json:"provider_id"`
+	Stage      string                      `json:"stage"`
+	System     string                      `json:"system_prompt"`
+	User       string                      `json:"user_prompt"`
+	RawOutput  string                      `json:"raw_output"`
+	RawJSON    string                      `json:"raw_json"`
+	Meta       string                      `json:"meta_summary"`
+	Decisions  []decision.Decision         `json:"decisions"`
 	Positions  []decision.PositionSnapshot `json:"positions"`
-	Symbols    []string                  `json:"symbols,omitempty"`
-	Error      string                    `json:"error,omitempty"`
-	Note       string                    `json:"note,omitempty"`
+	Symbols    []string                    `json:"symbols,omitempty"`
+	Images     []ImageAttachment           `json:"images,omitempty"`
+	Error      string                      `json:"error,omitempty"`
+	Note       string                      `json:"note,omitempty"`
+}
+
+// ImageAttachment 保存注入模型的图像信息（DataURI + 描述）。
+type ImageAttachment struct {
+	DataURI     string `json:"data_uri"`
+	Description string `json:"description,omitempty"`
+}
+
+// LiveDecisionTrace 用于前端展示“决策线”。
+type LiveDecisionTrace struct {
+	TraceID    string             `json:"trace_id"`
+	Timestamp  int64              `json:"ts"`
+	Horizon    string             `json:"horizon"`
+	Candidates []string           `json:"candidates,omitempty"`
+	Timeframes []string           `json:"timeframes,omitempty"`
+	Symbols    []string           `json:"symbols,omitempty"`
+	Steps      []LiveDecisionStep `json:"steps"`
+}
+
+// LiveDecisionStep 描述单次模型请求/响应。
+type LiveDecisionStep struct {
+	Stage      string              `json:"stage"`
+	ProviderID string              `json:"provider_id"`
+	Timestamp  int64               `json:"ts"`
+	System     string              `json:"system_prompt"`
+	User       string              `json:"user_prompt"`
+	RawOutput  string              `json:"raw_output"`
+	RawJSON    string              `json:"raw_json"`
+	Meta       string              `json:"meta_summary"`
+	Decisions  []decision.Decision `json:"decisions"`
+	Images     []ImageAttachment   `json:"images,omitempty"`
+	Error      string              `json:"error,omitempty"`
+	Note       string              `json:"note,omitempty"`
 }
 
 // LiveOrder 记录实盘执行事件（预留，暂未对外暴露）。
@@ -61,17 +98,21 @@ type LiveOrder struct {
 
 // LivePosition 记录实盘持仓状态（预留，暂未对外暴露）。
 type LivePosition struct {
-	ID        int64   `json:"id"`
-	Symbol    string  `json:"symbol"`
-	Side      string  `json:"side"`
-	Entry     float64 `json:"entry_price"`
-	Exit      float64 `json:"exit_price"`
-	Quantity  float64 `json:"quantity"`
-	PnL       float64 `json:"pnl"`
-	Status    string  `json:"status"`
-	OpenedAt  int64   `json:"opened_at"`
-	ClosedAt  int64   `json:"closed_at"`
-	UpdatedAt int64   `json:"updated_at"`
+	ID         int64   `json:"id"`
+	Symbol     string  `json:"symbol"`
+	Side       string  `json:"side"`
+	Entry      float64 `json:"entry_price"`
+	Exit       float64 `json:"exit_price"`
+	Quantity   float64 `json:"quantity"`
+	Notional   float64 `json:"notional"`
+	Leverage   float64 `json:"leverage"`
+	TakeProfit float64 `json:"take_profit"`
+	StopLoss   float64 `json:"stop_loss"`
+	PnL        float64 `json:"pnl"`
+	Status     string  `json:"status"`
+	OpenedAt   int64   `json:"opened_at"`
+	ClosedAt   int64   `json:"closed_at"`
+	UpdatedAt  int64   `json:"updated_at"`
 }
 
 // LiveDecisionQuery 用于筛选实时日志。
@@ -134,9 +175,11 @@ func ensureDecisionLogSchema(db *sql.DB) error {
 			decisions_json TEXT,
 			positions_json TEXT,
 			symbols TEXT,
+			images_json TEXT,
 			error TEXT,
 			note TEXT,
-			created_at INTEGER NOT NULL
+			created_at INTEGER NOT NULL,
+			trace_id TEXT
 		);
 		`,
 		`CREATE TABLE IF NOT EXISTS live_orders (
@@ -168,6 +211,10 @@ func ensureDecisionLogSchema(db *sql.DB) error {
 			entry_price REAL,
 			exit_price REAL,
 			quantity REAL,
+			notional REAL,
+			leverage REAL,
+			take_profit REAL,
+			stop_loss REAL,
 			pnl REAL,
 			status TEXT,
 			opened_at INTEGER,
@@ -204,7 +251,9 @@ func ensureDecisionLogColumns(db *sql.DB) error {
 		column string
 		typ    string
 	}{
+		{"live_decision_logs", "trace_id", "TEXT"},
 		{"live_decision_logs", "symbols", "TEXT"},
+		{"live_decision_logs", "images_json", "TEXT"},
 		{"live_orders", "type", "TEXT"},
 		{"live_orders", "fee", "REAL"},
 		{"live_orders", "timeframe", "TEXT"},
@@ -217,6 +266,10 @@ func ensureDecisionLogColumns(db *sql.DB) error {
 		{"live_orders", "expected_rr", "REAL"},
 		{"last_decisions", "horizon", "TEXT"},
 		{"last_decisions", "decisions_json", "TEXT"},
+		{"live_positions", "notional", "REAL"},
+		{"live_positions", "leverage", "REAL"},
+		{"live_positions", "take_profit", "REAL"},
+		{"live_positions", "stop_loss", "REAL"},
 	}
 	for _, col := range cols {
 		if err := addColumnIfMissing(db, col.table, col.column, col.typ); err != nil {
@@ -285,8 +338,8 @@ func (s *DecisionLogStore) Insert(ctx context.Context, rec DecisionLogRecord) (i
 	res, err := db.ExecContext(ctx, `
 		INSERT INTO live_decision_logs
 			(ts, candidates, timeframes, horizon, provider_id, stage, system_prompt, user_prompt,
-			 raw_output, raw_json, meta_summary, decisions_json, positions_json, symbols, error, note, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			 raw_output, raw_json, meta_summary, decisions_json, positions_json, symbols, images_json, error, note, created_at, trace_id)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		ts,
 		enc(rec.Candidates),
 		enc(rec.Timeframes),
@@ -301,9 +354,11 @@ func (s *DecisionLogStore) Insert(ctx context.Context, rec DecisionLogRecord) (i
 		enc(rec.Decisions),
 		enc(rec.Positions),
 		symbolBlob,
+		enc(rec.Images),
 		rec.Error,
 		rec.Note,
 		now,
+		rec.TraceID,
 	)
 	if err != nil {
 		return 0, err
@@ -326,9 +381,9 @@ func (s *DecisionLogStore) ListDecisions(ctx context.Context, q LiveDecisionQuer
 	}
 	var args []interface{}
 	var sb strings.Builder
-	sb.WriteString(`SELECT id, ts, candidates, timeframes, horizon, provider_id, stage,
+	sb.WriteString(`SELECT id, trace_id, ts, candidates, timeframes, horizon, provider_id, stage,
 		system_prompt, user_prompt, raw_output, raw_json, meta_summary, decisions_json,
-		positions_json, symbols, error, note
+		positions_json, symbols, images_json, error, note
 		FROM live_decision_logs WHERE 1=1`)
 	if q.Provider != "" {
 		sb.WriteString(" AND provider_id=?")
@@ -358,6 +413,7 @@ func (s *DecisionLogStore) ListDecisions(ctx context.Context, q LiveDecisionQuer
 			decisions  sql.NullString
 			positions  sql.NullString
 			symbols    sql.NullString
+			images     sql.NullString
 			system     sql.NullString
 			user       sql.NullString
 			rawOut     sql.NullString
@@ -366,9 +422,9 @@ func (s *DecisionLogStore) ListDecisions(ctx context.Context, q LiveDecisionQuer
 			errorStr   sql.NullString
 			noteStr    sql.NullString
 		)
-		if err := rows.Scan(&rec.ID, &rec.Timestamp, &candidates, &timeframes, &rec.Horizon,
+		if err := rows.Scan(&rec.ID, &rec.TraceID, &rec.Timestamp, &candidates, &timeframes, &rec.Horizon,
 			&rec.ProviderID, &rec.Stage, &system, &user, &rawOut, &rawJSON, &meta,
-			&decisions, &positions, &symbols, &errorStr, &noteStr); err != nil {
+			&decisions, &positions, &symbols, &images, &errorStr, &noteStr); err != nil {
 			return nil, err
 		}
 		rec.System = system.String
@@ -383,6 +439,7 @@ func (s *DecisionLogStore) ListDecisions(ctx context.Context, q LiveDecisionQuer
 		rec.Decisions = decodeDecisionArray(decisions.String)
 		rec.Positions = decodePositionArray(positions.String)
 		rec.Symbols = decodeSymbolBlob(symbols.String)
+		rec.Images = decodeImageArray(images.String)
 		list = append(list, rec)
 	}
 	return list, rows.Err()
@@ -407,6 +464,7 @@ func (o *DecisionLogObserver) AfterDecide(ctx context.Context, trace decision.De
 		return
 	}
 	base := DecisionLogRecord{
+		TraceID:    trace.TraceID,
 		Timestamp:  time.Now().UnixMilli(),
 		Candidates: cloneStrings(trace.Candidates),
 		Timeframes: cloneStrings(trace.Timeframes),
@@ -424,6 +482,7 @@ func (o *DecisionLogObserver) AfterDecide(ctx context.Context, trace decision.De
 		rec.Meta = out.Parsed.MetaSummary
 		rec.Decisions = append([]decision.Decision(nil), out.Parsed.Decisions...)
 		rec.Symbols = collectSymbols(rec.Decisions)
+		rec.Images = attachmentsFromProviderImages(out.Images)
 		rec.Note = "provider"
 		if out.Err != nil {
 			rec.Error = out.Err.Error()
@@ -444,12 +503,121 @@ func (o *DecisionLogObserver) AfterDecide(ctx context.Context, trace decision.De
 	finalRec.Meta = trace.Best.Parsed.MetaSummary
 	finalRec.Decisions = append([]decision.Decision(nil), trace.Best.Parsed.Decisions...)
 	finalRec.Symbols = collectSymbols(finalRec.Decisions)
+	finalRec.Images = attachmentsFromProviderImages(trace.Best.Images)
 	if trace.Best.Err != nil {
 		finalRec.Error = trace.Best.Err.Error()
 	}
 	if _, err := o.store.Insert(ctx, finalRec); err != nil {
 		logger.Warnf("写入决策日志失败(final): %v", err)
 	}
+	if len(trace.AgentInsights) > 0 {
+		for _, ins := range trace.AgentInsights {
+			stage := strings.TrimSpace(ins.Stage)
+			if stage == "" {
+				continue
+			}
+			rec := base
+			rec.Stage = "agent:" + stage
+			rec.ProviderID = ins.ProviderID
+			if sys := strings.TrimSpace(ins.System); sys != "" {
+				rec.System = sys
+			}
+			if usr := strings.TrimSpace(ins.User); usr != "" {
+				rec.User = usr
+			}
+			rec.RawOutput = ins.Output
+			rec.RawJSON = ""
+			rec.Meta = ""
+			rec.Decisions = nil
+			rec.Symbols = nil
+			rec.Note = "agent"
+			if ins.Warned {
+				rec.Note += "|warned"
+			}
+			rec.Error = ins.Error
+			if _, err := o.store.Insert(ctx, rec); err != nil {
+				logger.Warnf("写入决策日志失败(agent:%s): %v", stage, err)
+			}
+		}
+	}
+}
+
+// BuildLiveDecisionTraces 将平铺日志转为按 trace_id 分组的决策线。
+func BuildLiveDecisionTraces(records []DecisionLogRecord) []LiveDecisionTrace {
+	if len(records) == 0 {
+		return nil
+	}
+	type stepWrap struct {
+		step  LiveDecisionStep
+		order int64
+	}
+	type builder struct {
+		trace LiveDecisionTrace
+		steps []stepWrap
+	}
+	groups := make(map[string]*builder)
+	var orderKeys []string
+	for idx, rec := range records {
+		key := strings.TrimSpace(rec.TraceID)
+		if key == "" {
+			key = fmt.Sprintf("legacy-%d-%s-%s-%d", rec.Timestamp, rec.Horizon, strings.Join(rec.Symbols, "|"), idx)
+		}
+		b := groups[key]
+		if b == nil {
+			trace := LiveDecisionTrace{
+				TraceID:    key,
+				Timestamp:  rec.Timestamp,
+				Horizon:    rec.Horizon,
+				Candidates: cloneStrings(rec.Candidates),
+				Timeframes: cloneStrings(rec.Timeframes),
+				Symbols:    cloneStrings(rec.Symbols),
+			}
+			b = &builder{trace: trace}
+			groups[key] = b
+			orderKeys = append(orderKeys, key)
+		} else if rec.Timestamp > b.trace.Timestamp {
+			b.trace.Timestamp = rec.Timestamp
+		}
+		if len(rec.Symbols) > 0 {
+			b.trace.Symbols = mergeSymbolLists(b.trace.Symbols, rec.Symbols)
+		}
+		step := LiveDecisionStep{
+			Stage:      rec.Stage,
+			ProviderID: rec.ProviderID,
+			Timestamp:  rec.Timestamp,
+			System:     rec.System,
+			User:       rec.User,
+			RawOutput:  rec.RawOutput,
+			RawJSON:    rec.RawJSON,
+			Meta:       rec.Meta,
+			Images:     cloneImages(rec.Images),
+			Error:      rec.Error,
+			Note:       rec.Note,
+		}
+		if len(rec.Decisions) > 0 {
+			step.Decisions = append([]decision.Decision(nil), rec.Decisions...)
+		}
+		order := (rec.Timestamp << 20) + rec.ID
+		b.steps = append(b.steps, stepWrap{step: step, order: order})
+	}
+	for _, b := range groups {
+		sort.Slice(b.steps, func(i, j int) bool {
+			return b.steps[i].order < b.steps[j].order
+		})
+		steps := make([]LiveDecisionStep, len(b.steps))
+		for i, sp := range b.steps {
+			steps[i] = sp.step
+		}
+		b.trace.Steps = steps
+	}
+	sort.Slice(orderKeys, func(i, j int) bool {
+		return groups[orderKeys[i]].trace.Timestamp > groups[orderKeys[j]].trace.Timestamp
+	})
+	out := make([]LiveDecisionTrace, len(orderKeys))
+	for i, key := range orderKeys {
+		out[i] = groups[key].trace
+	}
+	return out
 }
 
 func cloneStrings(src []string) []string {
@@ -470,6 +638,15 @@ func cloneSnapshots(src []decision.PositionSnapshot) []decision.PositionSnapshot
 	return dst
 }
 
+func cloneImages(src []ImageAttachment) []ImageAttachment {
+	if len(src) == 0 {
+		return nil
+	}
+	dst := make([]ImageAttachment, len(src))
+	copy(dst, src)
+	return dst
+}
+
 func collectSymbols(decisions []decision.Decision) []string {
 	if len(decisions) == 0 {
 		return nil
@@ -486,6 +663,32 @@ func collectSymbols(decisions []decision.Decision) []string {
 		}
 		seen[sym] = struct{}{}
 		out = append(out, sym)
+	}
+	return out
+}
+
+func mergeSymbolLists(dst, src []string) []string {
+	if len(src) == 0 {
+		return dst
+	}
+	seen := make(map[string]struct{}, len(dst)+len(src))
+	var out []string
+	appendSymbol := func(sym string) {
+		sym = strings.ToUpper(strings.TrimSpace(sym))
+		if sym == "" {
+			return
+		}
+		if _, ok := seen[sym]; ok {
+			return
+		}
+		seen[sym] = struct{}{}
+		out = append(out, sym)
+	}
+	for _, sym := range dst {
+		appendSymbol(sym)
+	}
+	for _, sym := range src {
+		appendSymbol(sym)
 	}
 	return out
 }
@@ -574,10 +777,54 @@ func decodePositionArray(raw string) []decision.PositionSnapshot {
 	return arr
 }
 
+func decodeImageArray(raw string) []ImageAttachment {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	var arr []ImageAttachment
+	if err := json.Unmarshal([]byte(raw), &arr); err != nil {
+		logger.Warnf("解析图像附件失败: %v", err)
+		return nil
+	}
+	cleaned := make([]ImageAttachment, 0, len(arr))
+	for _, img := range arr {
+		img.DataURI = strings.TrimSpace(img.DataURI)
+		img.Description = strings.TrimSpace(img.Description)
+		if img.DataURI == "" {
+			continue
+		}
+		cleaned = append(cleaned, img)
+	}
+	if len(cleaned) == 0 {
+		return nil
+	}
+	return cleaned
+}
+
 func symbolLikePattern(sym string) string {
 	sym = strings.ToUpper(strings.TrimSpace(sym))
 	if sym == "" {
 		return "%"
 	}
 	return "%|" + sym + "|%"
+}
+
+func attachmentsFromProviderImages(images []provider.ImagePayload) []ImageAttachment {
+	if len(images) == 0 {
+		return nil
+	}
+	out := make([]ImageAttachment, 0, len(images))
+	for _, img := range images {
+		data := strings.TrimSpace(img.DataURI)
+		if data == "" {
+			continue
+		}
+		desc := strings.TrimSpace(img.Description)
+		out = append(out, ImageAttachment{DataURI: data, Description: desc})
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }

@@ -229,8 +229,30 @@ function renderPromptDetails(log) {
 }
 
 function formatSymbols(list = []) {
-  if (!list || !list.length) return "-";
-  return list.join(", ");
+  if (!list) return "-";
+  if (Array.isArray(list)) {
+    return list.length ? list.join(", ") : "-";
+  }
+  if (typeof list === "string") {
+    return list || "-";
+  }
+  return "-";
+}
+
+function renderStatus(log) {
+  const parts = [];
+  if (log.error && log.error.length) {
+    parts.push(`❗ ${escapeHTML(previewText(log.error, 80))}`);
+  } else {
+    parts.push("OK");
+  }
+  if (log.meta_summary && log.meta_summary.length) {
+    parts.push(`<br/><small>${escapeHTML(previewText(log.meta_summary, 120))}</small>`);
+  }
+  if (log.note && log.note.length) {
+    parts.push(`<br/><small>${escapeHTML(previewText(log.note, 80))}</small>`);
+  }
+  return parts.join("");
 }
 
 function updateLogsTable(list) {
@@ -246,60 +268,390 @@ function updateLogsTable(list) {
   list.forEach((log) => {
     const row = document.createElement("tr");
     const provider = `${log.provider_id || "-"} / ${log.stage || "-"}`;
-    const status =
-      log.error && log.error.length
-        ? `❗ ${escapeHTML(previewText(log.error, 80))}`
-        : "OK";
-    const meta =
-      log.meta_summary && log.meta_summary.length
-        ? `<br/><small>${escapeHTML(previewText(log.meta_summary, 120))}</small>`
-        : "";
-    const note =
-      log.note && log.note.length
-        ? `<br/><small>${escapeHTML(previewText(log.note, 80))}</small>`
-        : "";
+    const decisions = escapeHTML(summarizeDecisions(log.decisions));
     row.innerHTML = `
       <td>${formatTs(log.candle_ts)}</td>
       <td>${log.timeframe}</td>
       <td>${provider}</td>
-      <td>${summarizeDecisions(log.decisions)}</td>
-      <td>${status}${meta}${note}</td>
+      <td>${decisions}</td>
+      <td>${renderStatus(log)}</td>
       <td>${renderPromptDetails(log)}</td>
     `;
     body.appendChild(row);
   });
 }
 
+function stageBadge(stage) {
+  const text = stage || "-";
+  const key = text.toLowerCase();
+  let cls = "stage-default";
+  if (key === "final" || key === "aggregate") {
+    cls = "stage-final";
+  } else if (key === "provider" || key === "multi-agent") {
+    cls = "stage-provider";
+  }
+  return `<span class="stage-badge ${cls}">${escapeHTML(text)}</span>`;
+}
+
+function renderProviderCell(log) {
+  const provider = log.provider_id ? escapeHTML(log.provider_id) : "-";
+  return `${provider} ${stageBadge(log.stage)}`;
+}
+
+function renderProviderPromptPreview(log) {
+  const preview = previewText(
+    log.raw_output || log.raw_json || log.meta_summary || "-",
+    140
+  );
+  return `<div class="prompt-preview">${escapeHTML(preview)}</div>`;
+}
+
+function groupLiveLogs(list) {
+  const groups = [];
+  const map = new Map();
+  list.forEach((log) => {
+    const ts = log.ts || log.candle_ts || 0;
+    const symbols = Array.isArray(log.symbols)
+      ? log.symbols
+      : log.symbols
+      ? [log.symbols]
+      : [];
+    const horizon = log.horizon || log.profile || "";
+    const timeframe =
+      log.timeframe ||
+      (Array.isArray(log.timeframes) && log.timeframes.length
+        ? log.timeframes.join(", ")
+        : log.timeframes || "-");
+    const key = `${ts}-${symbols.join("|")}-${horizon}`;
+    let group = map.get(key);
+    if (!group) {
+      group = {
+        key,
+        ts,
+        symbols,
+        horizon,
+        timeframe,
+        providers: [],
+      };
+      map.set(key, group);
+      groups.push(group);
+    }
+    const stage = (log.stage || "").toLowerCase();
+    if (stage === "final" || stage === "aggregate") {
+      group.final = log;
+    } else {
+      group.providers.push(log);
+    }
+  });
+  groups.sort((a, b) => (b.ts || 0) - (a.ts || 0));
+  return groups;
+}
+
+function logToTimelineStep(log) {
+  if (!log) return null;
+  return {
+    stage: log.stage || "",
+    provider_id: log.provider_id || "",
+    ts: log.ts || log.candle_ts || 0,
+    system_prompt: log.system_prompt || "",
+    user_prompt: log.user_prompt || "",
+    raw_output: log.raw_output || "",
+    raw_json: log.raw_json || "",
+    meta_summary: log.meta_summary || "",
+    decisions: Array.isArray(log.decisions) ? log.decisions : [],
+    error: log.error || "",
+    note: log.note || "",
+  };
+}
+
+function buildTimelineFallback(logs) {
+  const groups = groupLiveLogs(logs || []);
+  return groups.map((group, idx) => {
+    const steps = [];
+    const pushStep = (item) => {
+      const step = logToTimelineStep(item);
+      if (step) {
+        steps.push(step);
+      }
+    };
+    group.providers.forEach(pushStep);
+    if (group.final) {
+      pushStep(group.final);
+    }
+    return {
+      trace_id:
+        (group.final && group.final.trace_id) ||
+        (group.providers[0] && group.providers[0].trace_id) ||
+        group.key ||
+        `legacy-${idx}`,
+      ts: group.ts,
+      horizon: group.horizon,
+      symbols: group.symbols,
+      candidates:
+        (group.final && group.final.candidates) ||
+        (group.providers[0] && group.providers[0].candidates) ||
+        [],
+      timeframes:
+        (group.final && group.final.timeframes) ||
+        (group.providers[0] && group.providers[0].timeframes) ||
+        [],
+      steps,
+    };
+  });
+}
+
+function ensureTimelineData(data) {
+  if (data && Array.isArray(data.traces) && data.traces.length) {
+    return data.traces;
+  }
+  return buildTimelineFallback((data && data.logs) || []);
+}
+
+function renderTimelineStep(step) {
+  if (!step) {
+    return "";
+  }
+  const cls = step.error
+    ? "timeline-step error"
+    : step.decisions && step.decisions.length
+    ? "timeline-step success"
+    : "timeline-step";
+  const statusText = step.error
+    ? `⚠ ${step.error}`
+    : summarizeDecisions(step.decisions || []) ||
+      previewText(step.meta_summary || step.raw_json || "-", 160);
+  const inputPreview = previewText(
+    step.user_prompt || step.system_prompt || "-",
+    200
+  );
+  const outputPreview = previewText(
+    step.raw_output || step.raw_json || step.meta_summary || step.error || "-",
+    220
+  );
+  const decisionsBlock =
+    step.decisions && step.decisions.length
+      ? `<strong>决策</strong><pre>${escapeHTML(
+          JSON.stringify(step.decisions, null, 2)
+        )}</pre>`
+      : "";
+  const imagesBlock = renderStepImages(step.images);
+  const outputBlock = step.raw_output || step.raw_json || step.meta_summary;
+  const outputText = outputBlock
+    ? outputBlock
+    : step.error
+    ? `错误：${step.error}`
+    : "-";
+  return `
+    <div class="${cls}">
+      <div class="step-head">
+        <div>
+          <span class="provider-badge">${escapeHTML(
+            step.provider_id || "-"
+          )}</span>
+          ${stageBadge(step.stage || "-")}
+        </div>
+        <div class="step-status">${escapeHTML(statusText || "-")}</div>
+      </div>
+      <div class="step-previews">
+        <div>
+          <label>输入预览</label>
+          <p>${escapeHTML(inputPreview)}</p>
+        </div>
+        <div>
+          <label>输出预览</label>
+          <p>${escapeHTML(outputPreview)}</p>
+        </div>
+      </div>
+      <details>
+        <summary>查看完整输入 / 输出</summary>
+        <strong>System Prompt</strong>
+        <pre>${escapeHTML(step.system_prompt || "-")}</pre>
+        <strong>User Prompt</strong>
+        <pre>${escapeHTML(step.user_prompt || "-")}</pre>
+        <strong>输出</strong>
+        <pre>${escapeHTML(outputText || "-")}</pre>
+        ${decisionsBlock}
+        ${imagesBlock}
+      </details>
+    </div>
+  `;
+}
+
+function renderTimelineCard(trace) {
+  if (!trace) return "";
+  const steps =
+    trace.steps && trace.steps.length
+      ? trace.steps.map((step) => renderTimelineStep(step)).join("")
+      : `<p class="muted">暂无阶段记录</p>`;
+  return `
+    <div class="timeline-card">
+      <div class="timeline-head">
+        <div>
+          <div>${formatTs(trace.ts || 0)}</div>
+          <small>${escapeHTML(trace.horizon || "-")}</small>
+        </div>
+        <div class="timeline-symbols">${formatSymbolCell(
+          trace.symbols,
+          trace.horizon
+        )}</div>
+      </div>
+      <div class="timeline-steps">
+        ${steps}
+      </div>
+    </div>
+  `;
+}
+
+function updateLiveTimeline(traces) {
+  const container = document.getElementById("liveTimeline");
+  if (!container) {
+    return;
+  }
+  if (!Array.isArray(traces) || !traces.length) {
+    container.classList.add("muted");
+    container.innerHTML = `<p class="muted">暂无实时决策轨迹</p>`;
+    return;
+  }
+  container.classList.remove("muted");
+  const limited = traces.slice(0, 10);
+  container.innerHTML = limited.map((trace) => renderTimelineCard(trace)).join("");
+}
+
+function collapseTimelineDetails() {
+  const container = document.getElementById("liveTimeline");
+  if (!container) {
+    return;
+  }
+  container.querySelectorAll("details[open]").forEach((details) => {
+    details.open = false;
+  });
+}
+
+function renderStepImages(images) {
+  if (!Array.isArray(images) || !images.length) {
+    return "";
+  }
+  const items = images
+    .map((img, idx) => {
+      const src = img?.data_uri || img?.dataURI || "";
+      if (!src) {
+        return "";
+      }
+      const desc = img?.description || `图像 ${idx + 1}`;
+      return `
+        <figure class="image-item">
+          <img src="${escapeHTML(src)}" alt="${escapeHTML(desc)}" loading="lazy" />
+          <figcaption>${escapeHTML(desc)}</figcaption>
+        </figure>
+      `;
+    })
+    .join("");
+  if (!items.trim()) {
+    return "";
+  }
+  return `<div class="image-grid">${items}</div>`;
+}
+
+function formatSymbolCell(symbols, horizon) {
+  const symbolText = formatSymbols(symbols);
+  const horizonText = horizon
+    ? `<br/><small>${escapeHTML(horizon)}</small>`
+    : "";
+  return `${escapeHTML(symbolText)}${horizonText}`;
+}
+
+function updateLiveFinalSummary(groups) {
+  const container = document.getElementById("liveFinalSummary");
+  if (!container) return;
+  container.classList.remove("muted");
+  const finals = groups
+    .filter((group) => group.final)
+    .slice(0, 5)
+    .map((group) => ({
+      ts: group.ts,
+      log: group.final,
+      horizon: group.horizon,
+      symbols: group.final.symbols || group.symbols,
+    }));
+  if (!finals.length) {
+    container.classList.add("muted");
+    container.innerHTML = "<p class=\"muted\">暂无聚合记录</p>";
+    return;
+  }
+  container.innerHTML = finals
+    .map((item) => {
+      const decisions = escapeHTML(summarizeDecisions(item.log.decisions));
+      const meta =
+        item.log.meta_summary && item.log.meta_summary.length
+          ? `<small>${escapeHTML(previewText(item.log.meta_summary, 160))}</small>`
+          : "";
+      const symbolCell = formatSymbolCell(item.symbols, item.horizon);
+      return `
+        <div class="final-item">
+          <div class="final-head">
+            <span class="final-time">${formatTs(item.ts)}</span>
+            <span class="final-symbols">${symbolCell}</span>
+          </div>
+          <div class="final-body">
+            <strong>${decisions}</strong>
+            ${meta}
+          </div>
+        </div>
+      `;
+    })
+    .join("");
+}
+
 function updateLiveLogsTable(list) {
   list = Array.isArray(list) ? list : [];
   const body = document.getElementById("liveLogsBody");
   body.innerHTML = "";
-  if (!list.length) {
+  const groups = groupLiveLogs(list);
+  updateLiveFinalSummary(groups);
+  if (!groups.length) {
     const row = document.createElement("tr");
     row.innerHTML = `<td colspan="6" class="muted">暂无实时记录</td>`;
     body.appendChild(row);
     return;
   }
-  list.forEach((log) => {
+  const toggle = document.getElementById("liveShowProviders");
+  const showProviders = !toggle || toggle.checked;
+  groups.forEach((group) => {
+    if (!group.final && !group.providers.length) {
+      return;
+    }
+    const primary = group.final || group.providers[0];
     const row = document.createElement("tr");
-    const provider = `${log.provider_id || "-"} / ${log.stage || "-"}`;
-    const status =
-      log.error && log.error.length
-        ? `❗ ${escapeHTML(previewText(log.error, 80))}`
-        : "OK";
-    const meta =
-      log.meta_summary && log.meta_summary.length
-        ? `<br/><small>${escapeHTML(previewText(log.meta_summary, 120))}</small>`
-        : "";
+    row.classList.add(group.final ? "live-log-final" : "live-log-provider");
+    const primaryDecisions = escapeHTML(summarizeDecisions(primary.decisions));
     row.innerHTML = `
-      <td>${formatTs(log.ts)}</td>
-      <td>${escapeHTML(formatSymbols(log.symbols))}</td>
-      <td>${provider}</td>
-      <td>${summarizeDecisions(log.decisions)}</td>
-      <td>${status}${meta}</td>
-      <td>${renderPromptDetails(log)}</td>
+      <td>${formatTs(group.ts)}</td>
+      <td>${formatSymbolCell(primary.symbols || group.symbols, group.horizon)}</td>
+      <td>${renderProviderCell(primary)}</td>
+      <td>${primaryDecisions}</td>
+      <td>${renderStatus(primary)}</td>
+      <td>${renderPromptDetails(primary)}</td>
     `;
     body.appendChild(row);
+    const providerRows = group.final ? group.providers : group.providers.slice(1);
+    if (showProviders && providerRows.length) {
+      providerRows.forEach((log) => {
+        const providerRow = document.createElement("tr");
+        providerRow.classList.add("live-log-provider", "live-log-nested");
+        const providerDecisions = escapeHTML(
+          summarizeDecisions(log.decisions)
+        );
+        providerRow.innerHTML = `
+          <td>${formatTs(log.ts || log.candle_ts)}</td>
+          <td>${formatSymbolCell(log.symbols || group.symbols, group.horizon)}</td>
+          <td>${renderProviderCell(log)}</td>
+          <td>${providerDecisions}</td>
+          <td>${renderStatus(log)}</td>
+          <td>${renderProviderPromptPreview(log)}</td>
+        `;
+        body.appendChild(providerRow);
+      });
+    }
   });
 }
 
@@ -361,6 +713,8 @@ async function refreshLiveDecisions() {
     if (limit) params.set("limit", limit);
     const query = params.toString();
     const data = await safeFetch(`/api/live/decisions${query ? `?${query}` : ""}`);
+    const timeline = ensureTimelineData(data);
+    updateLiveTimeline(timeline);
     updateLiveLogsTable(data.logs || []);
     if (msg) setMessage(msg, `已加载 ${data.logs?.length || 0} 条`, "success");
   } catch (err) {
@@ -430,42 +784,6 @@ function updateJobsTable(jobs) {
     });
 }
 
-function sanitizeNumber(val) {
-  const num = Number(val);
-  if (Number.isNaN(num)) {
-    return 0;
-  }
-  return num;
-}
-
-function updateCandlesTable(list) {
-  const body = document.getElementById("candlesBody");
-  body.innerHTML = "";
-  if (!list.length) {
-    const row = document.createElement("tr");
-    row.innerHTML = `<td colspan="6" class="muted">没有数据</td>`;
-    body.appendChild(row);
-    return;
-  }
-  list.forEach((candle) => {
-    const row = document.createElement("tr");
-    const close = sanitizeNumber(candle.close).toFixed(4);
-    const high = sanitizeNumber(candle.high).toFixed(4);
-    const low = sanitizeNumber(candle.low).toFixed(4);
-    const volume = sanitizeNumber(candle.volume).toFixed(2);
-    const trades = sanitizeNumber(candle.trades);
-    row.innerHTML = `
-      <td>${formatTs(candle.open_time)}</td>
-      <td>${close}</td>
-      <td>${high}</td>
-      <td>${low}</td>
-      <td>${volume}</td>
-      <td>${trades}</td>
-    `;
-    body.appendChild(row);
-  });
-}
-
 async function refreshJobs() {
   try {
     const data = await safeFetch("/api/backtest/jobs");
@@ -476,81 +794,12 @@ async function refreshJobs() {
 }
 
 function init() {
-  fillTimeframes(document.getElementById("timeframe"));
-  fillTimeframes(document.getElementById("dataTimeframe"));
   fillTimeframes(document.getElementById("executionTf"));
   fillProfiles(document.getElementById("profile"));
 
   document
-    .getElementById("fetchForm")
-    .addEventListener("submit", async (e) => {
-      e.preventDefault();
-      const msg = document.getElementById("fetchMessage");
-      setMessage(msg, "提交中…");
-      try {
-        const payload = {
-          exchange: document.getElementById("exchange").value.trim(),
-          symbol: document.getElementById("symbol").value.trim(),
-          timeframe: document.getElementById("timeframe").value,
-          start_ts: tsFromInput(document.getElementById("start").value),
-          end_ts: tsFromInput(document.getElementById("end").value),
-        };
-        if (!payload.symbol || !payload.start_ts || !payload.end_ts) {
-          setMessage(msg, "请填写完整参数", "error");
-          return;
-        }
-        const res = await safeFetch("/api/backtest/fetch", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(payload),
-        });
-        setMessage(
-          msg,
-          `任务 ${res.job.id} 已创建，状态：${res.job.status}`,
-          "success"
-        );
-        refreshJobs();
-      } catch (err) {
-        setMessage(msg, err.message, "error");
-      }
-    });
-
-  document
     .getElementById("refreshJobs")
     .addEventListener("click", refreshJobs);
-
-  document
-    .getElementById("candlesForm")
-    .addEventListener("submit", async (e) => {
-      e.preventDefault();
-      const symbol = document.getElementById("dataSymbol").value.trim();
-      const timeframe = document.getElementById("dataTimeframe").value.trim();
-      if (!symbol || !timeframe) {
-        alert("请填写交易对与周期");
-        return;
-      }
-      const params = new URLSearchParams({ symbol, timeframe });
-      try {
-        const manifestRes = await safeFetch(
-          `/api/backtest/data?${params.toString()}`
-        );
-        const manifest = manifestRes.manifest;
-        const info = document.getElementById("manifestInfo");
-        if (manifest) {
-          info.textContent = `本地共有 ${manifest.rows} 根，时间范围 ${formatTs(
-            manifest.min_time
-          )} → ${formatTs(manifest.max_time)}`;
-        } else {
-          info.textContent = "未找到 manifest 信息";
-        }
-        const res = await safeFetch(
-          `/api/backtest/candles/all?${params.toString()}`
-        );
-        updateCandlesTable(res.candles || []);
-      } catch (err) {
-        alert(err.message);
-      }
-    });
 
   document
     .getElementById("runForm")
@@ -599,6 +848,18 @@ function init() {
     .getElementById("refreshLiveLogs")
     .addEventListener("click", refreshLiveDecisions);
 
+  const collapseBtn = document.getElementById("collapseTimelineDetails");
+  if (collapseBtn) {
+    collapseBtn.addEventListener("click", collapseTimelineDetails);
+  }
+
+  const liveProvidersToggle = document.getElementById("liveShowProviders");
+  if (liveProvidersToggle) {
+    liveProvidersToggle.addEventListener("change", () => {
+      refreshLiveDecisions();
+    });
+  }
+
   document
     .getElementById("liveOrdersForm")
     .addEventListener("submit", (e) => {
@@ -610,12 +871,8 @@ function init() {
     .getElementById("refreshLiveOrders")
     .addEventListener("click", refreshLiveOrders);
 
-  // 默认时间：拉取任务 24h、回测任务 7 天
+  // 默认时间：回测任务 7 天
   const now = new Date();
-  const dayAgo = new Date(now.getTime() - 24 * 3600 * 1000);
-  document.getElementById("end").value = toLocalInput(now);
-  document.getElementById("start").value = toLocalInput(dayAgo);
-
   const weekAgo = new Date(now.getTime() - 7 * 24 * 3600 * 1000);
   document.getElementById("runEnd").value = toLocalInput(now);
   document.getElementById("runStart").value = toLocalInput(weekAgo);

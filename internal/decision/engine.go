@@ -12,6 +12,7 @@ type Context struct {
 	Market        map[string]MarketData // 各币种聚合指标（可后续填充）
 	Positions     []PositionSnapshot    // 当前持仓信息
 	Prompt        PromptBundle          // System/User 提示词
+	Analysis      []AnalysisContext     // 新版结构化分析上下文
 	LastDecisions []DecisionMemory      // 上一次决策（可选）
 	LastRawJSON   string                // 上一次决策的原始 JSON（可选）
 }

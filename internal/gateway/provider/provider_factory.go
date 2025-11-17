@@ -18,6 +18,8 @@ type ModelCfg struct {
 	ID, Provider, APIURL, APIKey, Model string
 	Enabled                             bool
 	Headers                             map[string]string // 额外请求头（如 X-API-Key / Organization）
+	SupportsVision                      bool
+	ExpectJSON                          bool
 }
 
 // BuildProvidersFromConfig 根据配置文件的模型条目构造 Provider 列表
@@ -50,7 +52,7 @@ func BuildProvidersFromConfig(models []ModelCfg, timeout time.Duration) []ModelP
 		if timeout > 0 {
 			client.Timeout = timeout
 		}
-		out = append(out, NewOpenAIModelProvider(id, true, client))
+		out = append(out, NewOpenAIModelProvider(id, true, m.SupportsVision, m.ExpectJSON, client))
 	}
 	return out
 }

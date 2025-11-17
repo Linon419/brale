@@ -9,12 +9,14 @@ type DecisionObserver interface {
 
 // DecisionTrace 描述一次完整调用的材料与结果。
 type DecisionTrace struct {
-	SystemPrompt string
-	UserPrompt   string
-	Outputs      []ModelOutput
-	Best         ModelOutput
-	Candidates   []string
-	Timeframes   []string
-	HorizonName  string
-	Positions    []PositionSnapshot
+	TraceID       string
+	SystemPrompt  string
+	UserPrompt    string
+	Outputs       []ModelOutput
+	Best          ModelOutput
+	Candidates    []string
+	Timeframes    []string
+	HorizonName   string
+	Positions     []PositionSnapshot
+	AgentInsights []AgentInsight
 }

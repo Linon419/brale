@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	brcfg "brale/internal/config"
 	"brale/internal/decision"
 	"brale/internal/gateway/provider"
 	"brale/internal/store"
@@ -20,6 +21,7 @@ type AIProxyFactory struct {
 	Aggregator     decision.Aggregator
 	Parallel       bool
 	TimeoutSeconds int
+	MultiAgent     brcfg.MultiAgentConfig
 }
 
 func (f *AIProxyFactory) NewStrategy(spec StrategySpec) (Strategy, error) {
@@ -43,6 +45,7 @@ func (f *AIProxyFactory) NewStrategy(spec StrategySpec) (Strategy, error) {
 		Intervals:      spec.Profile.AllTimeframes(),
 		Horizon:        spec.Profile,
 		HorizonName:    spec.ProfileName,
+		MultiAgent:     f.MultiAgent,
 		Parallel:       f.Parallel,
 		TimeoutSeconds: f.TimeoutSeconds,
 		Observer:       strat,
@@ -66,7 +69,7 @@ func (s *aiProxyStrategy) Decide(ctx context.Context, req StrategyRequest) (deci
 		if len(candles) == 0 {
 			continue
 		}
-		if err := mem.Put(ctx, strings.ToUpper(req.Symbol), tf, candles, len(candles)); err != nil {
+		if err := mem.Set(ctx, strings.ToUpper(req.Symbol), tf, candles); err != nil {
 			return decision.DecisionResult{}, err
 		}
 	}
@@ -78,9 +81,30 @@ func (s *aiProxyStrategy) Decide(ctx context.Context, req StrategyRequest) (deci
 	if intervals := req.Profile.AllTimeframes(); len(intervals) > 0 {
 		s.engine.Intervals = intervals
 	}
+	var analysis []decision.AnalysisContext
+	limit := 240
+	for _, candles := range req.Timeframes {
+		if len(candles) > limit {
+			limit = len(candles)
+		}
+	}
+	if exp, ok := interface{}(mem).(store.SnapshotExporter); ok {
+		analysis = decision.BuildAnalysisContexts(decision.AnalysisBuildInput{
+			Context:     ctx,
+			Exporter:    exp,
+			Symbols:     []string{strings.ToUpper(req.Symbol)},
+			Intervals:   req.Profile.AllTimeframes(),
+			Limit:       limit,
+			SliceLength: req.Profile.AnalysisSlice,
+			SliceDrop:   req.Profile.SliceDropTail,
+			HorizonName: req.ProfileName,
+			Indicators:  req.Profile.Indicators,
+		})
+	}
 	return s.engine.Decide(ctx, decision.Context{
 		Candidates: []string{strings.ToUpper(req.Symbol)},
 		Positions:  toSnapshots(req.Positions),
+		Analysis:   analysis,
 	})
 }
 

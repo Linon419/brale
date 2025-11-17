@@ -80,6 +80,7 @@ func (s *Source) FetchHistory(ctx context.Context, symbol, interval string, limi
 			Low:       toFloat(k[3]),
 			Close:     toFloat(k[4]),
 			Volume:    toFloat(k[5]),
+			Trades:    toInt64Safe(k, 8),
 		}
 		out = append(out, c)
 	}
@@ -174,6 +175,7 @@ func (s *Source) forwardStream(ctx context.Context, symbol, interval string, str
 				Low:       ev.Kline.LowPrice.Float(),
 				Close:     ev.Kline.ClosePrice.Float(),
 				Volume:    ev.Kline.Volume.Float(),
+				Trades:    int64(ev.Kline.NumberOfTrades),
 			}
 			event := market.CandleEvent{Symbol: symbol, Interval: interval, Candle: c}
 			select {
@@ -243,6 +245,13 @@ func toInt64(v any) int64 {
 	}
 }
 
+func toInt64Safe(row []any, idx int) int64 {
+	if idx < 0 || idx >= len(row) {
+		return 0
+	}
+	return toInt64(row[idx])
+}
+
 type klineEvent struct {
 	EventType string `json:"e"`
 	EventTime int64  `json:"E"`
@@ -262,7 +271,7 @@ type klineEvent struct {
 		QuoteVolume         strOrNum `json:"q"`
 		TakerBuyBaseVolume  strOrNum `json:"V"`
 		TakerBuyQuoteVolume strOrNum `json:"Q"`
-		Ignore              struct{} `json:"B"`
+		Ignore              strOrNum `json:"B"`
 	} `json:"k"`
 }
 
