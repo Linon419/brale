@@ -28,25 +28,27 @@ type DecisionLogStore struct {
 
 // DecisionLogRecord 代表一条日志记录，会持久化模型输入/输出摘要。
 type DecisionLogRecord struct {
-	TraceID    string                      `json:"trace_id"`
-	ID         int64                       `json:"id"`
-	Timestamp  int64                       `json:"ts"`
-	Candidates []string                    `json:"candidates,omitempty"`
-	Timeframes []string                    `json:"timeframes,omitempty"`
-	Horizon    string                      `json:"horizon"`
-	ProviderID string                      `json:"provider_id"`
-	Stage      string                      `json:"stage"`
-	System     string                      `json:"system_prompt"`
-	User       string                      `json:"user_prompt"`
-	RawOutput  string                      `json:"raw_output"`
-	RawJSON    string                      `json:"raw_json"`
-	Meta       string                      `json:"meta_summary"`
-	Decisions  []decision.Decision         `json:"decisions"`
-	Positions  []decision.PositionSnapshot `json:"positions"`
-	Symbols    []string                    `json:"symbols,omitempty"`
-	Images     []ImageAttachment           `json:"images,omitempty"`
-	Error      string                      `json:"error,omitempty"`
-	Note       string                      `json:"note,omitempty"`
+	TraceID         string                      `json:"trace_id"`
+	ID              int64                       `json:"id"`
+	Timestamp       int64                       `json:"ts"`
+	Candidates      []string                    `json:"candidates,omitempty"`
+	Timeframes      []string                    `json:"timeframes,omitempty"`
+	Horizon         string                      `json:"horizon"`
+	ProviderID      string                      `json:"provider_id"`
+	Stage           string                      `json:"stage"`
+	System          string                      `json:"system_prompt"`
+	User            string                      `json:"user_prompt"`
+	RawOutput       string                      `json:"raw_output"`
+	RawJSON         string                      `json:"raw_json"`
+	Meta            string                      `json:"meta_summary"`
+	Decisions       []decision.Decision         `json:"decisions"`
+	Positions       []decision.PositionSnapshot `json:"positions"`
+	Symbols         []string                    `json:"symbols,omitempty"`
+	Images          []ImageAttachment           `json:"images,omitempty"`
+	VisionSupported bool                        `json:"vision_supported"`
+	ImageCount      int                         `json:"image_count"`
+	Error           string                      `json:"error,omitempty"`
+	Note            string                      `json:"note,omitempty"`
 }
 
 // ImageAttachment 保存注入模型的图像信息（DataURI + 描述）。
@@ -68,18 +70,20 @@ type LiveDecisionTrace struct {
 
 // LiveDecisionStep 描述单次模型请求/响应。
 type LiveDecisionStep struct {
-	Stage      string              `json:"stage"`
-	ProviderID string              `json:"provider_id"`
-	Timestamp  int64               `json:"ts"`
-	System     string              `json:"system_prompt"`
-	User       string              `json:"user_prompt"`
-	RawOutput  string              `json:"raw_output"`
-	RawJSON    string              `json:"raw_json"`
-	Meta       string              `json:"meta_summary"`
-	Decisions  []decision.Decision `json:"decisions"`
-	Images     []ImageAttachment   `json:"images,omitempty"`
-	Error      string              `json:"error,omitempty"`
-	Note       string              `json:"note,omitempty"`
+	Stage           string              `json:"stage"`
+	ProviderID      string              `json:"provider_id"`
+	Timestamp       int64               `json:"ts"`
+	System          string              `json:"system_prompt"`
+	User            string              `json:"user_prompt"`
+	RawOutput       string              `json:"raw_output"`
+	RawJSON         string              `json:"raw_json"`
+	Meta            string              `json:"meta_summary"`
+	Decisions       []decision.Decision `json:"decisions"`
+	Images          []ImageAttachment   `json:"images,omitempty"`
+	VisionSupported bool                `json:"vision_supported"`
+	ImageCount      int                 `json:"image_count"`
+	Error           string              `json:"error,omitempty"`
+	Note            string              `json:"note,omitempty"`
 }
 
 // LiveOrder 记录实盘执行事件（预留，暂未对外暴露）。
@@ -159,6 +163,8 @@ func ensureDecisionLogSchema(db *sql.DB) error {
 			positions_json TEXT,
 			symbols TEXT,
 			images_json TEXT,
+			vision_supported INTEGER,
+			image_count INTEGER,
 			error TEXT,
 			note TEXT,
 			created_at INTEGER NOT NULL,
@@ -218,6 +224,8 @@ func ensureDecisionLogColumns(db *sql.DB) error {
 		{"live_decision_logs", "trace_id", "TEXT"},
 		{"live_decision_logs", "symbols", "TEXT"},
 		{"live_decision_logs", "images_json", "TEXT"},
+		{"live_decision_logs", "vision_supported", "INTEGER"},
+		{"live_decision_logs", "image_count", "INTEGER"},
 		{"live_orders", "type", "TEXT"},
 		{"live_orders", "fee", "REAL"},
 		{"live_orders", "timeframe", "TEXT"},
@@ -298,8 +306,9 @@ func (s *DecisionLogStore) Insert(ctx context.Context, rec DecisionLogRecord) (i
 	res, err := db.ExecContext(ctx, `
 		INSERT INTO live_decision_logs
 			(ts, candidates, timeframes, horizon, provider_id, stage, system_prompt, user_prompt,
-			 raw_output, raw_json, meta_summary, decisions_json, positions_json, symbols, images_json, error, note, created_at, trace_id)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			 raw_output, raw_json, meta_summary, decisions_json, positions_json, symbols, images_json,
+			 vision_supported, image_count, error, note, created_at, trace_id)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		ts,
 		enc(rec.Candidates),
 		enc(rec.Timeframes),
@@ -315,6 +324,8 @@ func (s *DecisionLogStore) Insert(ctx context.Context, rec DecisionLogRecord) (i
 		enc(rec.Positions),
 		symbolBlob,
 		enc(rec.Images),
+		boolToInt(rec.VisionSupported),
+		rec.ImageCount,
 		rec.Error,
 		rec.Note,
 		now,
@@ -347,7 +358,7 @@ func (s *DecisionLogStore) ListDecisions(ctx context.Context, q LiveDecisionQuer
 	var sb strings.Builder
 	sb.WriteString(`SELECT id, trace_id, ts, candidates, timeframes, horizon, provider_id, stage,
 		system_prompt, user_prompt, raw_output, raw_json, meta_summary, decisions_json,
-		positions_json, symbols, images_json, error, note
+		positions_json, symbols, images_json, vision_supported, image_count, error, note
 		FROM live_decision_logs WHERE 1=1`)
 	if q.Provider != "" {
 		sb.WriteString(" AND provider_id=?")
@@ -378,6 +389,8 @@ func (s *DecisionLogStore) ListDecisions(ctx context.Context, q LiveDecisionQuer
 			positions  sql.NullString
 			symbols    sql.NullString
 			images     sql.NullString
+			vision     sql.NullInt64
+			imageCount sql.NullInt64
 			system     sql.NullString
 			user       sql.NullString
 			rawOut     sql.NullString
@@ -388,7 +401,7 @@ func (s *DecisionLogStore) ListDecisions(ctx context.Context, q LiveDecisionQuer
 		)
 		if err := rows.Scan(&rec.ID, &rec.TraceID, &rec.Timestamp, &candidates, &timeframes, &rec.Horizon,
 			&rec.ProviderID, &rec.Stage, &system, &user, &rawOut, &rawJSON, &meta,
-			&decisions, &positions, &symbols, &images, &errorStr, &noteStr); err != nil {
+			&decisions, &positions, &symbols, &images, &vision, &imageCount, &errorStr, &noteStr); err != nil {
 			return nil, err
 		}
 		rec.System = system.String
@@ -404,6 +417,12 @@ func (s *DecisionLogStore) ListDecisions(ctx context.Context, q LiveDecisionQuer
 		rec.Positions = decodePositionArray(positions.String)
 		rec.Symbols = decodeSymbolBlob(symbols.String)
 		rec.Images = decodeImageArray(images.String)
+		rec.VisionSupported = nullIntToBool(vision)
+		if imageCount.Valid {
+			rec.ImageCount = int(imageCount.Int64)
+		} else if len(rec.Images) > 0 {
+			rec.ImageCount = len(rec.Images)
+		}
 		list = append(list, rec)
 	}
 	return list, rows.Err()
@@ -447,6 +466,8 @@ func (o *DecisionLogObserver) AfterDecide(ctx context.Context, trace decision.De
 		rec.Decisions = append([]decision.Decision(nil), out.Parsed.Decisions...)
 		rec.Symbols = collectSymbols(rec.Decisions)
 		rec.Images = attachmentsFromProviderImages(out.Images)
+		rec.VisionSupported = out.VisionEnabled
+		rec.ImageCount = len(out.Images)
 		rec.Note = "provider"
 		if out.Err != nil {
 			rec.Error = out.Err.Error()
@@ -468,6 +489,8 @@ func (o *DecisionLogObserver) AfterDecide(ctx context.Context, trace decision.De
 	finalRec.Decisions = append([]decision.Decision(nil), trace.Best.Parsed.Decisions...)
 	finalRec.Symbols = collectSymbols(finalRec.Decisions)
 	finalRec.Images = attachmentsFromProviderImages(trace.Best.Images)
+	finalRec.VisionSupported = trace.Best.VisionEnabled
+	finalRec.ImageCount = len(trace.Best.Images)
 	if trace.Best.Err != nil {
 		finalRec.Error = trace.Best.Err.Error()
 	}
@@ -546,17 +569,19 @@ func BuildLiveDecisionTraces(records []DecisionLogRecord) []LiveDecisionTrace {
 			b.trace.Symbols = mergeSymbolLists(b.trace.Symbols, rec.Symbols)
 		}
 		step := LiveDecisionStep{
-			Stage:      rec.Stage,
-			ProviderID: rec.ProviderID,
-			Timestamp:  rec.Timestamp,
-			System:     rec.System,
-			User:       rec.User,
-			RawOutput:  rec.RawOutput,
-			RawJSON:    rec.RawJSON,
-			Meta:       rec.Meta,
-			Images:     cloneImages(rec.Images),
-			Error:      rec.Error,
-			Note:       rec.Note,
+			Stage:           rec.Stage,
+			ProviderID:      rec.ProviderID,
+			Timestamp:       rec.Timestamp,
+			System:          rec.System,
+			User:            rec.User,
+			RawOutput:       rec.RawOutput,
+			RawJSON:         rec.RawJSON,
+			Meta:            rec.Meta,
+			Images:          cloneImages(rec.Images),
+			VisionSupported: rec.VisionSupported,
+			ImageCount:      rec.ImageCount,
+			Error:           rec.Error,
+			Note:            rec.Note,
 		}
 		if len(rec.Decisions) > 0 {
 			step.Decisions = append([]decision.Decision(nil), rec.Decisions...)
@@ -609,6 +634,17 @@ func cloneImages(src []ImageAttachment) []ImageAttachment {
 	dst := make([]ImageAttachment, len(src))
 	copy(dst, src)
 	return dst
+}
+
+func boolToInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+func nullIntToBool(v sql.NullInt64) bool {
+	return v.Valid && v.Int64 != 0
 }
 
 func collectSymbols(decisions []decision.Decision) []string {

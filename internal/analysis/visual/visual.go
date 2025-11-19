@@ -68,6 +68,11 @@ const (
 	colorVolume        = "#a78bfa"
 	colorDIF           = "#22d3ee"
 	colorDEA           = "#fb7185"
+
+	chartWidthPx   = 1600
+	klineHeightPx  = 600
+	volumeHeightPx = 260
+	macdHeightPx   = 260
 )
 
 // RenderComposite 生成多周期、带指标/注释的 PNG。
@@ -85,11 +90,12 @@ func RenderComposite(input CompositeInput) (ImageResult, error) {
 	if err != nil {
 		return ImageResult{}, err
 	}
-	height := len(input.Intervals) * 520
+	blockHeight := klineHeightPx + volumeHeightPx + macdHeightPx
+	height := len(input.Intervals) * blockHeight
 	if height < 520 {
 		height = 520
 	}
-	png, err := renderHTMLToPNG(input.Context, html, 1400, height)
+	png, err := renderHTMLToPNG(input.Context, html, chartWidthPx, height)
 	if err != nil {
 		return ImageResult{}, err
 	}
@@ -144,9 +150,14 @@ func buildCompositeHTML(input CompositeInput) ([]byte, string, error) {
 		minAxis := round(minPrice-padding, 4)
 		maxAxis := round(maxPrice+padding, 4)
 
-		init := opts.Initialization{Theme: types.ThemeWesteros, Width: "1400px", Height: "360px", BackgroundColor: colorBackground}
-		kline := charts.NewKLine()
-		kline.SetGlobalOptions(
+		init := opts.Initialization{
+			Theme:           types.ThemeWesteros,
+			Width:           fmt.Sprintf("%dpx", chartWidthPx),
+			Height:          fmt.Sprintf("%dpx", klineHeightPx),
+			BackgroundColor: colorBackground,
+		}
+	kline := charts.NewKLine()
+	kline.SetGlobalOptions(
 			charts.WithInitializationOpts(init),
 			charts.WithLegendOpts(opts.Legend{Show: opts.Bool(true), TextStyle: &opts.TextStyle{Color: colorTextPrimary}}),
 			charts.WithTitleOpts(opts.Title{
@@ -190,8 +201,8 @@ func buildCompositeHTML(input CompositeInput) ([]byte, string, error) {
 		emaLine.SetXAxis(xAxis)
 		kline.Overlap(emaLine)
 
-		volume := buildVolumeChart(interval, xAxis, candles)
-		macdChart := buildMACDChart(interval, xAxis, candles)
+	volume := buildVolumeChart(interval, xAxis, candles)
+	macdChart := buildMACDChart(interval, xAxis, candles)
 
 		page.AddCharts(kline, volume, macdChart)
 	}
@@ -250,19 +261,38 @@ func buildEMALine(interval string, candles []market.Candle, rep indicator.Report
 	line.SetSeriesOptions(
 		charts.WithLineChartOpts(opts.LineChart{ShowSymbol: opts.Bool(false)}),
 	)
-	emaFast := toLineData(rep.Values["ema_fast"].Series, len(candles))
-	emaMid := toLineData(rep.Values["ema_mid"].Series, len(candles))
-	emaSlow := toLineData(rep.Values["ema_slow"].Series, len(candles))
-	line.AddSeries("EMA21", emaFast, charts.WithLineStyleOpts(opts.LineStyle{Color: colorEmaFast, Width: 2}))
-	line.AddSeries("EMA50", emaMid, charts.WithLineStyleOpts(opts.LineStyle{Color: colorEmaMid, Width: 2}))
-	line.AddSeries("EMA200", emaSlow, charts.WithLineStyleOpts(opts.LineStyle{Color: colorEmaSlow, Width: 2}))
+	fast := rep.Values["ema_fast"]
+	mid := rep.Values["ema_mid"]
+	slow := rep.Values["ema_slow"]
+	emaFast := toLineData(fast.Series, len(candles))
+	emaMid := toLineData(mid.Series, len(candles))
+	emaSlow := toLineData(slow.Series, len(candles))
+	line.AddSeries(emaLegendLabel(fast.Note, "EMA Fast"), emaFast, charts.WithLineStyleOpts(opts.LineStyle{Color: colorEmaFast, Width: 2}))
+	line.AddSeries(emaLegendLabel(mid.Note, "EMA Mid"), emaMid, charts.WithLineStyleOpts(opts.LineStyle{Color: colorEmaMid, Width: 2}))
+	line.AddSeries(emaLegendLabel(slow.Note, "EMA Slow"), emaSlow, charts.WithLineStyleOpts(opts.LineStyle{Color: colorEmaSlow, Width: 2}))
 	return line
+}
+
+func emaLegendLabel(note, fallback string) string {
+	note = strings.TrimSpace(note)
+	if note != "" {
+		fields := strings.Fields(note)
+		if len(fields) > 0 && fields[0] != "" {
+			return fields[0]
+		}
+	}
+	return fallback
 }
 
 func buildVolumeChart(interval string, xAxis []string, candles []market.Candle) *charts.Bar {
 	bar := charts.NewBar()
 	bar.SetGlobalOptions(
-		charts.WithInitializationOpts(opts.Initialization{Theme: types.ThemeWesteros, Width: "1400px", Height: "160px", BackgroundColor: colorBackground}),
+		charts.WithInitializationOpts(opts.Initialization{
+			Theme:           types.ThemeWesteros,
+			Width:           fmt.Sprintf("%dpx", chartWidthPx),
+			Height:          fmt.Sprintf("%dpx", volumeHeightPx),
+			BackgroundColor: colorBackground,
+		}),
 		charts.WithTitleOpts(opts.Title{Title: fmt.Sprintf("Volume %s", interval), Left: "left", TitleStyle: &opts.TextStyle{Color: colorTextPrimary}}),
 		charts.WithLegendOpts(opts.Legend{Show: opts.Bool(false)}),
 		charts.WithTooltipOpts(opts.Tooltip{Show: opts.Bool(true), Trigger: "axis"}),
@@ -297,7 +327,12 @@ func buildVolumeChart(interval string, xAxis []string, candles []market.Candle) 
 func buildMACDChart(interval string, xAxis []string, candles []market.Candle) *charts.Bar {
 	bar := charts.NewBar()
 	bar.SetGlobalOptions(
-		charts.WithInitializationOpts(opts.Initialization{Theme: types.ThemeWesteros, Width: "1400px", Height: "180px", BackgroundColor: colorBackground}),
+		charts.WithInitializationOpts(opts.Initialization{
+			Theme:           types.ThemeWesteros,
+			Width:           fmt.Sprintf("%dpx", chartWidthPx),
+			Height:          fmt.Sprintf("%dpx", macdHeightPx),
+			BackgroundColor: colorBackground,
+		}),
 		charts.WithTitleOpts(opts.Title{Title: fmt.Sprintf("MACD %s", interval), Left: "left", TitleStyle: &opts.TextStyle{Color: colorTextPrimary}}),
 		charts.WithLegendOpts(opts.Legend{Show: opts.Bool(true), TextStyle: &opts.TextStyle{Color: colorTextSecondary}}),
 		charts.WithTooltipOpts(opts.Tooltip{Show: opts.Bool(true), Trigger: "axis"}),
@@ -418,7 +453,7 @@ func renderHTMLToPNG(ctx context.Context, html []byte, width, height int) ([]byt
 		chromedp.Navigate(dataURI),
 		chromedp.WaitReady("body", chromedp.ByQuery),
 		chromedp.Sleep(1500 * time.Millisecond),
-		chromedp.FullScreenshot(&screenshot, 95),
+		chromedp.FullScreenshot(&screenshot, 0),
 	}
 	if err := chromedp.Run(timeoutCtx, tasks...); err != nil {
 		return nil, err

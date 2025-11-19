@@ -61,6 +61,7 @@ func (c *OpenAIChatClient) Call(ctx context.Context, payload ChatPayload) (strin
 		body["response_format"] = map[string]string{"type": "json_object"}
 	}
 	b, _ := json.Marshal(body)
+	logger.LogLLMPayload(c.Model, string(b))
 
 	httpc := &http.Client{Timeout: c.Timeout}
 	var lastErr error

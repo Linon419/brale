@@ -33,6 +33,7 @@ func (r *Router) Register(group *gin.RouterGroup) {
 	if r.FreqtradeHandler != nil {
 		group.POST("/freqtrade/webhook", r.handleFreqtradeWebhook)
 		group.GET("/freqtrade/positions", r.handleFreqtradePositions)
+		group.POST("/freqtrade/close", r.handleFreqtradeQuickClose)
 	}
 }
 
@@ -40,6 +41,7 @@ func (r *Router) Register(group *gin.RouterGroup) {
 type FreqtradeWebhookHandler interface {
 	HandleFreqtradeWebhook(ctx context.Context, msg freqtrade.WebhookMessage) error
 	ListFreqtradePositions(ctx context.Context, symbol string, limit int) []freqtrade.APIPosition
+	CloseFreqtradePosition(ctx context.Context, symbol, side string, closeRatio float64) error
 }
 
 func (r *Router) handleLiveDecisions(c *gin.Context) {
@@ -118,4 +120,27 @@ func (r *Router) handleFreqtradePositions(c *gin.Context) {
 	}
 	positions := r.FreqtradeHandler.ListFreqtradePositions(c.Request.Context(), symbol, limit)
 	c.JSON(http.StatusOK, gin.H{"positions": positions})
+}
+
+type freqtradeCloseRequest struct {
+	Symbol     string  `json:"symbol"`
+	Side       string  `json:"side"`
+	CloseRatio float64 `json:"close_ratio"`
+}
+
+func (r *Router) handleFreqtradeQuickClose(c *gin.Context) {
+	if r.FreqtradeHandler == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "未配置 freqtrade 处理器"})
+		return
+	}
+	var req freqtradeCloseRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if err := r.FreqtradeHandler.CloseFreqtradePosition(c.Request.Context(), req.Symbol, req.Side, req.CloseRatio); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"status": "ok"})
 }

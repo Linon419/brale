@@ -34,9 +34,9 @@ provider = "default"
 
 [ai.profile_defaults.indicators.ema]
 # fast/mid/slow：默认 EMA 周期（单位：根）。
-fast = 21
-mid = 50
-slow = 200
+fast = 9
+mid = 21
+slow = 55
 [ai.profile_defaults.indicators.rsi]
 # period/oversold/overbought：默认 RSI 参数。
 period = 14
@@ -65,8 +65,8 @@ background_timeframes = ["4h"]
 slice_drop_tail = 1
 [ai.holding_horizon_profiles.one_hour.indicators.rsi]
 # QuantAgent 特有的 RSI 阈值。
-oversold = 30
-overbought = 70
+oversold = 35
+overbought = 65
 
 [ai.holding_horizon_profiles.four_hour]
 # 4 小时持仓：15/30m 入场，4h 确认，1d 背景。
@@ -94,6 +94,8 @@ entry_timeframes = ["1h"]
 confirm_timeframes = ["4h", "1d"]
 background_timeframes = ["1w"]
 # analysis_slice 留空继承默认 46，单独覆盖 drop tail。
+# 注意：实际截取长度会自动不低于指标所需的最大 lookback（例如 slow EMA=200），
+# 如需缩短窗口，需同步降低指标周期。
 slice_drop_tail = 1
 [ai.holding_horizon_profiles.quant_agent.indicators.rsi]
 # QuantAgent 特有的 RSI 阈值。

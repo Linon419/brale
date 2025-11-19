@@ -11,11 +11,13 @@ import (
 
 // ModelOutput 模型执行后的统一表示
 type ModelOutput struct {
-	ProviderID string
-	Raw        string
-	Parsed     DecisionResult
-	Err        error
-	Images     []provider.ImagePayload
+	ProviderID    string
+	Raw           string
+	Parsed        DecisionResult
+	Err           error
+	Images        []provider.ImagePayload
+	VisionEnabled bool
+	ImageCount    int
 }
 
 // Aggregator 聚合接口

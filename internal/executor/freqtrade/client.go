@@ -107,34 +107,85 @@ type Trade struct {
 	ID           int     `json:"trade_id"`
 	Pair         string  `json:"pair"`
 	Side         string  `json:"side"`
+	IsShort      bool    `json:"is_short"`
 	OpenDate     string  `json:"open_date"`
 	CloseDate    string  `json:"close_date"`
 	OpenRate     float64 `json:"open_rate"`
 	CloseRate    float64 `json:"close_rate"`
 	Amount       float64 `json:"amount"`
+	StakeAmount  float64 `json:"stake_amount"`
+	Leverage     float64 `json:"leverage"`
 	OpenOrderID  string  `json:"open_order_id"`
 	CloseOrderID string  `json:"close_order_id"`
 	IsOpen       bool    `json:"is_open"`
 }
 
-// ListTrades fetches the latest trades from freqtrade.
+// ListTrades fetches currently open trades from freqtrade (uses /status endpoint).
 func (c *Client) ListTrades(ctx context.Context) ([]Trade, error) {
-	var trades []Trade
-	if err := c.doRequest(ctx, http.MethodGet, "/trades", nil, &trades); err != nil {
+	trades, err := c.fetchTrades(ctx, "/status")
+	if err != nil {
 		return nil, err
 	}
-	return trades, nil
+	return filterOpenTrades(trades), nil
+}
+
+func (c *Client) fetchTrades(ctx context.Context, path string) ([]Trade, error) {
+	var raw json.RawMessage
+	if err := c.doRequest(ctx, http.MethodGet, path, nil, &raw); err != nil {
+		return nil, err
+	}
+	if len(raw) == 0 || string(bytes.TrimSpace(raw)) == "null" {
+		return nil, nil
+	}
+	var trades []Trade
+	if err := json.Unmarshal(raw, &trades); err == nil {
+		return trades, nil
+	}
+	type tradeEnvelope struct {
+		Trades []Trade `json:"trades"`
+		Data   []Trade `json:"data"`
+		Result []Trade `json:"result"`
+		Items  []Trade `json:"items"`
+	}
+	var env tradeEnvelope
+	if err := json.Unmarshal(raw, &env); err != nil {
+		return nil, fmt.Errorf("无法解析 freqtrade trades 响应: %w", err)
+	}
+	switch {
+	case len(env.Trades) > 0:
+		return env.Trades, nil
+	case len(env.Data) > 0:
+		return env.Data, nil
+	case len(env.Result) > 0:
+		return env.Result, nil
+	case len(env.Items) > 0:
+		return env.Items, nil
+	default:
+		return nil, nil
+	}
+}
+
+func filterOpenTrades(trades []Trade) []Trade {
+	if len(trades) == 0 {
+		return nil
+	}
+	open := make([]Trade, 0, len(trades))
+	for _, tr := range trades {
+		if tr.IsOpen {
+			open = append(open, tr)
+		}
+	}
+	return open
 }
 
 func (c *Client) doRequest(ctx context.Context, method, path string, payload any, out any) error {
 	if c == nil {
 		return fmt.Errorf("freqtrade client 未初始化")
 	}
-	rel, err := url.Parse(path)
+	endpoint, err := c.resolveEndpoint(path)
 	if err != nil {
-		return fmt.Errorf("解析路径失败: %w", err)
+		return err
 	}
-	endpoint := c.baseURL.ResolveReference(rel)
 
 	var body io.Reader
 	if payload != nil {
@@ -179,4 +230,31 @@ func (c *Client) doRequest(ctx context.Context, method, path string, payload any
 		return fmt.Errorf("解析 freqtrade 响应失败: %w", err)
 	}
 	return nil
+}
+
+func (c *Client) resolveEndpoint(path string) (*url.URL, error) {
+	if c.baseURL == nil {
+		return nil, fmt.Errorf("freqtrade API 地址未设置")
+	}
+	trimmed := strings.TrimSpace(path)
+	if trimmed == "" {
+		trimmed = "/"
+	}
+	query := ""
+	if idx := strings.Index(trimmed, "?"); idx >= 0 {
+		query = trimmed[idx+1:]
+		trimmed = trimmed[:idx]
+	}
+	if trimmed == "" {
+		trimmed = "/"
+	}
+	if !strings.HasPrefix(trimmed, "/") {
+		trimmed = "/" + trimmed
+	}
+	base := *c.baseURL
+	base.Path = strings.TrimSuffix(base.Path, "/") + trimmed
+	base.RawPath = ""
+	base.RawQuery = query
+	base.Fragment = ""
+	return &base, nil
 }

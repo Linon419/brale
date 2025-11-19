@@ -7,6 +7,12 @@
 env = "dev"
 # log_level：日志级别（debug|info|warn|error）。
 log_level = "info"
+# log_path：可选，若填写则把日志输出追加到该文件（同时保留 stdout）。
+log_path = ""
+# llm_log_path：可选，需配合 llm_dump_payload=true 才会写入。
+llm_log_path = ""
+# llm_dump_payload：开启后才会生成 llm_log_path 日志，并把完整请求 JSON 追加进去（调试用）。
+llm_dump_payload = false
 # http_addr：Live HTTP 服务监听地址。
 http_addr = ":9991"
 
@@ -60,6 +66,8 @@ weights = { openai_main = 1.0, deepseek_backup = 1.0, qwen_helper = 1.0 }
 
 [ai.profile_defaults]
 # analysis_slice：若 profile 未指定，默认让 LLM 查看最近多少根。
+# 该值不能小于指标所需的最小历史（max(EMA slow, RSI period+1, MACD)），
+# 否则会自动被提升到对应的 lookback（例如默认 slow EMA=200，则 slice 至少 200）。
 analysis_slice = 46
 # slice_drop_tail：默认丢弃最新多少根未收盘蜡烛。
 slice_drop_tail = 3

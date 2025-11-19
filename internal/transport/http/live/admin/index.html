@@ -22,13 +22,39 @@
             <option :value="60">60s</option>
           </select>
         </label>
+        <div class="symbol-filter">
+          <label>
+            交易对
+            <input
+              v-model="symbolInput"
+              @keyup.enter="applySymbolFilter"
+              placeholder="例如 ETHUSDT"
+            />
+          </label>
+          <button class="ghost" @click="applySymbolFilter">应用</button>
+          <button class="ghost" @click="clearSymbolFilter" :disabled="!symbolFilter">清除</button>
+        </div>
+        <div class="stage-filter">
+          <label>
+            阶段
+            <select v-model="stageFilter">
+              <option
+                v-for="opt in stageOptions"
+                :key="opt.value"
+                :value="opt.value"
+              >
+                {{ opt.label }}
+              </option>
+            </select>
+          </label>
+        </div>
       </div>
     </header>
 
     <section class="status-bar">
       <div>
         <strong>决策记录</strong>
-        <span>第 {{ page }} 页 · 每页 {{ pageSize }} 条</span>
+        <span>第 {{ page }} 页 · 每页 {{ pageSize }} 条 · {{ symbolFilter || '全部交易对' }}</span>
       </div>
       <div>
         <strong>仓位</strong>
@@ -68,12 +94,12 @@
                 </button>
                 <button
                   v-for="stage in traceStages(trace)"
-                  :key="stage"
+                  :key="stage.key"
                   class="tab"
-                  :class="{ active: activeTab[trace.trace_id] === stage }"
-                  @click.stop="setActiveTab(trace.trace_id, stage)"
+                  :class="{ active: activeTab[trace.trace_id] === stage.key }"
+                  @click.stop="setActiveTab(trace.trace_id, stage.key)"
                 >
-                  {{ stageLabel(trace, stage) }}
+                  {{ formatStageLabel(stage) }}
                 </button>
               </div>
               <article v-for="(step, idx) in filteredSteps(trace)" :key="idx" class="step">
@@ -82,7 +108,16 @@
                     <span class="stage">{{ step.stage }}</span>
                     <span class="provider">{{ step.provider_id || 'n/a' }}</span>
                   </div>
-                  <small>{{ formatTs(step.ts) }}</small>
+                  <div class="step-meta">
+                    <span
+                      class="vision-flag"
+                      :class="{ enabled: step.vision_supported }"
+                    >
+                      🖼️ {{ step.vision_supported ? '支持' : '不支持' }}
+                    </span>
+                    <span class="image-count">图片 {{ step.image_count || (step.images ? step.images.length : 0) }}</span>
+                    <small>{{ formatTs(step.ts) }}</small>
+                  </div>
                 </div>
                 <div class="step-body">
                   <p class="status" v-if="step.error">⚠ {{ step.error }}</p>
@@ -147,7 +182,15 @@
               <td>{{ pos.leverage ? pos.leverage + 'x' : '-' }}</td>
               <td>{{ formatDuration(pos.holding_ms) }}</td>
               <td>{{ formatTs(pos.opened_at) }}</td>
-              <td><button class="ghost" @click="quickClose(pos)">快捷关闭</button></td>
+              <td>
+                <button
+                  class="ghost"
+                  @click="quickClose(pos)"
+                  :disabled="isClosing(pos.trade_id)"
+                >
+                  {{ isClosing(pos.trade_id) ? '关闭中…' : '快捷关闭' }}
+                </button>
+              </td>
             </tr>
           </tbody>
         </table>

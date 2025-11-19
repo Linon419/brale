@@ -184,6 +184,69 @@ func (m *Manager) HandleWebhook(ctx context.Context, msg WebhookMessage) {
 	}
 }
 
+// SyncOpenPositions loads existing open trades from freqtrade to seed the cache.
+func (m *Manager) SyncOpenPositions(ctx context.Context) (int, error) {
+	if m == nil || m.client == nil {
+		return 0, fmt.Errorf("freqtrade client 未初始化")
+	}
+	trades, err := m.client.ListTrades(ctx)
+	if err != nil {
+		return 0, err
+	}
+	type cached struct {
+		id     int
+		symbol string
+		side   string
+		pos    Position
+	}
+	candidates := make([]cached, 0, len(trades))
+	for _, tr := range trades {
+		if !tr.IsOpen {
+			continue
+		}
+		symbol := freqtradePairToSymbol(tr.Pair)
+		side := strings.ToLower(strings.TrimSpace(tr.Side))
+		if side == "" {
+			if tr.IsShort {
+				side = "short"
+			} else {
+				side = "long"
+			}
+		}
+		if symbol == "" || side == "" {
+			continue
+		}
+		pos := Position{
+			TradeID:    tr.ID,
+			Symbol:     symbol,
+			Side:       side,
+			Amount:     tr.Amount,
+			Stake:      tr.StakeAmount,
+			Leverage:   tr.Leverage,
+			EntryPrice: tr.OpenRate,
+			OpenedAt:   parseFreqtradeTime(tr.OpenDate),
+		}
+		candidates = append(candidates, cached{
+			id:     tr.ID,
+			symbol: symbol,
+			side:   side,
+			pos:    pos,
+		})
+	}
+	if len(candidates) == 0 {
+		return 0, nil
+	}
+	m.mu.Lock()
+	for _, c := range candidates {
+		m.positions[c.id] = c.pos
+	}
+	m.mu.Unlock()
+	for _, c := range candidates {
+		m.storeTrade(c.symbol, c.side, c.id)
+	}
+	return len(candidates), nil
+}
+
 // Positions 返回当前 freqtrade 持仓快照。
 func (m *Manager) Positions() []decision.PositionSnapshot {
 	m.mu.Lock()
@@ -225,7 +288,10 @@ func (m *Manager) handleEntry(ctx context.Context, msg WebhookMessage, filled bo
 	amount := float64(msg.Amount)
 	stake := float64(msg.StakeAmount)
 	openTime := parseFreqtradeTime(msg.OpenDate)
-	traceID := m.ensureTrace(fmt.Sprintf("%d", tradeID))
+	traceID := m.lookupTrace(tradeID)
+	if traceID == "" {
+		traceID = m.ensureTrace(fmt.Sprintf("%d", tradeID))
+	}
 	pos := Position{
 		TradeID:    tradeID,
 		Symbol:     symbol,

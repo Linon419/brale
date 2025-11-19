@@ -211,6 +211,11 @@ func NewApp(cfg *brcfg.Config) (*App, error) {
 		}
 		logger.Infof("✓ Freqtrade 执行器已启用: %s", cfg.Freqtrade.APIURL)
 		freqManager = freqexec.NewManager(client, cfg.Freqtrade, cfg.AI.ActiveHorizon, decisionStore, orderRecorder)
+		if synced, err := freqManager.SyncOpenPositions(ctx); err != nil {
+			logger.Warnf("同步 freqtrade 持仓失败: %v", err)
+		} else if synced > 0 {
+			logger.Infof("✓ 已同步 %d 个 freqtrade 在途仓位", synced)
+		}
 	}
 
 	liveSvc := &LiveService{

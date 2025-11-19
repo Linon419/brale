@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"sort"
 	"strings"
 	"time"
@@ -64,6 +65,8 @@ type LegacyEngineAdapter struct {
 	TimeoutSeconds int
 }
 
+const priceWindowBars = 6
+
 func (e *LegacyEngineAdapter) Name() string {
 	if e.Name_ != "" {
 		return e.Name_
@@ -88,16 +91,19 @@ func (e *LegacyEngineAdapter) Decide(ctx context.Context, input Context) (Decisi
 			defer cancel()
 		}
 		logger.Debugf("调用模型: %s", p.ID())
+		visionEnabled := p.SupportsVision()
 		payload := provider.ChatPayload{
 			System:     sys,
 			User:       usr,
 			ExpectJSON: p.ExpectsJSON(),
 		}
-		if p.SupportsVision() {
+		if visionEnabled {
 			payload.Images = visionPayloads
 		}
-		logAIInput("main", p.ID(), fmt.Sprintf("final decision (images=%d)", len(payload.Images)), payload.System, payload.User)
+		purpose := fmt.Sprintf("final decision (images=%d)", len(payload.Images))
+		logAIInput("main", p.ID(), purpose, payload.System, payload.User, summarizeImagePayloads(payload.Images))
 		raw, err := p.Call(cctx, payload)
+		logger.LogLLMResponse("main", p.ID(), purpose, raw)
 		parsed := DecisionResult{}
 		if err == nil {
 			if arr, ok := ExtractJSONArrayCompat(raw); ok {
@@ -123,11 +129,13 @@ func (e *LegacyEngineAdapter) Decide(ctx context.Context, input Context) (Decisi
 			logger.Warnf("模型 %s 调用失败: %v", p.ID(), err)
 		}
 		return ModelOutput{
-			ProviderID: p.ID(),
-			Raw:        raw,
-			Parsed:     parsed,
-			Err:        err,
-			Images:     cloneImagePayloads(payload.Images),
+			ProviderID:    p.ID(),
+			Raw:           raw,
+			Parsed:        parsed,
+			Err:           err,
+			Images:        cloneImagePayloads(payload.Images),
+			VisionEnabled: visionEnabled,
+			ImageCount:    len(payload.Images),
 		}
 	}
 	if e.Parallel {
@@ -264,6 +272,7 @@ func (e *LegacyEngineAdapter) buildUserSummary(ctx context.Context, input Contex
 	b.WriteString("# 决策输入（Multi-Agent 汇总）\n")
 	e.appendLastDecisions(&b, input.LastDecisions)
 	e.appendCurrentPositions(&b, input.Positions)
+	e.appendKlineWindows(&b, input.Analysis)
 	e.logStructuredBlocksDebug(input.Analysis)
 	if len(insights) > 0 {
 		stageOrder := []string{agentStageIndicator, agentStagePattern, agentStageTrend}
@@ -318,15 +327,15 @@ func (e *LegacyEngineAdapter) buildUserSummary(ctx context.Context, input Contex
 	} else {
 		b.WriteString("\n## Multi-Agent Insights\n- 暂无可用结论，请谨慎观望或输出空决策。\n")
 	}
-	req := `请先输出简短的【思维链】（1句，说明判断依据与结论），换行后仅输出 JSON 数组。
+	req := `请先输出简短的【思维链】（3句，说明判断依据与结论），换行后仅输出 JSON 数组。
 	数组中每项需含：symbol、action、reasoning。
-	reasoning中当多空信号差距在20以上时，需要包含bull_score，bear_score，resistance_upper，resistance_lower
+	reasoning中当多空信号差距在30以上时，就可以执行开仓操作，需要包含bull_score，bear_score，若没有图就包含“没有收到图片”
 	如已有仓位且需要部分止盈/减仓，添加 close_ratio（0-1），无仓位时勿返回。
 	若 action 为 open_long 或 open_short，必须返回 take_profit、stop_loss（绝对价，浮点）及 leverage（2–50，依信号强度）。
-若 action 为 adjust_stop_loss，必须返回新 stop_loss。
-示例:
-思维链: 4h 供需不明、15m 无形态。
-[{"symbol":"BTCUSDT","action":"hold","reasoning":"多空信号不足"}]
+    若 action 为 adjust_stop_loss，必须返回新 stop_loss。
+    示例:
+    思维链: 4h 供需不明、15m 无形态。
+    [{"symbol":"BTCUSDT","action":"hold","reasoning":"多空信号不足"}]
 `
 	b.WriteString(req)
 
@@ -400,8 +409,10 @@ func (e *LegacyEngineAdapter) executeAgentStage(ctx context.Context, stage agent
 		return ins
 	}
 	ins.ProviderID = provider.ID()
-	logAIInput(fmt.Sprintf("multi-agent:%s", stage.name), provider.ID(), describeAgentPurpose(stage.name), tpl, user)
+	purpose := describeAgentPurpose(stage.name)
+	logAIInput(fmt.Sprintf("multi-agent:%s", stage.name), provider.ID(), purpose, tpl, user, nil)
 	out, err := e.invokeAgentProvider(ctx, provider, tpl, user)
+	logger.LogLLMResponse(fmt.Sprintf("multi-agent:%s", stage.name), provider.ID(), purpose, out)
 	if err != nil {
 		ins.Error = err.Error()
 		ins.Warned = e.emitAgentWarning(stage.name, provider.ID(), ins.Error)
@@ -474,6 +485,28 @@ func (e *LegacyEngineAdapter) collectVisionPayloads(ctxs []AnalysisContext) []pr
 	return out
 }
 
+func summarizeImagePayloads(imgs []provider.ImagePayload) []string {
+	if len(imgs) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(imgs))
+	for _, img := range imgs {
+		var b strings.Builder
+		desc := strings.TrimSpace(img.Description)
+		if desc == "" {
+			desc = "(no description)"
+		}
+		b.WriteString(desc)
+		if data := strings.TrimSpace(img.DataURI); data != "" {
+			preview := TrimTo(data, 512)
+			b.WriteString("\nDATA: ")
+			b.WriteString(preview)
+		}
+		out = append(out, b.String())
+	}
+	return out
+}
+
 func cloneOutputs(src []ModelOutput) []ModelOutput {
 	if len(src) == 0 {
 		return nil
@@ -482,6 +515,8 @@ func cloneOutputs(src []ModelOutput) []ModelOutput {
 	for i := range src {
 		dst[i] = src[i]
 		dst[i].Images = cloneImagePayloads(src[i].Images)
+		dst[i].VisionEnabled = src[i].VisionEnabled
+		dst[i].ImageCount = src[i].ImageCount
 	}
 	return dst
 }
@@ -535,7 +570,7 @@ func describeAgentPurpose(stage string) string {
 	}
 }
 
-func logAIInput(kind, providerID, purpose, systemPrompt, userPrompt string) {
+func logAIInput(kind, providerID, purpose, systemPrompt, userPrompt string, imageNotes []string) {
 	if strings.TrimSpace(kind) == "" {
 		kind = "unknown"
 	}
@@ -543,6 +578,7 @@ func logAIInput(kind, providerID, purpose, systemPrompt, userPrompt string) {
 	userPreview := TrimTo(userPrompt, 4000)
 	logger.Debugf("[AI][request] kind=%s provider=%s purpose=%s system_prompt=%q user_prompt=%q",
 		kind, strings.TrimSpace(providerID), purpose, sysPreview, userPreview)
+	logger.LogLLMRequest(kind, strings.TrimSpace(providerID), purpose, systemPrompt, userPrompt, imageNotes, "")
 }
 
 // formatVolumeSlice 将成交量切片格式化为紧凑的字符串，例如 "[123, 456, 789]"
@@ -708,6 +744,201 @@ func (e *LegacyEngineAdapter) appendCurrentPositions(b *strings.Builder, positio
 		b.WriteString(line + "\n")
 	}
 	b.WriteString("请结合上述仓位判断是否需要平仓、加仓或调整计划。\n")
+}
+
+type klineWindow struct {
+	Symbol   string
+	Interval string
+	Horizon  string
+	Trend    string
+	Bars     []market.Candle
+}
+
+func (e *LegacyEngineAdapter) appendKlineWindows(b *strings.Builder, ctxs []AnalysisContext) {
+	if b == nil || len(ctxs) == 0 {
+		return
+	}
+	rank := buildIntervalRank(e.Intervals)
+	windows := make([]klineWindow, 0, len(ctxs))
+	for _, ac := range ctxs {
+		bars, err := parseRecentCandles(ac.KlineJSON, priceWindowBars)
+		if err != nil {
+			logger.Debugf("kline snapshot 解析失败 %s %s: %v", ac.Symbol, ac.Interval, err)
+			continue
+		}
+		if len(bars) == 0 {
+			continue
+		}
+		win := klineWindow{
+			Symbol:   strings.ToUpper(strings.TrimSpace(ac.Symbol)),
+			Interval: strings.TrimSpace(ac.Interval),
+			Horizon:  strings.TrimSpace(ac.ForecastHorizon),
+			Trend:    ac.TrendReport,
+			Bars:     bars,
+		}
+		if win.Symbol == "" || win.Interval == "" {
+			continue
+		}
+		windows = append(windows, win)
+	}
+	if len(windows) == 0 {
+		return
+	}
+	sort.Slice(windows, func(i, j int) bool {
+		if windows[i].Symbol == windows[j].Symbol {
+			ri := intervalRankValue(windows[i].Interval, rank)
+			rj := intervalRankValue(windows[j].Interval, rank)
+			if ri != rj {
+				return ri < rj
+			}
+			return windows[i].Interval < windows[j].Interval
+		}
+		return windows[i].Symbol < windows[j].Symbol
+	})
+	b.WriteString("\n## Price Windows（最近 6 根，最新在前）\n")
+	for _, win := range windows {
+		header := fmt.Sprintf("- %s %s", win.Symbol, win.Interval)
+		if win.Horizon != "" {
+			header += fmt.Sprintf(" (%s)", win.Horizon)
+		}
+		b.WriteString(header + "\n")
+		b.WriteString("  Bars:\n")
+		for idx := len(win.Bars) - 1; idx >= 0; idx-- {
+			bar := win.Bars[idx]
+			b.WriteString(fmt.Sprintf("    [%s, o=%s, h=%s, l=%s, c=%s, v=%s]\n",
+				formatCandleTime(bar),
+				formatKlinePrice(bar.Open),
+				formatKlinePrice(bar.High),
+				formatKlinePrice(bar.Low),
+				formatKlinePrice(bar.Close),
+				formatKlineVolume(bar.Volume),
+			))
+		}
+		if summary := describeKlineSnapshot(win.Bars, win.Interval, win.Trend); summary != "" {
+			b.WriteString("  Snapshot: " + summary + "\n")
+		}
+		b.WriteString("\n")
+	}
+	b.WriteString("请结合这些时间窗口评估当前价格位置与动量。\n")
+}
+
+func buildIntervalRank(intervals []string) map[string]int {
+	if len(intervals) == 0 {
+		return nil
+	}
+	rank := make(map[string]int, len(intervals))
+	for idx, iv := range intervals {
+		key := strings.ToLower(strings.TrimSpace(iv))
+		if key == "" {
+			continue
+		}
+		if _, exists := rank[key]; !exists {
+			rank[key] = idx
+		}
+	}
+	return rank
+}
+
+func intervalRankValue(iv string, rank map[string]int) int {
+	if len(rank) == 0 {
+		return 0
+	}
+	key := strings.ToLower(strings.TrimSpace(iv))
+	if val, ok := rank[key]; ok {
+		return val
+	}
+	return len(rank) + 1
+}
+
+func parseRecentCandles(raw string, keep int) ([]market.Candle, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || keep <= 0 {
+		return nil, nil
+	}
+	var candles []market.Candle
+	if err := json.Unmarshal([]byte(raw), &candles); err != nil {
+		return nil, err
+	}
+	if len(candles) == 0 {
+		return nil, nil
+	}
+	if len(candles) > keep {
+		candles = candles[len(candles)-keep:]
+	}
+	return candles, nil
+}
+
+func formatCandleTime(c market.Candle) string {
+	ts := c.CloseTime
+	if ts == 0 {
+		ts = c.OpenTime
+	}
+	if ts == 0 {
+		return "-"
+	}
+	return time.UnixMilli(ts).UTC().Format("01-02 15:04") + "Z"
+}
+
+func formatKlinePrice(v float64) string {
+	return trimFloatPrecision(v, 4)
+}
+
+func formatKlineVolume(v float64) string {
+	return trimFloatPrecision(v, 2)
+}
+
+func trimFloatPrecision(v float64, dec int) string {
+	if dec < 0 {
+		dec = 4
+	}
+	out := fmt.Sprintf("%.*f", dec, v)
+	out = strings.TrimRight(strings.TrimRight(out, "0"), ".")
+	if out == "" {
+		return "0"
+	}
+	return out
+}
+
+func describeKlineSnapshot(bars []market.Candle, interval, trend string) string {
+	if len(bars) == 0 {
+		return ""
+	}
+	first := bars[0]
+	last := bars[len(bars)-1]
+	base := first.Close
+	if base == 0 {
+		base = first.Open
+	}
+	changePct := 0.0
+	if base != 0 {
+		changePct = (last.Close - base) / base * 100
+	}
+	low := math.MaxFloat64
+	high := -math.MaxFloat64
+	for _, bar := range bars {
+		if bar.Low < low {
+			low = bar.Low
+		}
+		if bar.High > high {
+			high = bar.High
+		}
+	}
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("close≈%s", formatKlinePrice(last.Close)))
+	iv := strings.TrimSpace(interval)
+	if iv == "" {
+		iv = "window"
+	}
+	if base != 0 {
+		sb.WriteString(fmt.Sprintf(" (%+.2f%%/%s)", changePct, iv))
+	}
+	if low != math.MaxFloat64 && high != -math.MaxFloat64 {
+		sb.WriteString(fmt.Sprintf(", 区间 %s–%s", formatKlinePrice(low), formatKlinePrice(high)))
+	}
+	if t := strings.TrimSpace(trend); t != "" {
+		sb.WriteString(", " + TrimTo(t, 200))
+	}
+	return sb.String()
 }
 
 func formatHoldingDuration(ms int64) string {

@@ -570,6 +570,34 @@ func (s *LiveService) ListFreqtradePositions(ctx context.Context, symbol string,
 	return s.freqManager.PositionsForAPI(symbol, limit)
 }
 
+// CloseFreqtradePosition implements livehttp.FreqtradeWebhookHandler.
+func (s *LiveService) CloseFreqtradePosition(ctx context.Context, symbol, side string, closeRatio float64) error {
+	if s == nil || s.freqManager == nil {
+		return fmt.Errorf("live service 未初始化")
+	}
+	symbol = strings.ToUpper(strings.TrimSpace(symbol))
+	if symbol == "" {
+		return fmt.Errorf("symbol 不能为空")
+	}
+	side = strings.ToLower(strings.TrimSpace(side))
+	var action string
+	switch side {
+	case "long":
+		action = "close_long"
+	case "short":
+		action = "close_short"
+	default:
+		return fmt.Errorf("side 只能是 long 或 short")
+	}
+	traceID := s.ensureTraceID("")
+	decision := decision.Decision{
+		Symbol:     symbol,
+		Action:     action,
+		CloseRatio: closeRatio,
+	}
+	return s.freqtradeHandleDecision(ctx, traceID, decision)
+}
+
 func (s *LiveService) ensureTraceID(raw string) string {
 	id := strings.TrimSpace(raw)
 	if id != "" {
