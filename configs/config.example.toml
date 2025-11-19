@@ -164,8 +164,6 @@ pattern_template = "agent_pattern"
 trend_template = "agent_trend"
 # max_blocks：单次拆分的 symbol×interval 最大组合数。
 max_blocks = 4
-# max_chars_per_block：传给子 Agent 的 JSON 字符上限。
-max_chars_per_block = 1600
 
 [ai.holding_horizon_profiles.one_hour]
 # entry_timeframes：入场判断使用的周期列表。

@@ -77,9 +77,6 @@ func NewApp(cfg *brcfg.Config) (*App, error) {
 	} else {
 		logger.Warnf("未找到提示词模板 '%s'", cfg.Prompt.SystemTemplate)
 	}
-	if err := visual.EnsureHeadlessAvailable(ctx); err != nil {
-		return nil, fmt.Errorf("初始化可视化渲染失败(请安装 headless Chrome): %w", err)
-	}
 
 	// 存储与 WS 更新器
 	src, err := gateway.NewSourceFromConfig(cfg)
@@ -104,7 +101,10 @@ func NewApp(cfg *brcfg.Config) (*App, error) {
 	warmupSummary := fmt.Sprintf("*Warmup 完成*\n```\n%v\n```", lookbacks)
 
 	// 模型 Providers
-	var modelCfgs []provider.ModelCfg
+	var (
+		modelCfgs   []provider.ModelCfg
+		visionReady bool
+	)
 	for _, m := range cfg.AI.MustResolveModelConfigs() {
 		modelCfgs = append(modelCfgs, provider.ModelCfg{
 			ID:             m.ID,
@@ -117,6 +117,16 @@ func NewApp(cfg *brcfg.Config) (*App, error) {
 			SupportsVision: m.SupportsVision,
 			ExpectJSON:     m.ExpectJSON,
 		})
+		if m.Enabled && m.SupportsVision {
+			visionReady = true
+		}
+	}
+	if visionReady {
+		if err := visual.EnsureHeadlessAvailable(ctx); err != nil {
+			return nil, fmt.Errorf("初始化可视化渲染失败(请安装 headless Chrome): %w", err)
+		}
+	} else {
+		logger.Infof("所有启用模型均不支持图像，跳过可视化渲染初始化")
 	}
 	providers := provider.BuildProvidersFromConfig(modelCfgs, time.Duration(cfg.MCP.TimeoutSeconds)*time.Second)
 	if len(providers) == 0 {
@@ -237,6 +247,7 @@ func NewApp(cfg *brcfg.Config) (*App, error) {
 		lastOpen:            map[string]time.Time{},
 		lastRawJSON:         initialLastJSON,
 		freqManager:         freqManager,
+		visionReady:         visionReady,
 	}
 
 	var liveHTTPServe *livehttp.Server

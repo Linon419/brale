@@ -151,7 +151,6 @@ type MultiAgentConfig struct {
 	PatternTemplate   string `toml:"pattern_template"`
 	TrendTemplate     string `toml:"trend_template"`
 	MaxBlocks         int    `toml:"max_blocks"`
-	MaxCharsPerBlock  int    `toml:"max_chars_per_block"`
 }
 
 func (m *MultiAgentConfig) applyDefaults() {
@@ -169,9 +168,6 @@ func (m *MultiAgentConfig) applyDefaults() {
 	}
 	if m.MaxBlocks <= 0 {
 		m.MaxBlocks = 4
-	}
-	if m.MaxCharsPerBlock <= 0 {
-		m.MaxCharsPerBlock = 1600
 	}
 }
 
@@ -844,9 +840,6 @@ func validate(c *Config) error {
 		}
 		if ma.MaxBlocks <= 0 {
 			return fmt.Errorf("ai.multi_agent.max_blocks 需 > 0")
-		}
-		if ma.MaxCharsPerBlock <= 0 {
-			return fmt.Errorf("ai.multi_agent.max_chars_per_block 需 > 0")
 		}
 	}
 	if c.Freqtrade.Enabled {

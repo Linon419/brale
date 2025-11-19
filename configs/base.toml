@@ -52,8 +52,6 @@ pattern_template = "agent_pattern"
 trend_template = "agent_trend"
 # max_blocks：单次拆分的 symbol×interval 最大组合数。
 max_blocks = 4
-# max_chars_per_block：传给子 Agent 的 JSON 片段长度上限。
-max_chars_per_block = 1600
 
 
 
@@ -65,8 +63,8 @@ background_timeframes = ["4h"]
 slice_drop_tail = 1
 [ai.holding_horizon_profiles.one_hour.indicators.rsi]
 # QuantAgent 特有的 RSI 阈值。
-oversold = 35
-overbought = 65
+oversold = 30
+overbought = 70
 
 [ai.holding_horizon_profiles.four_hour]
 # 4 小时持仓：15/30m 入场，4h 确认，1d 背景。
@@ -104,7 +102,7 @@ overbought = 65
 
 [mcp]
 # timeout_seconds：单次模型推理的超时时间（秒）。
-timeout_seconds = 600
+timeout_seconds = 120
 [prompt]
 # dir：提示词模板目录（通常保持 prompts）。
 dir = "prompts"

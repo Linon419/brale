@@ -40,6 +40,7 @@ type AnalysisBuildInput struct {
 	SliceDrop   int
 	HorizonName string
 	Indicators  config.HorizonIndicators
+	WithImages  bool
 }
 
 // BuildAnalysisContexts 批量生成 AnalysisContext。
@@ -63,6 +64,7 @@ func BuildAnalysisContexts(input AnalysisBuildInput) []AnalysisContext {
 	}
 	indicatorLookback := input.Indicators.LookbackBars()
 	result := make([]AnalysisContext, 0, len(input.Symbols)*len(intervals))
+	generateImages := input.WithImages
 	for _, rawSym := range input.Symbols {
 		sym := strings.ToUpper(strings.TrimSpace(rawSym))
 		if sym == "" {
@@ -139,7 +141,7 @@ func BuildAnalysisContexts(input AnalysisBuildInput) []AnalysisContext {
 				TrendReport:     trendReport,
 				ForecastHorizon: input.HorizonName,
 			}
-			if indErr == nil {
+			if generateImages && indErr == nil {
 				imgInput := visual.CompositeInput{
 					Context:    ctx,
 					Symbol:     sym,

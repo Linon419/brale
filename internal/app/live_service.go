@@ -41,6 +41,7 @@ type LiveService struct {
 	lastRawJSON string
 
 	freqManager *freqexec.Manager
+	visionReady bool
 }
 
 // Run 启动实时服务，直到 ctx 取消。
@@ -169,6 +170,7 @@ func (s *LiveService) tickDecision(ctx context.Context) error {
 			SliceDrop:   s.profile.SliceDropTail,
 			HorizonName: s.horizonName,
 			Indicators:  s.profile.Indicators,
+			WithImages:  s.visionReady,
 		})
 	}
 	if snaps := s.livePositions(); len(snaps) > 0 {
