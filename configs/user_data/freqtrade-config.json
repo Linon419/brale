@@ -56,8 +56,8 @@
   ],
   "telegram": {
     "enabled": true,
-    "token": "8310150358:AAHPpnqfGCVIIlaDGWFUXAtWfDalcNzUDNM",
-    "chat_id": "-1002744826913"
+    "token": "7979485253:AAHy3j8VMfkK3arNp7nl_stvWN3JKh-KGWg",
+    "chat_id": "-1003001441406"
   },
   "api_server": {
     "enabled": true,
@@ -73,7 +73,7 @@
   },
   "webhook": {
     "enabled": true,
-    "url": "http://172.17.0.1:9991/api/live/freqtrade/webhook",
+    "url": "http://brale:9991/api/live/freqtrade/webhook",
     "format": "json",
     "webhookentry": {
       "type": "entry",

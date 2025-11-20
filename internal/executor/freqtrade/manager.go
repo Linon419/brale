@@ -1,12 +1,9 @@
 package freqtrade
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
-	"net/http"
 	"sort"
 	"strconv"
 	"strings"
@@ -46,20 +43,18 @@ type APIPosition struct {
 
 // Manager 提供 freqtrade 执行、日志与持仓同步能力。
 type Manager struct {
-	client           *Client
-	cfg              brcfg.FreqtradeConfig
-	logger           Logger
-	orderRec         market.Recorder
-	traceByKey       map[string]int
-	traceByID        map[int]string
-	positions        map[int]Position
-	mu               sync.Mutex
-	horizonName      string
-	stopLossClient   *http.Client
-	takeProfitClient *http.Client
-	riskStore        *storage.Store
-	riskStorePath    string
-	notifier         TextNotifier
+	client        *Client
+	cfg           brcfg.FreqtradeConfig
+	logger        Logger
+	orderRec      market.Recorder
+	traceByKey    map[string]int
+	traceByID     map[int]string
+	positions     map[int]Position
+	mu            sync.Mutex
+	horizonName   string
+	riskStore     *storage.Store
+	riskStorePath string
+	notifier      TextNotifier
 }
 
 // Position 缓存 freqtrade 持仓信息。
@@ -76,22 +71,6 @@ type Position struct {
 
 // NewManager 创建 freqtrade 执行管理器。
 func NewManager(client *Client, cfg brcfg.FreqtradeConfig, horizon string, logStore Logger, orderRec market.Recorder, notifier TextNotifier) *Manager {
-	var slClient *http.Client
-	if strings.TrimSpace(cfg.StopLossWebhookURL) != "" {
-		timeout := time.Duration(cfg.TimeoutSeconds) * time.Second
-		if timeout <= 0 {
-			timeout = 10 * time.Second
-		}
-		slClient = &http.Client{Timeout: timeout}
-	}
-	var tpClient *http.Client
-	if strings.TrimSpace(cfg.TakeProfitWebhookURL) != "" {
-		timeout := time.Duration(cfg.TimeoutSeconds) * time.Second
-		if timeout <= 0 {
-			timeout = 10 * time.Second
-		}
-		tpClient = &http.Client{Timeout: timeout}
-	}
 	var risk *storage.Store
 	if path := strings.TrimSpace(cfg.RiskStorePath); path != "" {
 		store, err := storage.Open(path)
@@ -102,19 +81,17 @@ func NewManager(client *Client, cfg brcfg.FreqtradeConfig, horizon string, logSt
 		}
 	}
 	return &Manager{
-		client:           client,
-		cfg:              cfg,
-		logger:           logStore,
-		orderRec:         orderRec,
-		traceByKey:       make(map[string]int),
-		traceByID:        make(map[int]string),
-		positions:        make(map[int]Position),
-		horizonName:      horizon,
-		stopLossClient:   slClient,
-		takeProfitClient: tpClient,
-		riskStore:        risk,
-		riskStorePath:    strings.TrimSpace(cfg.RiskStorePath),
-		notifier:         notifier,
+		client:        client,
+		cfg:           cfg,
+		logger:        logStore,
+		orderRec:      orderRec,
+		traceByKey:    make(map[string]int),
+		traceByID:     make(map[int]string),
+		positions:     make(map[int]Position),
+		horizonName:   horizon,
+		riskStore:     risk,
+		riskStorePath: strings.TrimSpace(cfg.RiskStorePath),
+		notifier:      notifier,
 	}
 }
 
@@ -142,38 +119,6 @@ func (m *Manager) Execute(ctx context.Context, input DecisionInput) error {
 	default:
 		return nil
 	}
-}
-
-type stopLossWebhookPayload struct {
-	TradeID    int     `json:"trade_id"`
-	Pair       string  `json:"pair"`
-	Symbol     string  `json:"symbol"`
-	Side       string  `json:"side"`
-	StopLoss   float64 `json:"stop_loss"`
-	EntryPrice float64 `json:"entry_price,omitempty"`
-	Stake      float64 `json:"stake_amount,omitempty"`
-	Amount     float64 `json:"amount,omitempty"`
-	Leverage   float64 `json:"leverage,omitempty"`
-	TraceID    string  `json:"trace_id"`
-	Horizon    string  `json:"horizon"`
-	Reason     string  `json:"reason,omitempty"`
-	Timestamp  int64   `json:"timestamp"`
-}
-
-type takeProfitWebhookPayload struct {
-	TradeID    int     `json:"trade_id"`
-	Pair       string  `json:"pair"`
-	Symbol     string  `json:"symbol"`
-	Side       string  `json:"side"`
-	TakeProfit float64 `json:"take_profit"`
-	EntryPrice float64 `json:"entry_price,omitempty"`
-	Stake      float64 `json:"stake_amount,omitempty"`
-	Amount     float64 `json:"amount,omitempty"`
-	Leverage   float64 `json:"leverage,omitempty"`
-	TraceID    string  `json:"trace_id"`
-	Horizon    string  `json:"horizon"`
-	Reason     string  `json:"reason,omitempty"`
-	Timestamp  int64   `json:"timestamp"`
 }
 
 func (m *Manager) open(ctx context.Context, traceID string, d decision.Decision) error {
@@ -252,25 +197,6 @@ func (m *Manager) open(ctx context.Context, traceID string, d decision.Decision)
 		lines = append(lines, "理由: "+reason)
 	}
 	m.notify("Freqtrade 建仓请求已发送 ✅", lines...)
-	// 同步初始止盈/止损到 risk server
-	go func(sym string, tp, sl float64, trace string) {
-		dec := decision.Decision{
-			Symbol:     sym,
-			TakeProfit: tp,
-			StopLoss:   sl,
-			Reasoning:  strings.TrimSpace(d.Reasoning),
-		}
-		if tp > 0 {
-			if err := m.adjustTakeProfit(context.Background(), trace, dec); err != nil {
-				logger.Warnf("初始同步止盈失败: %v", err)
-			}
-		}
-		if sl > 0 {
-			if err := m.adjustStopLoss(context.Background(), trace, dec); err != nil {
-				logger.Warnf("初始同步止损失败: %v", err)
-			}
-		}
-	}(strings.ToUpper(strings.TrimSpace(d.Symbol)), d.TakeProfit, d.StopLoss, m.ensureTrace(traceID))
 	return nil
 }
 
@@ -315,10 +241,6 @@ func (m *Manager) close(ctx context.Context, traceID string, d decision.Decision
 }
 
 func (m *Manager) adjustStopLoss(ctx context.Context, traceID string, d decision.Decision) error {
-	if strings.TrimSpace(m.cfg.StopLossWebhookURL) == "" {
-		logger.Warnf("freqtrade stop loss webhook 未配置，忽略 adjust_stop_loss")
-		return nil
-	}
 	if d.StopLoss <= 0 {
 		return fmt.Errorf("invalid stop_loss for adjust_stop_loss")
 	}
@@ -332,113 +254,47 @@ func (m *Manager) adjustStopLoss(ctx context.Context, traceID string, d decision
 	}
 	existing, _ := m.loadRiskRecord(ctx, tradeID)
 	prevStop := existing.StopLoss
-	payload := stopLossWebhookPayload{
+	status := "stoploss_recorded"
+	lines := []string{
+		fmt.Sprintf("交易ID: %d", tradeID),
+		fmt.Sprintf("标的: %s", strings.ToUpper(d.Symbol)),
+		fmt.Sprintf("方向: %s", strings.ToUpper(side)),
+		fmt.Sprintf("原止损: %s", formatPrice(prevStop)),
+		fmt.Sprintf("新止损: %.4f", d.StopLoss),
+		fmt.Sprintf("Trace: %s", m.ensureTrace(traceID)),
+	}
+	if reason := shortReason(d.Reasoning); reason != "" {
+		lines = append(lines, "理由: "+reason)
+	}
+	m.recordRisk(storage.RiskRecord{
 		TradeID:    tradeID,
-		Pair:       pair,
 		Symbol:     strings.ToUpper(strings.TrimSpace(d.Symbol)),
+		Pair:       pair,
 		Side:       side,
-		StopLoss:   d.StopLoss,
 		EntryPrice: pos.EntryPrice,
 		Stake:      pos.Stake,
 		Amount:     pos.Amount,
 		Leverage:   pos.Leverage,
-		TraceID:    m.ensureTrace(traceID),
-		Horizon:    m.horizonName,
+		StopLoss:   d.StopLoss,
+		TakeProfit: existing.TakeProfit,
 		Reason:     strings.TrimSpace(d.Reasoning),
-		Timestamp:  time.Now().UnixMilli(),
-	}
-	body, err := json.Marshal(payload)
-	if err != nil {
-		return err
-	}
-	client := m.stopLossClient
-	if client == nil {
-		timeout := time.Duration(m.cfg.TimeoutSeconds) * time.Second
-		if timeout <= 0 {
-			timeout = 10 * time.Second
-		}
-		client = &http.Client{Timeout: timeout}
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimSpace(m.cfg.StopLossWebhookURL), bytes.NewReader(body))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	if secret := strings.TrimSpace(m.cfg.StopLossSecret); secret != "" {
-		req.Header.Set("X-Webhook-Secret", secret)
-	}
-	resp, err := client.Do(req)
-	status := "stoploss_webhook_success"
-	if err == nil && resp != nil {
-		defer resp.Body.Close()
-		_, _ = io.Copy(io.Discard, resp.Body)
-		if resp.StatusCode/100 != 2 {
-			err = fmt.Errorf("stop loss webhook status=%d", resp.StatusCode)
-		}
-	} else if resp == nil {
-		err = fmt.Errorf("stop loss webhook 未返回响应")
-	}
-	if err != nil {
-		status = "stoploss_webhook_error"
-		logger.Warnf("freqtrade stop-loss webhook 失败: %v", err)
-		lines := []string{
-			fmt.Sprintf("交易ID: %d", tradeID),
-			fmt.Sprintf("标的: %s", strings.ToUpper(d.Symbol)),
-			fmt.Sprintf("方向: %s", strings.ToUpper(side)),
-			fmt.Sprintf("原止损: %s  新止损: %.4f", formatPrice(prevStop), d.StopLoss),
-			fmt.Sprintf("Trace: %s", m.ensureTrace(traceID)),
-			fmt.Sprintf("错误: %v", err),
-		}
-		if reason := shortReason(d.Reasoning); reason != "" {
-			lines = append(lines, "理由: "+reason)
-		}
-		m.notify("止损调整失败 ❌", lines...)
-	} else {
-		logger.Infof("freqtrade stop-loss webhook 已发送 trade_id=%d %s stop=%.4f", tradeID, d.Symbol, d.StopLoss)
-		lines := []string{
-			fmt.Sprintf("交易ID: %d", tradeID),
-			fmt.Sprintf("标的: %s", strings.ToUpper(d.Symbol)),
-			fmt.Sprintf("方向: %s", strings.ToUpper(side)),
-			fmt.Sprintf("原止损: %s", formatPrice(prevStop)),
-			fmt.Sprintf("新止损: %.4f", d.StopLoss),
-			fmt.Sprintf("Trace: %s", m.ensureTrace(traceID)),
-		}
-		if reason := shortReason(d.Reasoning); reason != "" {
-			lines = append(lines, "理由: "+reason)
-		}
-		m.notify("止损已更新 ✅", lines...)
-	}
+		Source:     "adjust_stop_loss",
+		Status:     status,
+		UpdatedAt:  time.Now(),
+	})
+	logger.Infof("freqtrade stop-loss 记录已更新 trade_id=%d %s stop=%.4f", tradeID, d.Symbol, d.StopLoss)
+	m.notify("止损已更新 ✅", lines...)
 	recData := map[string]any{
-		"payload": payload,
-		"url":     strings.TrimSpace(m.cfg.StopLossWebhookURL),
+		"trade_id":  tradeID,
+		"symbol":    strings.ToUpper(strings.TrimSpace(d.Symbol)),
+		"prev_stop": formatPrice(prevStop),
+		"new_stop":  d.StopLoss,
 	}
-	m.logExecutor(ctx, traceID, d, tradeID, status, recData, err)
-	if err == nil {
-		m.recordRisk(storage.RiskRecord{
-			TradeID:    tradeID,
-			Symbol:     strings.ToUpper(strings.TrimSpace(d.Symbol)),
-			Pair:       pair,
-			Side:       side,
-			EntryPrice: pos.EntryPrice,
-			Stake:      pos.Stake,
-			Amount:     pos.Amount,
-			Leverage:   pos.Leverage,
-			StopLoss:   d.StopLoss,
-			TakeProfit: existing.TakeProfit,
-			Reason:     strings.TrimSpace(d.Reasoning),
-			Source:     "adjust_stop_loss",
-			Status:     status,
-			UpdatedAt:  time.Now(),
-		})
-	}
-	return err
+	m.logExecutor(ctx, traceID, d, tradeID, status, recData, nil)
+	return nil
 }
 
 func (m *Manager) adjustTakeProfit(ctx context.Context, traceID string, d decision.Decision) error {
-	if strings.TrimSpace(m.cfg.TakeProfitWebhookURL) == "" {
-		logger.Warnf("freqtrade take profit webhook 未配置，忽略 adjust_take_profit")
-		return nil
-	}
 	if d.TakeProfit <= 0 {
 		return fmt.Errorf("invalid take_profit for adjust_take_profit")
 	}
@@ -452,106 +308,44 @@ func (m *Manager) adjustTakeProfit(ctx context.Context, traceID string, d decisi
 	}
 	existing, _ := m.loadRiskRecord(ctx, tradeID)
 	prevTP := existing.TakeProfit
-	payload := takeProfitWebhookPayload{
+	status := "takeprofit_recorded"
+	lines := []string{
+		fmt.Sprintf("交易ID: %d", tradeID),
+		fmt.Sprintf("标的: %s", strings.ToUpper(d.Symbol)),
+		fmt.Sprintf("方向: %s", strings.ToUpper(side)),
+		fmt.Sprintf("原止盈: %s", formatPrice(prevTP)),
+		fmt.Sprintf("新止盈: %.4f", d.TakeProfit),
+		fmt.Sprintf("Trace: %s", m.ensureTrace(traceID)),
+	}
+	if reason := shortReason(d.Reasoning); reason != "" {
+		lines = append(lines, "理由: "+reason)
+	}
+	m.recordRisk(storage.RiskRecord{
 		TradeID:    tradeID,
-		Pair:       pair,
 		Symbol:     strings.ToUpper(strings.TrimSpace(d.Symbol)),
+		Pair:       pair,
 		Side:       side,
-		TakeProfit: d.TakeProfit,
 		EntryPrice: pos.EntryPrice,
 		Stake:      pos.Stake,
 		Amount:     pos.Amount,
 		Leverage:   pos.Leverage,
-		TraceID:    m.ensureTrace(traceID),
-		Horizon:    m.horizonName,
+		StopLoss:   existing.StopLoss,
+		TakeProfit: d.TakeProfit,
 		Reason:     strings.TrimSpace(d.Reasoning),
-		Timestamp:  time.Now().UnixMilli(),
-	}
-	body, err := json.Marshal(payload)
-	if err != nil {
-		return err
-	}
-	client := m.takeProfitClient
-	if client == nil {
-		timeout := time.Duration(m.cfg.TimeoutSeconds) * time.Second
-		if timeout <= 0 {
-			timeout = 10 * time.Second
-		}
-		client = &http.Client{Timeout: timeout}
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimSpace(m.cfg.TakeProfitWebhookURL), bytes.NewReader(body))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	if secret := strings.TrimSpace(m.cfg.TakeProfitSecret); secret != "" {
-		req.Header.Set("X-Webhook-Secret", secret)
-	}
-	resp, err := client.Do(req)
-	status := "takeprofit_webhook_success"
-	if err == nil && resp != nil {
-		defer resp.Body.Close()
-		_, _ = io.Copy(io.Discard, resp.Body)
-		if resp.StatusCode/100 != 2 {
-			err = fmt.Errorf("take profit webhook status=%d", resp.StatusCode)
-		}
-	} else if resp == nil {
-		err = fmt.Errorf("take profit webhook 未返回响应")
-	}
-	if err != nil {
-		status = "takeprofit_webhook_error"
-		logger.Warnf("freqtrade take-profit webhook 失败: %v", err)
-		lines := []string{
-			fmt.Sprintf("交易ID: %d", tradeID),
-			fmt.Sprintf("标的: %s", strings.ToUpper(d.Symbol)),
-			fmt.Sprintf("方向: %s", strings.ToUpper(side)),
-			fmt.Sprintf("原止盈: %s  新止盈: %.4f", formatPrice(prevTP), d.TakeProfit),
-			fmt.Sprintf("Trace: %s", m.ensureTrace(traceID)),
-			fmt.Sprintf("错误: %v", err),
-		}
-		if reason := shortReason(d.Reasoning); reason != "" {
-			lines = append(lines, "理由: "+reason)
-		}
-		m.notify("止盈调整失败 ❌", lines...)
-	} else {
-		logger.Infof("freqtrade take-profit webhook 已发送 trade_id=%d %s take=%.4f", tradeID, d.Symbol, d.TakeProfit)
-		lines := []string{
-			fmt.Sprintf("交易ID: %d", tradeID),
-			fmt.Sprintf("标的: %s", strings.ToUpper(d.Symbol)),
-			fmt.Sprintf("方向: %s", strings.ToUpper(side)),
-			fmt.Sprintf("原止盈: %s", formatPrice(prevTP)),
-			fmt.Sprintf("新止盈: %.4f", d.TakeProfit),
-			fmt.Sprintf("Trace: %s", m.ensureTrace(traceID)),
-		}
-		if reason := shortReason(d.Reasoning); reason != "" {
-			lines = append(lines, "理由: "+reason)
-		}
-		m.notify("止盈已更新 ✅", lines...)
-	}
+		Source:     "adjust_take_profit",
+		Status:     status,
+		UpdatedAt:  time.Now(),
+	})
+	logger.Infof("freqtrade take-profit 记录已更新 trade_id=%d %s take=%.4f", tradeID, d.Symbol, d.TakeProfit)
+	m.notify("止盈已更新 ✅", lines...)
 	recData := map[string]any{
-		"payload": payload,
-		"url":     strings.TrimSpace(m.cfg.TakeProfitWebhookURL),
+		"trade_id": tradeID,
+		"symbol":   strings.ToUpper(strings.TrimSpace(d.Symbol)),
+		"prev_tp":  formatPrice(prevTP),
+		"new_tp":   d.TakeProfit,
 	}
-	m.logExecutor(ctx, traceID, d, tradeID, status, recData, err)
-	if err == nil {
-		m.recordRisk(storage.RiskRecord{
-			TradeID:    tradeID,
-			Symbol:     strings.ToUpper(strings.TrimSpace(d.Symbol)),
-			Pair:       pair,
-			Side:       side,
-			EntryPrice: pos.EntryPrice,
-			Stake:      pos.Stake,
-			Amount:     pos.Amount,
-			Leverage:   pos.Leverage,
-			StopLoss:   existing.StopLoss,
-			TakeProfit: d.TakeProfit,
-			Reason:     strings.TrimSpace(d.Reasoning),
-			Source:     "adjust_take_profit",
-			Status:     status,
-			UpdatedAt:  time.Now(),
-		})
-	}
-	return err
+	m.logExecutor(ctx, traceID, d, tradeID, status, recData, nil)
+	return nil
 }
 
 // HandleWebhook 由 HTTP 路由调用，负责更新持仓与日志。
@@ -737,7 +531,6 @@ func (m *Manager) handleEntry(ctx context.Context, msg WebhookMessage, filled bo
 		fmt.Sprintf("开仓时间: %s", formatTime(openTime)),
 		fmt.Sprintf("Trace: %s", traceID),
 	)
-	m.syncInitialRisk(ctx, traceID, tradeID, symbol)
 }
 
 func (m *Manager) handleEntryCancel(ctx context.Context, msg WebhookMessage) {
@@ -1073,77 +866,6 @@ func (m *Manager) recordOrder(ctx context.Context, msg WebhookMessage, action st
 	}
 	if _, err := m.orderRec.RecordOrder(ctx, &order); err != nil {
 		logger.Warnf("freqtrade manager: record order failed: %v", err)
-	}
-}
-
-func (m *Manager) syncInitialRisk(ctx context.Context, traceID string, tradeID int, symbol string) {
-	if tradeID <= 0 || strings.TrimSpace(symbol) == "" {
-		return
-	}
-	rec, ok := m.loadRiskRecord(ctx, tradeID)
-	if !ok {
-		return
-	}
-	symbol = strings.ToUpper(strings.TrimSpace(symbol))
-	if rec.StopLoss > 0 {
-		title := "自动同步止损"
-		lines := []string{
-			fmt.Sprintf("交易ID: %d", tradeID),
-			fmt.Sprintf("标的: %s", symbol),
-			fmt.Sprintf("目标止损: %.4f", rec.StopLoss),
-			fmt.Sprintf("Trace: %s", m.ensureTrace(traceID)),
-		}
-		if reason := strings.TrimSpace(rec.Reason); reason != "" {
-			lines = append(lines, "理由: "+reason)
-		}
-		m.notify(title+" ⏳", lines...)
-		dec := decision.Decision{
-			Symbol:   symbol,
-			StopLoss: rec.StopLoss,
-			Reasoning: func() string {
-				if strings.TrimSpace(rec.Reason) != "" {
-					return rec.Reason
-				}
-				return "初始同步止损"
-			}(),
-		}
-		if err := m.adjustStopLoss(ctx, traceID, dec); err != nil {
-			logger.Warnf("自动同步止损失败 trade_id=%d: %v", tradeID, err)
-			lines = append(lines, fmt.Sprintf("错误: %v", err))
-			m.notify("自动同步止损失败 ❌", lines...)
-		} else {
-			m.notify("自动同步止损成功 ✅", lines...)
-		}
-	}
-	if rec.TakeProfit > 0 {
-		title := "自动同步止盈"
-		lines := []string{
-			fmt.Sprintf("交易ID: %d", tradeID),
-			fmt.Sprintf("标的: %s", symbol),
-			fmt.Sprintf("目标止盈: %.4f", rec.TakeProfit),
-			fmt.Sprintf("Trace: %s", m.ensureTrace(traceID)),
-		}
-		if reason := strings.TrimSpace(rec.Reason); reason != "" {
-			lines = append(lines, "理由: "+reason)
-		}
-		m.notify(title+" ⏳", lines...)
-		dec := decision.Decision{
-			Symbol:     symbol,
-			TakeProfit: rec.TakeProfit,
-			Reasoning: func() string {
-				if strings.TrimSpace(rec.Reason) != "" {
-					return rec.Reason
-				}
-				return "初始同步止盈"
-			}(),
-		}
-		if err := m.adjustTakeProfit(ctx, traceID, dec); err != nil {
-			logger.Warnf("自动同步止盈失败 trade_id=%d: %v", tradeID, err)
-			lines = append(lines, fmt.Sprintf("错误: %v", err))
-			m.notify("自动同步止盈失败 ❌", lines...)
-		} else {
-			m.notify("自动同步止盈成功 ✅", lines...)
-		}
 	}
 }
 

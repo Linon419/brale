@@ -113,7 +113,7 @@ system_template = "default"
 # liquidity_filter_usd_m：按 OI×价格估算的最低流动性（百万 USD）。
 liquidity_filter_usd_m = 15
 # min_risk_reward：接受的最低风险回报比。
-min_risk_reward = 1.0
+min_risk_reward = 0.1
 # open_cooldown_seconds：同 symbol+方向开仓的冷却时间（秒）。
 open_cooldown_seconds = 180
 # max_opens_per_cycle：单次决策循环内允许的新开仓数量。
