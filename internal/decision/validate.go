@@ -10,6 +10,7 @@ import "fmt"
 var validActions = map[string]bool{
 	"open_long": true, "open_short": true, "close_long": true, "close_short": true,
 	"hold": true, "wait": true, "adjust_stop_loss": true, "adjust_take_profit": true,
+	"update_tiers": true,
 }
 
 func ValidateAll(ds []Decision) error {
@@ -39,6 +40,9 @@ func Validate(d *Decision) error {
 		if d.Confidence < 0 || d.Confidence > 100 {
 			return fmt.Errorf("confidence 范围0-100")
 		}
+		if err := validateTiers(d.Tiers, true); err != nil {
+			return err
+		}
 	case "adjust_stop_loss":
 		if d.StopLoss <= 0 {
 			return fmt.Errorf("调整止损需提供 stop_loss>0")
@@ -47,6 +51,33 @@ func Validate(d *Decision) error {
 		if d.TakeProfit <= 0 {
 			return fmt.Errorf("调整止盈需提供 take_profit>0")
 		}
+	case "update_tiers":
+		if err := validateTiers(d.Tiers, false); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateTiers(t *DecisionTiers, requireAll bool) error {
+	if t == nil {
+		return fmt.Errorf("需提供 tiers 配置")
+	}
+	if requireAll {
+		if t.Tier1Target <= 0 || t.Tier2Target <= 0 || t.Tier3Target <= 0 {
+			return fmt.Errorf("tiers 目标价需 >0")
+		}
+	} else {
+		if t.Tier1Target <= 0 && t.Tier2Target <= 0 && t.Tier3Target <= 0 {
+			return fmt.Errorf("需提供至少一个 tier 目标价>0")
+		}
+		if t.Tier1Target < 0 || t.Tier2Target < 0 || t.Tier3Target < 0 {
+			return fmt.Errorf("tier 目标价不能为负")
+		}
+	}
+	// 允许 ratio 缺省，程序会默认填入
+	if t.Tier1Ratio < 0 || t.Tier2Ratio < 0 || t.Tier3Ratio < 0 {
+		return fmt.Errorf("tiers 比例需 >=0")
 	}
 	return nil
 }

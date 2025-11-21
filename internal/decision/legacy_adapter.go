@@ -271,7 +271,7 @@ func (e *LegacyEngineAdapter) buildUserSummary(ctx context.Context, input Contex
 	var b strings.Builder
 	b.WriteString("# 决策输入（Multi-Agent 汇总）\n")
 	e.appendLastDecisions(&b, input.LastDecisions)
-	e.appendCurrentPositions(&b, input.Positions)
+	e.appendCurrentPositions(&b, input.Account, input.Positions)
 	e.appendKlineWindows(&b, input.Analysis)
 	e.logStructuredBlocksDebug(input.Analysis)
 	if len(insights) > 0 {
@@ -328,16 +328,17 @@ func (e *LegacyEngineAdapter) buildUserSummary(ctx context.Context, input Contex
 		b.WriteString("\n## Multi-Agent Insights\n- 暂无可用结论，请谨慎观望或输出空决策。\n")
 	}
 	req := `请先输出简短的【思维链】（3句，说明判断依据与结论），换行后仅输出 JSON 数组。
-	数组中每项需含：symbol、action、reasoning。
-	reasoning中当多空信号差距在30以上时，就可以执行开仓操作，需要包含bull_score，bear_score
-	如已有仓位且需要部分止盈/减仓，添加 close_ratio（0-1），无仓位时勿返回。
-	若 action 为 open_long 或 open_short，必须返回 take_profit、stop_loss（绝对价，浮点）及 leverage（2–50，依信号强度）。
-    若 action 为 adjust_stop_loss，必须在json中返回新 stop_loss，否则视为无效。
-	若 action 为 adjust_take_profit，必须在 json 中返回 take_profit，否则视为无效。
-    示例:
-    思维链: 4h 供需不明、15m 无形态。
-    [{"symbol":"BTCUSDT","action":"hold","reasoning":"多空信号不足"}]
-`
+	JSON 每项必须包含 symbol、action、reasoning（写出 bull_score、bear_score、ATR 语境），并遵守：
+	- action 为 open_long/open_short：返回 take_profit、stop_loss（绝对价）、leverage（2–50）以及 tiers 对象（含 tier1/2/3 target 与 ratio，ratio 省略时程序默认 33%/33%/34%）。
+	- action 为 update_tiers：当结构或波动变化需要调整三段目标时输出，并在 tiers 对象内给出新的 target/ratio；**每个被调整的段必须同时提供 target 与 ratio**，且仅能修改未完成 (tier*_done=0) 的段位，已标注 ✅ 的段不可更改。
+	- action 为 adjust_stop_loss/adjust_take_profit：必须同时返回新的 stop_loss 与 take_profit，否则视为无效。
+    - 多个动作须按逻辑顺序列出，例如先 update_tiers 再 adjust_*。
+	- 除非结构彻底反转或紧急退出，不要输出 close_*；分段减仓由程序自动执行。
+	- 无操作时仅输出 hold。
+	示例:
+	【思维链】4h 需求区测试成功 + 15m EMA 多头排列，ATR 扩张允许 1.8R 目标。
+     [{"symbol":"BTCUSDT","action":"open_long","take_profit":73000,"stop_loss":70500,"leverage":6,"tiers":{"tier1_target":71200,"tier1_ratio":0.33,"tier2_target":72000,"tier2_ratio":0.33,"tier3_target":73500,"tier3_ratio":0.34},"reasoning":"bull_score=72,bear_score=28，ATR Normal；H4 需求区与EMA55 共振"}]
+     `
 	b.WriteString(req)
 
 	return b.String()
@@ -722,16 +723,43 @@ func isOpenAction(action string) bool {
 	return strings.HasPrefix(action, "open_")
 }
 
-func (e *LegacyEngineAdapter) appendCurrentPositions(b *strings.Builder, positions []PositionSnapshot) {
+func (e *LegacyEngineAdapter) appendCurrentPositions(b *strings.Builder, account AccountSnapshot, positions []PositionSnapshot) {
 	if len(positions) == 0 || b == nil {
 		return
+	}
+	if account.Total > 0 || account.Available > 0 {
+		currency := strings.ToUpper(strings.TrimSpace(account.Currency))
+		if currency == "" {
+			currency = "USDT"
+		}
+		b.WriteString("\n## 账户概览\n")
+		line := fmt.Sprintf("- 权益: %.2f %s", account.Total, currency)
+		if account.Available > 0 {
+			line += fmt.Sprintf(" · 可用: %.2f", account.Available)
+		}
+		if account.Total > 0 && account.Available >= 0 {
+			used := account.Total - account.Available
+			if used > 0 {
+				line += fmt.Sprintf(" · 已占用: %.2f", used)
+			}
+		}
+		b.WriteString(line + "\n")
 	}
 	b.WriteString("\n## 当前持仓\n")
 	for _, pos := range positions {
 		line := fmt.Sprintf("- %s %s entry=%.4f",
 			strings.ToUpper(pos.Symbol), strings.ToUpper(pos.Side), pos.EntryPrice)
 		if pos.Quantity > 0 {
-			line += fmt.Sprintf(" size=%.0f", pos.Quantity)
+			line += fmt.Sprintf(" qty=%.4f", pos.Quantity)
+		}
+		if pos.Stake > 0 {
+			line += fmt.Sprintf(" stake=%.2f", pos.Stake)
+		}
+		if pos.Leverage > 0 {
+			line += fmt.Sprintf(" lev=x%.2f", pos.Leverage)
+		}
+		if pos.CurrentPrice > 0 {
+			line += fmt.Sprintf(" last=%.4f", pos.CurrentPrice)
 		}
 		if pos.TakeProfit > 0 {
 			line += fmt.Sprintf(" tp=%.4f", pos.TakeProfit)
@@ -739,12 +767,61 @@ func (e *LegacyEngineAdapter) appendCurrentPositions(b *strings.Builder, positio
 		if pos.StopLoss > 0 {
 			line += fmt.Sprintf(" sl=%.4f", pos.StopLoss)
 		}
+		if pos.UnrealizedPnPct != 0 || pos.UnrealizedPn != 0 {
+			line += fmt.Sprintf(" pnl=%s(%+.2f)", formatPercent(pos.UnrealizedPnPct), pos.UnrealizedPn)
+		}
 		if pos.HoldingMs > 0 {
 			line += fmt.Sprintf(" holding=%s", formatHoldingDuration(pos.HoldingMs))
+		}
+		if pos.RemainingRatio > 0 {
+			line += fmt.Sprintf(" remaining=%s", formatPercent(pos.RemainingRatio))
+		}
+		if pos.AccountRatio > 0 {
+			line += fmt.Sprintf(" 占比=%s", formatPercent(pos.AccountRatio))
+		}
+		tierLines := buildTierLines(pos)
+		if tierLines != "" {
+			line += "\n  " + tierLines
+		}
+		if strings.TrimSpace(pos.TierNotes) != "" {
+			line += "\n  备注: " + pos.TierNotes
 		}
 		b.WriteString(line + "\n")
 	}
 	b.WriteString("请结合上述仓位判断是否需要平仓、加仓或调整计划。\n")
+}
+
+func buildTierLines(pos PositionSnapshot) string {
+	parts := make([]string, 0, 3)
+	if pos.Tier1Target > 0 {
+		parts = append(parts, fmt.Sprintf("Tier1 %.4f (%s)%s",
+			pos.Tier1Target, formatPercent(pos.Tier1Ratio), doneFlag(pos.Tier1Done)))
+	}
+	if pos.Tier2Target > 0 {
+		parts = append(parts, fmt.Sprintf("Tier2 %.4f (%s)%s",
+			pos.Tier2Target, formatPercent(pos.Tier2Ratio), doneFlag(pos.Tier2Done)))
+	}
+	if pos.Tier3Target > 0 {
+		parts = append(parts, fmt.Sprintf("Tier3 %.4f (%s)%s",
+			pos.Tier3Target, formatPercent(pos.Tier3Ratio), doneFlag(pos.Tier3Done)))
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	b := strings.Builder{}
+	b.WriteString(strings.Join(parts, " | "))
+	if strings.TrimSpace(pos.TierNotes) != "" {
+		b.WriteString(" | ")
+		b.WriteString(pos.TierNotes)
+	}
+	return b.String()
+}
+
+func doneFlag(done bool) string {
+	if done {
+		return " ✅"
+	}
+	return ""
 }
 
 type klineWindow struct {
@@ -958,4 +1035,11 @@ func formatHoldingDuration(ms int64) string {
 		return fmt.Sprintf("%dm%ds", m, d/time.Second)
 	}
 	return fmt.Sprintf("%ds", d/time.Second)
+}
+
+func formatPercent(val float64) string {
+	if val == 0 {
+		return "0%"
+	}
+	return fmt.Sprintf("%.0f%%", val*100)
 }

@@ -202,7 +202,7 @@ timeout_seconds = 120
 # dir：提示词模板目录。
 dir = "prompts"
 # system_template：默认系统提示模板名（不含 .txt）。
-system_template = "default"
+system_template = "prompt_default"
 
 [notify.telegram]
 # enabled：是否开启 Telegram 推送。

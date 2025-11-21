@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"sort"
 	"strconv"
 	"strings"
@@ -30,15 +31,62 @@ type TextNotifier interface {
 
 // APIPosition 用于 /api/live/freqtrade/positions 返回的数据结构。
 type APIPosition struct {
-	TradeID    int     `json:"trade_id"`
-	Symbol     string  `json:"symbol"`
-	Side       string  `json:"side"`
-	EntryPrice float64 `json:"entry_price"`
-	Amount     float64 `json:"amount"`
-	Stake      float64 `json:"stake"`
-	Leverage   float64 `json:"leverage"`
-	OpenedAt   int64   `json:"opened_at"`
-	HoldingMs  int64   `json:"holding_ms"`
+	TradeID        int      `json:"trade_id"`
+	Symbol         string   `json:"symbol"`
+	Side           string   `json:"side"`
+	EntryPrice     float64  `json:"entry_price"`
+	Amount         float64  `json:"amount"`
+	Stake          float64  `json:"stake"`
+	Leverage       float64  `json:"leverage"`
+	OpenedAt       int64    `json:"opened_at"`
+	HoldingMs      int64    `json:"holding_ms"`
+	StopLoss       float64  `json:"stop_loss,omitempty"`
+	TakeProfit     float64  `json:"take_profit,omitempty"`
+	CurrentPrice   float64  `json:"current_price,omitempty"`
+	PnLRatio       float64  `json:"pnl_ratio,omitempty"`
+	PnLUSD         float64  `json:"pnl_usd,omitempty"`
+	RemainingRatio float64  `json:"remaining_ratio,omitempty"`
+	Tier1          TierInfo `json:"tier1"`
+	Tier2          TierInfo `json:"tier2"`
+	Tier3          TierInfo `json:"tier3"`
+	TierNotes      string   `json:"tier_notes,omitempty"`
+	Status         string   `json:"status"`
+	ClosedAt       int64    `json:"closed_at,omitempty"`
+	ExitPrice      float64  `json:"exit_price,omitempty"`
+	ExitReason     string   `json:"exit_reason,omitempty"`
+}
+
+type TierInfo struct {
+	Target float64 `json:"target"`
+	Ratio  float64 `json:"ratio"`
+	Done   bool    `json:"done"`
+}
+
+type TierUpdateRequest struct {
+	TradeID     int     `json:"trade_id"`
+	Symbol      string  `json:"symbol"`
+	Side        string  `json:"side"`
+	Tier1Target float64 `json:"tier1_target"`
+	Tier1Ratio  float64 `json:"tier1_ratio"`
+	Tier2Target float64 `json:"tier2_target"`
+	Tier2Ratio  float64 `json:"tier2_ratio"`
+	Tier3Target float64 `json:"tier3_target"`
+	Tier3Ratio  float64 `json:"tier3_ratio"`
+	Reason      string  `json:"reason"`
+}
+
+// TierLog 暴露存储层的三段式记录，供 HTTP 层响应使用。
+type TierLog = storage.TierLog
+
+// TierPriceQuote 表示用于判断 tiers 的最新价格窗口。
+type TierPriceQuote struct {
+	Last float64
+	High float64
+	Low  float64
+}
+
+func (q TierPriceQuote) isEmpty() bool {
+	return q.Last <= 0 && q.High <= 0 && q.Low <= 0
 }
 
 // Manager 提供 freqtrade 执行、日志与持仓同步能力。
@@ -55,18 +103,36 @@ type Manager struct {
 	riskStore     *storage.Store
 	riskStorePath string
 	notifier      TextNotifier
+	tierWatchOnce sync.Once
+	tierExecMu    sync.Mutex
+	tierExec      map[int]bool
+	posSyncOnce   sync.Once
+	balanceMu     sync.RWMutex
+	balance       Balance
 }
+
+const (
+	defaultTier1Ratio = 0.33
+	defaultTier2Ratio = 0.33
+	defaultTier3Ratio = 0.34
+)
 
 // Position 缓存 freqtrade 持仓信息。
 type Position struct {
-	TradeID    int
-	Symbol     string
-	Side       string
-	Amount     float64
-	Stake      float64
-	Leverage   float64
-	EntryPrice float64
-	OpenedAt   time.Time
+	TradeID      int
+	Symbol       string
+	Side         string
+	Amount       float64
+	Stake        float64
+	Leverage     float64
+	EntryPrice   float64
+	OpenedAt     time.Time
+	Closed       bool
+	ClosedAt     time.Time
+	ExitPrice    float64
+	ExitReason   string
+	ExitPnLRatio float64
+	ExitPnLUSD   float64
 }
 
 // NewManager 创建 freqtrade 执行管理器。
@@ -92,6 +158,7 @@ func NewManager(client *Client, cfg brcfg.FreqtradeConfig, horizon string, logSt
 		riskStore:     risk,
 		riskStorePath: strings.TrimSpace(cfg.RiskStorePath),
 		notifier:      notifier,
+		tierExec:      make(map[int]bool),
 	}
 }
 
@@ -116,8 +183,103 @@ func (m *Manager) Execute(ctx context.Context, input DecisionInput) error {
 		return m.adjustStopLoss(ctx, input.TraceID, d)
 	case "adjust_take_profit":
 		return m.adjustTakeProfit(ctx, input.TraceID, d)
+	case "update_tiers":
+		return m.updateTiers(ctx, input.TraceID, d)
 	default:
 		return nil
+	}
+}
+
+// StartTierWatcher 启用三段式监控，按固定间隔检查是否达到目标价。
+func (m *Manager) StartTierWatcher(ctx context.Context, priceFn func(symbol string) TierPriceQuote) {
+	if m == nil {
+		return
+	}
+	m.tierWatchOnce.Do(func() {
+		if priceFn == nil {
+			priceFn = func(string) TierPriceQuote { return TierPriceQuote{} }
+		}
+		go m.runTierWatcher(ctx, priceFn)
+	})
+}
+
+// StartPositionSync 按固定频率刷新 freqtrade 仓位，与实际持仓保持一致。
+func (m *Manager) StartPositionSync(ctx context.Context) {
+	if m == nil {
+		return
+	}
+	m.posSyncOnce.Do(func() {
+		go m.runPositionSync(ctx)
+	})
+}
+
+const tierWatchInterval = 5 * time.Second
+const positionSyncInterval = 2 * time.Second
+
+func (m *Manager) runTierWatcher(ctx context.Context, priceFn func(symbol string) TierPriceQuote) {
+	ticker := time.NewTicker(tierWatchInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			m.evaluateTiers(ctx, priceFn)
+		}
+	}
+}
+
+func (m *Manager) runPositionSync(ctx context.Context) {
+	ticker := time.NewTicker(positionSyncInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			m.refreshOpenPositions(ctx)
+		}
+	}
+}
+
+func (m *Manager) evaluateTiers(ctx context.Context, priceFn func(symbol string) TierPriceQuote) {
+	m.mu.Lock()
+	positions := make([]Position, 0, len(m.positions))
+	for _, pos := range m.positions {
+		positions = append(positions, pos)
+	}
+	m.mu.Unlock()
+	if len(positions) == 0 {
+		return
+	}
+	for _, pos := range positions {
+		rec, ok := m.loadRiskRecord(ctx, pos.TradeID)
+		if !ok {
+			continue
+		}
+		var quote TierPriceQuote
+		if priceFn != nil {
+			quote = priceFn(pos.Symbol)
+		}
+		if quote.isEmpty() {
+			continue
+		}
+		side := strings.ToLower(pos.Side)
+		if price, hit := priceForStopLoss(side, quote, rec.StopLoss); hit {
+			m.forceClose(ctx, pos, "stop_loss", price, rec)
+			continue
+		}
+		if price, hit := priceForTakeProfit(side, quote, rec.TakeProfit); hit {
+			m.forceClose(ctx, pos, "take_profit", price, rec)
+			continue
+		}
+		tierName, target, ratio := nextPendingTier(rec)
+		if tierName == "" || ratio <= 0 || target <= 0 {
+			continue
+		}
+		if price, hit := priceForTierTrigger(side, quote, target); hit {
+			m.triggerTier(ctx, tierName, price, pos, rec)
+		}
 	}
 }
 
@@ -173,24 +335,32 @@ func (m *Manager) open(ctx context.Context, traceID string, d decision.Decision)
 	m.storeTrace(resp.TradeID, traceID)
 	m.logExecutor(ctx, traceID, d, resp.TradeID, "forceenter_success", recData, nil)
 	initialRisk := storage.RiskRecord{
-		TradeID:    resp.TradeID,
-		Symbol:     strings.ToUpper(strings.TrimSpace(d.Symbol)),
-		Pair:       pair,
-		Side:       side,
-		Leverage:   lev,
-		StopLoss:   d.StopLoss,
-		TakeProfit: d.TakeProfit,
-		Reason:     strings.TrimSpace(d.Reasoning),
-		Source:     "open",
-		Status:     "forceenter_success",
-		UpdatedAt:  time.Now(),
+		TradeID:        resp.TradeID,
+		Symbol:         strings.ToUpper(strings.TrimSpace(d.Symbol)),
+		Pair:           pair,
+		Side:           side,
+		Leverage:       lev,
+		StopLoss:       d.StopLoss,
+		TakeProfit:     d.TakeProfit,
+		Reason:         strings.TrimSpace(d.Reasoning),
+		Source:         "open",
+		Status:         "forceenter_success",
+		UpdatedAt:      time.Now(),
+		Stake:          stake,
+		RemainingRatio: 1,
 	}
+	m.applyTiersFromDecision(&initialRisk, d.Tiers)
 	m.recordRisk(initialRisk)
 	lines := []string{
 		fmt.Sprintf("交易ID: %d", resp.TradeID),
 		fmt.Sprintf("标的: %s (%s)", strings.ToUpper(d.Symbol), pair),
 		fmt.Sprintf("方向: %s  杠杆: x%.2f", strings.ToUpper(side), lev),
 		fmt.Sprintf("仓位: %.2f USDT", stake),
+		fmt.Sprintf("止损/止盈: %.4f / %.4f", d.StopLoss, d.TakeProfit),
+		fmt.Sprintf("三段: T1 %.4f(%.0f%%) T2 %.4f(%.0f%%) T3 %.4f(%.0f%%)",
+			initialRisk.Tier1Target, initialRisk.Tier1Ratio*100,
+			initialRisk.Tier2Target, initialRisk.Tier2Ratio*100,
+			initialRisk.Tier3Target, initialRisk.Tier3Ratio*100),
 		fmt.Sprintf("Trace: %s", m.ensureTrace(traceID)),
 	}
 	if reason := shortReason(d.Reasoning); reason != "" {
@@ -210,8 +380,9 @@ func (m *Manager) close(ctx context.Context, traceID string, d decision.Decision
 		return fmt.Errorf("freqtrade trade_id not found for %s %s", d.Symbol, side)
 	}
 	payload := ForceExitPayload{TradeID: fmt.Sprintf("%d", tradeID)}
-	if ratio := clampCloseRatio(d.CloseRatio); ratio > 0 && ratio < 1 {
-		if amt := m.lookupAmount(tradeID); amt > 0 {
+	ratio := clampCloseRatio(d.CloseRatio)
+	if ratio > 0 && ratio < 1 {
+		if amt := m.lookupAmount(ctx, tradeID); amt > 0 {
 			payload.Amount = amt * ratio
 		}
 	}
@@ -228,7 +399,6 @@ func (m *Manager) close(ctx context.Context, traceID string, d decision.Decision
 		)
 		return err
 	}
-	m.deleteTrade(d.Symbol, side)
 	m.logExecutor(ctx, traceID, d, tradeID, "forceexit_success", recData, nil)
 	m.notify("Freqtrade 平仓指令已执行 ✅",
 		fmt.Sprintf("交易ID: %d", tradeID),
@@ -237,6 +407,10 @@ func (m *Manager) close(ctx context.Context, traceID string, d decision.Decision
 		fmt.Sprintf("平仓比例: %.2f", clampCloseRatio(d.CloseRatio)),
 		fmt.Sprintf("Trace: %s", m.ensureTrace(traceID)),
 	)
+	partial := ratio > 0 && ratio < 1 && payload.Amount > 0
+	if !partial {
+		m.deleteTrade(d.Symbol, side)
+	}
 	return nil
 }
 
@@ -254,19 +428,35 @@ func (m *Manager) adjustStopLoss(ctx context.Context, traceID string, d decision
 	}
 	existing, _ := m.loadRiskRecord(ctx, tradeID)
 	prevStop := existing.StopLoss
+	prevTP := existing.TakeProfit
+	newStop := d.StopLoss
+	newTP := prevTP
+	if d.TakeProfit > 0 {
+		newTP = d.TakeProfit
+	}
+	changedStop := !floatEqual(prevStop, newStop)
+	changedTP := newTP > 0 && !floatEqual(prevTP, newTP)
+	if !changedStop && !changedTP {
+		logger.Infof("freqtrade stop-loss 调整无变化 trade_id=%d", tradeID)
+		return nil
+	}
 	status := "stoploss_recorded"
 	lines := []string{
 		fmt.Sprintf("交易ID: %d", tradeID),
 		fmt.Sprintf("标的: %s", strings.ToUpper(d.Symbol)),
 		fmt.Sprintf("方向: %s", strings.ToUpper(side)),
-		fmt.Sprintf("原止损: %s", formatPrice(prevStop)),
-		fmt.Sprintf("新止损: %.4f", d.StopLoss),
-		fmt.Sprintf("Trace: %s", m.ensureTrace(traceID)),
 	}
+	if changedStop {
+		lines = append(lines, fmt.Sprintf("止损: %s → %.4f", formatPrice(prevStop), newStop))
+	}
+	if changedTP {
+		lines = append(lines, fmt.Sprintf("止盈: %s → %.4f", formatPrice(prevTP), newTP))
+	}
+	lines = append(lines, fmt.Sprintf("Trace: %s", m.ensureTrace(traceID)))
 	if reason := shortReason(d.Reasoning); reason != "" {
 		lines = append(lines, "理由: "+reason)
 	}
-	m.recordRisk(storage.RiskRecord{
+	updatedRec := storage.RiskRecord{
 		TradeID:    tradeID,
 		Symbol:     strings.ToUpper(strings.TrimSpace(d.Symbol)),
 		Pair:       pair,
@@ -275,20 +465,30 @@ func (m *Manager) adjustStopLoss(ctx context.Context, traceID string, d decision
 		Stake:      pos.Stake,
 		Amount:     pos.Amount,
 		Leverage:   pos.Leverage,
-		StopLoss:   d.StopLoss,
-		TakeProfit: existing.TakeProfit,
+		StopLoss:   newStop,
+		TakeProfit: newTP,
 		Reason:     strings.TrimSpace(d.Reasoning),
 		Source:     "adjust_stop_loss",
 		Status:     status,
 		UpdatedAt:  time.Now(),
-	})
-	logger.Infof("freqtrade stop-loss 记录已更新 trade_id=%d %s stop=%.4f", tradeID, d.Symbol, d.StopLoss)
-	m.notify("止损已更新 ✅", lines...)
+	}
+	copyTierState(&updatedRec, existing)
+	m.recordRisk(updatedRec)
+	logger.Infof("freqtrade stop-loss 记录已更新 trade_id=%d %s stop=%.4f tp=%.4f", tradeID, d.Symbol, newStop, newTP)
+	title := "止损已更新 ✅"
+	if changedStop && changedTP {
+		title = "止损/止盈已更新 ✅"
+	} else if !changedStop && changedTP {
+		title = "止盈已更新 ✅"
+	}
+	m.notify(title, lines...)
 	recData := map[string]any{
 		"trade_id":  tradeID,
 		"symbol":    strings.ToUpper(strings.TrimSpace(d.Symbol)),
 		"prev_stop": formatPrice(prevStop),
-		"new_stop":  d.StopLoss,
+		"new_stop":  newStop,
+		"prev_tp":   formatPrice(prevTP),
+		"new_tp":    newTP,
 	}
 	m.logExecutor(ctx, traceID, d, tradeID, status, recData, nil)
 	return nil
@@ -308,19 +508,35 @@ func (m *Manager) adjustTakeProfit(ctx context.Context, traceID string, d decisi
 	}
 	existing, _ := m.loadRiskRecord(ctx, tradeID)
 	prevTP := existing.TakeProfit
+	prevStop := existing.StopLoss
+	newTP := d.TakeProfit
+	newStop := prevStop
+	if d.StopLoss > 0 {
+		newStop = d.StopLoss
+	}
+	changedTP := !floatEqual(prevTP, newTP)
+	changedStop := newStop > 0 && !floatEqual(prevStop, newStop)
+	if !changedTP && !changedStop {
+		logger.Infof("freqtrade take-profit 调整无变化 trade_id=%d", tradeID)
+		return nil
+	}
 	status := "takeprofit_recorded"
 	lines := []string{
 		fmt.Sprintf("交易ID: %d", tradeID),
 		fmt.Sprintf("标的: %s", strings.ToUpper(d.Symbol)),
 		fmt.Sprintf("方向: %s", strings.ToUpper(side)),
-		fmt.Sprintf("原止盈: %s", formatPrice(prevTP)),
-		fmt.Sprintf("新止盈: %.4f", d.TakeProfit),
-		fmt.Sprintf("Trace: %s", m.ensureTrace(traceID)),
 	}
+	if changedTP {
+		lines = append(lines, fmt.Sprintf("止盈: %s → %.4f", formatPrice(prevTP), newTP))
+	}
+	if changedStop {
+		lines = append(lines, fmt.Sprintf("止损: %s → %.4f", formatPrice(prevStop), newStop))
+	}
+	lines = append(lines, fmt.Sprintf("Trace: %s", m.ensureTrace(traceID)))
 	if reason := shortReason(d.Reasoning); reason != "" {
 		lines = append(lines, "理由: "+reason)
 	}
-	m.recordRisk(storage.RiskRecord{
+	updatedRec := storage.RiskRecord{
 		TradeID:    tradeID,
 		Symbol:     strings.ToUpper(strings.TrimSpace(d.Symbol)),
 		Pair:       pair,
@@ -329,23 +545,72 @@ func (m *Manager) adjustTakeProfit(ctx context.Context, traceID string, d decisi
 		Stake:      pos.Stake,
 		Amount:     pos.Amount,
 		Leverage:   pos.Leverage,
-		StopLoss:   existing.StopLoss,
-		TakeProfit: d.TakeProfit,
+		StopLoss:   newStop,
+		TakeProfit: newTP,
 		Reason:     strings.TrimSpace(d.Reasoning),
 		Source:     "adjust_take_profit",
 		Status:     status,
 		UpdatedAt:  time.Now(),
-	})
-	logger.Infof("freqtrade take-profit 记录已更新 trade_id=%d %s take=%.4f", tradeID, d.Symbol, d.TakeProfit)
-	m.notify("止盈已更新 ✅", lines...)
+	}
+	copyTierState(&updatedRec, existing)
+	m.recordRisk(updatedRec)
+	logger.Infof("freqtrade take-profit 记录已更新 trade_id=%d %s tp=%.4f sl=%.4f", tradeID, d.Symbol, newTP, newStop)
+	title := "止盈已更新 ✅"
+	if changedTP && changedStop {
+		title = "止盈/止损已更新 ✅"
+	} else if !changedTP && changedStop {
+		title = "止损已更新 ✅"
+	}
+	m.notify(title, lines...)
 	recData := map[string]any{
-		"trade_id": tradeID,
-		"symbol":   strings.ToUpper(strings.TrimSpace(d.Symbol)),
-		"prev_tp":  formatPrice(prevTP),
-		"new_tp":   d.TakeProfit,
+		"trade_id":  tradeID,
+		"symbol":    strings.ToUpper(strings.TrimSpace(d.Symbol)),
+		"prev_tp":   formatPrice(prevTP),
+		"new_tp":    newTP,
+		"prev_stop": formatPrice(prevStop),
+		"new_stop":  newStop,
 	}
 	m.logExecutor(ctx, traceID, d, tradeID, status, recData, nil)
 	return nil
+}
+
+func (m *Manager) updateTiers(ctx context.Context, traceID string, d decision.Decision) error {
+	if d.Tiers == nil {
+		return fmt.Errorf("update_tiers 缺少 tiers 字段")
+	}
+	return m.applyTierUpdate(ctx, traceID, d.Symbol, "", d.Tiers, strings.TrimSpace(d.Reasoning), "update_tiers", true)
+}
+
+func (m *Manager) UpdateTiersManual(ctx context.Context, req TierUpdateRequest) error {
+	if req.TradeID <= 0 {
+		return fmt.Errorf("trade_id 必填")
+	}
+	tiers := &decision.DecisionTiers{
+		Tier1Target: req.Tier1Target,
+		Tier1Ratio:  req.Tier1Ratio,
+		Tier2Target: req.Tier2Target,
+		Tier2Ratio:  req.Tier2Ratio,
+		Tier3Target: req.Tier3Target,
+		Tier3Ratio:  req.Tier3Ratio,
+	}
+	symbol := req.Symbol
+	if symbol == "" {
+		if rec, ok := m.loadRiskRecord(ctx, req.TradeID); ok && rec.Symbol != "" {
+			symbol = rec.Symbol
+		}
+	}
+	traceID := m.ensureTrace(fmt.Sprintf("manual-tier-%d", time.Now().UnixNano()))
+	return m.applyTierUpdate(ctx, traceID, symbol, req.Side, tiers, strings.TrimSpace(req.Reason), "manual", false)
+}
+
+// UpdateFreqtradeTiers implements the interface expected by LiveService/router.
+func (m *Manager) UpdateFreqtradeTiers(ctx context.Context, req TierUpdateRequest) error {
+	return m.UpdateTiersManual(ctx, req)
+}
+
+// ListTierLogs exposes tier change history for HTTP layer.
+func (m *Manager) ListTierLogs(ctx context.Context, tradeID int, limit int) ([]storage.TierLog, error) {
+	return m.loadTierLogs(ctx, tradeID)
 }
 
 // HandleWebhook 由 HTTP 路由调用，负责更新持仓与日志。
@@ -374,13 +639,56 @@ func (m *Manager) SyncOpenPositions(ctx context.Context) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	type cached struct {
-		id     int
-		symbol string
-		side   string
-		pos    Position
+	count := m.applyTradeSnapshot(trades, true)
+	m.refreshBalance(ctx)
+	return count, nil
+}
+
+func (m *Manager) refreshOpenPositions(ctx context.Context) {
+	if m == nil || m.client == nil {
+		return
 	}
-	candidates := make([]cached, 0, len(trades))
+	callCtx := ctx
+	if callCtx == nil {
+		callCtx = context.Background()
+	}
+	cctx, cancel := context.WithTimeout(callCtx, 5*time.Second)
+	defer cancel()
+	trades, err := m.client.ListTrades(cctx)
+	if err != nil {
+		logger.Warnf("freqtrade 仓位刷新失败: %v", err)
+		return
+	}
+	m.applyTradeSnapshot(trades, true)
+	m.refreshBalance(ctx)
+}
+
+func (m *Manager) refreshBalance(ctx context.Context) {
+	if m == nil || m.client == nil {
+		return
+	}
+	callCtx := ctx
+	if callCtx == nil {
+		callCtx = context.Background()
+	}
+	cctx, cancel := context.WithTimeout(callCtx, 3*time.Second)
+	defer cancel()
+	bal, err := m.client.GetBalance(cctx)
+	if err != nil {
+		logger.Warnf("freqtrade balance 查询失败: %v", err)
+		return
+	}
+	m.balanceMu.Lock()
+	m.balance = bal
+	m.balanceMu.Unlock()
+}
+
+func (m *Manager) applyTradeSnapshot(trades []Trade, recordStore bool) int {
+	if m == nil {
+		return 0
+	}
+	openIDs := make(map[int]struct{})
+	count := 0
 	for _, tr := range trades {
 		if !tr.IsOpen {
 			continue
@@ -397,58 +705,33 @@ func (m *Manager) SyncOpenPositions(ctx context.Context) (int, error) {
 		if symbol == "" || side == "" {
 			continue
 		}
-		pos := Position{
-			TradeID:    tr.ID,
-			Symbol:     symbol,
-			Side:       side,
-			Amount:     tr.Amount,
-			Stake:      tr.StakeAmount,
-			Leverage:   tr.Leverage,
-			EntryPrice: tr.OpenRate,
-			OpenedAt:   parseFreqtradeTime(tr.OpenDate),
+		openIDs[tr.ID] = struct{}{}
+		m.mergePositionFromTrade(tr)
+		if recordStore {
+			m.storeTrade(symbol, side, tr.ID)
 		}
-		candidates = append(candidates, cached{
-			id:     tr.ID,
-			symbol: symbol,
-			side:   side,
-			pos:    pos,
-		})
+		count++
 	}
-	if len(candidates) == 0 {
-		return 0, nil
-	}
-	m.mu.Lock()
-	for _, c := range candidates {
-		m.positions[c.id] = c.pos
-	}
-	m.mu.Unlock()
-	for _, c := range candidates {
-		m.storeTrade(c.symbol, c.side, c.id)
-	}
-	return len(candidates), nil
+	m.markPositionsClosed(openIDs)
+	return count
 }
 
 // Positions 返回当前 freqtrade 持仓快照。
 func (m *Manager) Positions() []decision.PositionSnapshot {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if len(m.positions) == 0 {
+	list := m.PositionsForAPI("", 0)
+	if len(list) == 0 {
 		return nil
 	}
-	now := time.Now()
-	out := make([]decision.PositionSnapshot, 0, len(m.positions))
-	for _, pos := range m.positions {
-		holding := int64(0)
-		if !pos.OpenedAt.IsZero() {
-			holding = now.Sub(pos.OpenedAt).Milliseconds()
+	out := make([]decision.PositionSnapshot, 0, len(list))
+	for _, pos := range list {
+		if !strings.EqualFold(pos.Status, "open") {
+			continue
 		}
-		out = append(out, decision.PositionSnapshot{
-			Symbol:     strings.ToUpper(pos.Symbol),
-			Side:       strings.ToUpper(pos.Side),
-			EntryPrice: pos.EntryPrice,
-			Quantity:   pos.Amount,
-			HoldingMs:  holding,
-		})
+		snap := apiPositionToSnapshot(pos)
+		out = append(out, snap)
+	}
+	if len(out) == 0 {
+		return nil
 	}
 	return out
 }
@@ -459,6 +742,13 @@ func (m *Manager) entryTag() string {
 		return "brale"
 	}
 	return tag
+}
+
+// AccountBalance 返回最近一次同步的账户余额信息。
+func (m *Manager) AccountBalance() Balance {
+	m.balanceMu.RLock()
+	defer m.balanceMu.RUnlock()
+	return m.balance
 }
 
 func (m *Manager) findActiveTrade(symbol string) (int, string, Position, bool) {
@@ -503,6 +793,12 @@ func (m *Manager) handleEntry(ctx context.Context, msg WebhookMessage, filled bo
 		EntryPrice: price,
 		OpenedAt:   openTime,
 	}
+	pos.Closed = false
+	pos.ClosedAt = time.Time{}
+	pos.ExitPrice = 0
+	pos.ExitReason = ""
+	pos.ExitPnLRatio = 0
+	pos.ExitPnLUSD = 0
 	if !filled && amount <= 0 {
 		m.storeTrade(symbol, side, tradeID)
 		logger.Infof("freqtrade manager: entry submitted trade_id=%d %s %s price=%.4f", tradeID, symbol, side, price)
@@ -557,10 +853,7 @@ func (m *Manager) handleEntryCancel(ctx context.Context, msg WebhookMessage) {
 func (m *Manager) handleExit(ctx context.Context, msg WebhookMessage, event string) {
 	tradeID := int(msg.TradeID)
 	m.mu.Lock()
-	pos, ok := m.positions[tradeID]
-	if ok {
-		delete(m.positions, tradeID)
-	}
+	pos, _ := m.positions[tradeID]
 	m.mu.Unlock()
 	symbol := pos.Symbol
 	if symbol == "" {
@@ -570,8 +863,11 @@ func (m *Manager) handleExit(ctx context.Context, msg WebhookMessage, event stri
 	if side == "" {
 		side = strings.ToLower(strings.TrimSpace(msg.Direction))
 	}
-	m.deleteTrade(symbol, side)
-	closePrice := float64(msg.CloseRate)
+	closePrice := firstNonZero(float64(msg.CloseRate), float64(msg.OrderRate))
+	stake := float64(msg.StakeAmount)
+	closedAt := parseFreqtradeTime(msg.CloseDate)
+	pnlRatio := parseProfitRatio(msg.ProfitRatio)
+	pos = m.markPositionClosed(tradeID, symbol, side, closePrice, stake, msg.ExitReason, closedAt, pnlRatio)
 	traceID := m.lookupTrace(tradeID)
 	m.deleteTrace(tradeID)
 	logger.Infof("freqtrade manager: exit trade_id=%d %s %s price=%.4f reason=%s", tradeID, symbol, side, closePrice, msg.ExitReason)
@@ -583,7 +879,11 @@ func (m *Manager) handleExit(ctx context.Context, msg WebhookMessage, event stri
 	}
 	duration := "-"
 	if !pos.OpenedAt.IsZero() {
-		duration = time.Since(pos.OpenedAt).Truncate(time.Second).String()
+		end := time.Now()
+		if !pos.ClosedAt.IsZero() {
+			end = pos.ClosedAt
+		}
+		duration = end.Sub(pos.OpenedAt).Truncate(time.Second).String()
 	}
 	lines := []string{
 		fmt.Sprintf("交易ID: %d", tradeID),
@@ -592,7 +892,7 @@ func (m *Manager) handleExit(ctx context.Context, msg WebhookMessage, event stri
 		fmt.Sprintf("平仓价: %s", formatPrice(closePrice)),
 		fmt.Sprintf("理由: %s", strings.TrimSpace(msg.ExitReason)),
 		fmt.Sprintf("持仓时长: %s", duration),
-		fmt.Sprintf("收益率: %.4f", parseProfitRatio(msg.ProfitRatio)),
+		fmt.Sprintf("收益率: %.4f", pnlRatio),
 		fmt.Sprintf("Trace: %s", traceID),
 	}
 	m.notify(title, lines...)
@@ -677,35 +977,94 @@ func (m *Manager) logWebhook(ctx context.Context, traceID string, tradeID int, s
 
 func (m *Manager) PositionsForAPI(symbol string, limit int) []APIPosition {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-	if len(m.positions) == 0 {
+	positions := make([]Position, 0, len(m.positions))
+	for _, pos := range m.positions {
+		positions = append(positions, pos)
+	}
+	m.mu.Unlock()
+	if len(positions) == 0 {
 		return nil
 	}
 	now := time.Now()
-	list := make([]APIPosition, 0, len(m.positions))
-	for _, pos := range m.positions {
+	list := make([]APIPosition, 0, len(positions))
+	ctx := context.Background()
+	for _, pos := range positions {
 		if symbol != "" && !strings.EqualFold(pos.Symbol, symbol) {
 			continue
 		}
 		opened := int64(0)
 		holding := int64(0)
+		closedAt := int64(0)
+		status := "open"
 		if !pos.OpenedAt.IsZero() {
 			opened = pos.OpenedAt.UnixMilli()
 			holding = now.Sub(pos.OpenedAt).Milliseconds()
 		}
-		list = append(list, APIPosition{
-			TradeID:    pos.TradeID,
-			Symbol:     strings.ToUpper(pos.Symbol),
-			Side:       strings.ToUpper(pos.Side),
-			EntryPrice: pos.EntryPrice,
-			Amount:     pos.Amount,
-			Stake:      pos.Stake,
-			Leverage:   pos.Leverage,
-			OpenedAt:   opened,
-			HoldingMs:  holding,
-		})
+		if pos.Closed {
+			status = "closed"
+			if !pos.ClosedAt.IsZero() {
+				closedAt = pos.ClosedAt.UnixMilli()
+				if !pos.OpenedAt.IsZero() {
+					holding = pos.ClosedAt.Sub(pos.OpenedAt).Milliseconds()
+				}
+			}
+		}
+		rec, _ := m.loadRiskRecord(ctx, pos.TradeID)
+		api := APIPosition{
+			TradeID:        pos.TradeID,
+			Symbol:         strings.ToUpper(pos.Symbol),
+			Side:           strings.ToUpper(pos.Side),
+			EntryPrice:     pos.EntryPrice,
+			Amount:         pos.Amount,
+			Stake:          pos.Stake,
+			Leverage:       pos.Leverage,
+			OpenedAt:       opened,
+			HoldingMs:      holding,
+			StopLoss:       rec.StopLoss,
+			TakeProfit:     rec.TakeProfit,
+			RemainingRatio: rec.RemainingRatio,
+			Tier1:          TierInfo{Target: rec.Tier1Target, Ratio: rec.Tier1Ratio, Done: rec.Tier1Done},
+			Tier2:          TierInfo{Target: rec.Tier2Target, Ratio: rec.Tier2Ratio, Done: rec.Tier2Done},
+			Tier3:          TierInfo{Target: rec.Tier3Target, Ratio: rec.Tier3Ratio, Done: rec.Tier3Done},
+			TierNotes:      rec.TierNotes,
+			Status:         status,
+			ClosedAt:       closedAt,
+			ExitPrice:      pos.ExitPrice,
+			ExitReason:     pos.ExitReason,
+		}
+		if pos.Closed {
+			api.PnLRatio = pos.ExitPnLRatio
+			api.PnLUSD = pos.ExitPnLUSD
+			api.RemainingRatio = 0
+		}
+		// attach tier logs summary if available
+		if logs, err := m.loadTierLogs(ctx, pos.TradeID); err == nil {
+			apiTierNotes := rec.TierNotes
+			if apiTierNotes == "" && len(logs) > 0 {
+				apiTierNotes = logs[0].Reason
+			}
+			api.TierNotes = apiTierNotes
+		}
+		list = append(list, api)
 	}
 	sort.Slice(list, func(i, j int) bool {
+		rank := func(status string) int {
+			if strings.EqualFold(status, "open") {
+				return 0
+			}
+			return 1
+		}
+		ri := rank(list[i].Status)
+		rj := rank(list[j].Status)
+		if ri != rj {
+			return ri < rj
+		}
+		if ri == 1 {
+			if list[i].ClosedAt != list[j].ClosedAt {
+				return list[i].ClosedAt > list[j].ClosedAt
+			}
+			return list[i].OpenedAt > list[j].OpenedAt
+		}
 		return list[i].OpenedAt > list[j].OpenedAt
 	})
 	if limit > 0 && len(list) > limit {
@@ -805,10 +1164,26 @@ func (m *Manager) recordRisk(rec storage.RiskRecord) {
 	if store == nil {
 		return
 	}
+	if rec.UpdatedAt.IsZero() {
+		rec.UpdatedAt = time.Now()
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	if err := store.Upsert(ctx, rec); err != nil {
 		logger.Warnf("freqtrade risk store upsert 失败: %v", err)
+	}
+}
+
+func (m *Manager) insertTierLog(ctx context.Context, log storage.TierLog) {
+	store := m.ensureRiskStore()
+	if store == nil {
+		return
+	}
+	if log.CreatedAt.IsZero() {
+		log.CreatedAt = time.Now()
+	}
+	if err := store.InsertTierLog(ctx, log); err != nil {
+		logger.Warnf("freqtrade tier log 记录失败: %v", err)
 	}
 }
 
@@ -827,14 +1202,174 @@ func (m *Manager) loadRiskRecord(ctx context.Context, tradeID int) (storage.Risk
 	return rec, ok
 }
 
-func (m *Manager) lookupAmount(tradeID int) float64 {
+func (m *Manager) loadTierLogs(ctx context.Context, tradeID int) ([]storage.TierLog, error) {
+	store := m.ensureRiskStore()
+	if store == nil {
+		return nil, fmt.Errorf("risk store 未初始化")
+	}
+	cctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	return store.ListTierLogs(cctx, tradeID, 20)
+}
+
+func (m *Manager) lookupAmount(ctx context.Context, tradeID int) float64 {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-	if pos, ok := m.positions[tradeID]; ok {
-		return pos.Amount
+	if pos, ok := m.positions[tradeID]; ok && pos.Amount > 0 {
+		amt := pos.Amount
+		m.mu.Unlock()
+		return amt
+	}
+	m.mu.Unlock()
+	if m == nil || m.client == nil || tradeID <= 0 {
+		return 0
+	}
+	callCtx := ctx
+	if callCtx == nil {
+		callCtx = context.Background()
+	}
+	cctx, cancel := context.WithTimeout(callCtx, 3*time.Second)
+	defer cancel()
+	trades, err := m.client.ListTrades(cctx)
+	if err != nil {
+		logger.Warnf("freqtrade manager: 获取 trade_id=%d 仓位失败: %v", tradeID, err)
+		return 0
+	}
+	for _, tr := range trades {
+		if tr.ID == tradeID {
+			return m.mergePositionFromTrade(tr)
+		}
 	}
 	return 0
 }
+
+func (m *Manager) mergePositionFromTrade(tr Trade) float64 {
+	if m == nil || tr.ID == 0 {
+		return 0
+	}
+	symbol := freqtradePairToSymbol(tr.Pair)
+	side := strings.ToLower(strings.TrimSpace(tr.Side))
+	if side == "" {
+		if tr.IsShort {
+			side = "short"
+		} else {
+			side = "long"
+		}
+	}
+	openedAt := parseFreqtradeTime(tr.OpenDate)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	pos, ok := m.positions[tr.ID]
+	if !ok {
+		pos = Position{TradeID: tr.ID}
+	}
+	if symbol != "" {
+		pos.Symbol = symbol
+	}
+	if side != "" {
+		pos.Side = side
+	}
+	if tr.Amount > 0 {
+		pos.Amount = tr.Amount
+	}
+	if tr.StakeAmount > 0 {
+		pos.Stake = tr.StakeAmount
+	}
+	if tr.Leverage > 0 {
+		pos.Leverage = tr.Leverage
+	}
+	if tr.OpenRate > 0 {
+		pos.EntryPrice = tr.OpenRate
+	}
+	if !openedAt.IsZero() {
+		pos.OpenedAt = openedAt
+	}
+	pos.Closed = false
+	pos.ClosedAt = time.Time{}
+	pos.ExitPrice = 0
+	pos.ExitReason = ""
+	pos.ExitPnLRatio = 0
+	pos.ExitPnLUSD = 0
+	m.positions[tr.ID] = pos
+	return pos.Amount
+}
+
+func (m *Manager) markPositionsClosed(openIDs map[int]struct{}) {
+	if m == nil {
+		return
+	}
+	now := time.Now()
+	type key struct{ symbol, side string }
+	toDelete := make([]key, 0)
+	m.mu.Lock()
+	for id, pos := range m.positions {
+		if pos.Closed {
+			continue
+		}
+		if _, ok := openIDs[id]; ok {
+			continue
+		}
+		pos.Closed = true
+		if pos.ClosedAt.IsZero() {
+			pos.ClosedAt = now
+		}
+		if pos.ExitReason == "" {
+			pos.ExitReason = "freqtrade_sync_closed"
+		}
+		pos.Amount = 0
+		m.positions[id] = pos
+		toDelete = append(toDelete, key{symbol: pos.Symbol, side: pos.Side})
+	}
+	m.mu.Unlock()
+	for _, item := range toDelete {
+		if item.symbol == "" || item.side == "" {
+			continue
+		}
+		m.deleteTrade(item.symbol, item.side)
+	}
+}
+
+func (m *Manager) markPositionClosed(tradeID int, symbol, side string, exitPrice, stake float64, reason string, closedAt time.Time, pnlRatio float64) Position {
+	if m == nil || tradeID <= 0 {
+		return Position{}
+	}
+	if closedAt.IsZero() {
+		closedAt = time.Now()
+	}
+	reason = strings.TrimSpace(reason)
+	m.mu.Lock()
+	pos, ok := m.positions[tradeID]
+	if !ok {
+		pos = Position{TradeID: tradeID}
+	}
+	if symbol != "" {
+		pos.Symbol = strings.ToUpper(strings.TrimSpace(symbol))
+	}
+	if side != "" {
+		pos.Side = strings.ToLower(strings.TrimSpace(side))
+	}
+	if stake > 0 {
+		pos.Stake = stake
+	}
+	if exitPrice > 0 {
+		pos.ExitPrice = exitPrice
+	}
+	if reason != "" {
+		pos.ExitReason = reason
+	}
+	pos.ExitPnLRatio = pnlRatio
+	if pos.Stake > 0 && pnlRatio != 0 {
+		pos.ExitPnLUSD = pnlRatio * pos.Stake
+	}
+	pos.Closed = true
+	pos.ClosedAt = closedAt
+	pos.Amount = 0
+	m.positions[tradeID] = pos
+	m.mu.Unlock()
+	m.deleteTrade(pos.Symbol, pos.Side)
+	return pos
+}
+
+// removePosition 已废弃，保留历史仓位用于前端展示。
 
 func (m *Manager) recordOrder(ctx context.Context, msg WebhookMessage, action string, price float64, executedAt time.Time) {
 	if m.orderRec == nil || action == "" {
@@ -926,6 +1461,21 @@ func formatPrice(val float64) string {
 	return fmt.Sprintf("%.4f", val)
 }
 
+func formatPercent(val float64) string {
+	return fmt.Sprintf("%.0f%%", val*100)
+}
+
+func floatEqual(a, b float64) bool {
+	return math.Abs(a-b) <= 1e-6*math.Max(1, math.Max(math.Abs(a), math.Abs(b)))
+}
+
+func ratioOrDefault(val, def float64) float64 {
+	if val <= 0 {
+		return def
+	}
+	return val
+}
+
 func parseProfitRatio(v interface{}) float64 {
 	switch t := v.(type) {
 	case float64:
@@ -945,4 +1495,650 @@ func parseProfitRatio(v interface{}) float64 {
 		}
 	}
 	return 0
+}
+
+func copyTierState(dst *storage.RiskRecord, src storage.RiskRecord) {
+	if dst == nil {
+		return
+	}
+	dst.Tier1Target = src.Tier1Target
+	dst.Tier1Ratio = src.Tier1Ratio
+	dst.Tier1Done = src.Tier1Done
+	dst.Tier2Target = src.Tier2Target
+	dst.Tier2Ratio = src.Tier2Ratio
+	dst.Tier2Done = src.Tier2Done
+	dst.Tier3Target = src.Tier3Target
+	dst.Tier3Ratio = src.Tier3Ratio
+	dst.Tier3Done = src.Tier3Done
+	dst.RemainingRatio = src.RemainingRatio
+	it := strings.TrimSpace(dst.TierNotes)
+	if it == "" {
+		dst.TierNotes = src.TierNotes
+	}
+	if dst.EntryPrice == 0 {
+		dst.EntryPrice = src.EntryPrice
+	}
+	if dst.Stake == 0 {
+		dst.Stake = src.Stake
+	}
+	if dst.Amount == 0 {
+		dst.Amount = src.Amount
+	}
+}
+
+func nextPendingTier(rec storage.RiskRecord) (string, float64, float64) {
+	if !rec.Tier1Done && rec.Tier1Target > 0 {
+		return "tier1", rec.Tier1Target, ratioOrDefault(rec.Tier1Ratio, defaultTier1Ratio)
+	}
+	if !rec.Tier2Done && rec.Tier2Target > 0 {
+		return "tier2", rec.Tier2Target, ratioOrDefault(rec.Tier2Ratio, defaultTier2Ratio)
+	}
+	if !rec.Tier3Done && rec.Tier3Target > 0 {
+		return "tier3", rec.Tier3Target, ratioOrDefault(rec.Tier3Ratio, defaultTier3Ratio)
+	}
+	return "", 0, 0
+}
+
+func priceForTierTrigger(side string, quote TierPriceQuote, target float64) (float64, bool) {
+	if target <= 0 {
+		return 0, false
+	}
+	side = strings.ToLower(strings.TrimSpace(side))
+	switch side {
+	case "long":
+		price := maxPositive(quote.High, quote.Last)
+		if price > 0 && price >= target {
+			return price, true
+		}
+	case "short":
+		price := minPositive(quote.Low, quote.Last)
+		if price > 0 && price <= target {
+			return price, true
+		}
+	}
+	return 0, false
+}
+
+func priceForStopLoss(side string, quote TierPriceQuote, stop float64) (float64, bool) {
+	if stop <= 0 {
+		return 0, false
+	}
+	side = strings.ToLower(strings.TrimSpace(side))
+	switch side {
+	case "long":
+		price := minPositive(quote.Low, quote.Last)
+		if price > 0 && price <= stop {
+			return price, true
+		}
+	case "short":
+		price := maxPositive(quote.High, quote.Last)
+		if price > 0 && price >= stop {
+			return price, true
+		}
+	}
+	return 0, false
+}
+
+func priceForTakeProfit(side string, quote TierPriceQuote, tp float64) (float64, bool) {
+	if tp <= 0 {
+		return 0, false
+	}
+	side = strings.ToLower(strings.TrimSpace(side))
+	switch side {
+	case "long":
+		price := maxPositive(quote.High, quote.Last)
+		if price > 0 && price >= tp {
+			return price, true
+		}
+	case "short":
+		price := minPositive(quote.Low, quote.Last)
+		if price > 0 && price <= tp {
+			return price, true
+		}
+	}
+	return 0, false
+}
+
+func maxPositive(vals ...float64) float64 {
+	max := 0.0
+	for _, v := range vals {
+		if v <= 0 {
+			continue
+		}
+		if v > max {
+			max = v
+		}
+	}
+	return max
+}
+
+func minPositive(vals ...float64) float64 {
+	min := 0.0
+	for _, v := range vals {
+		if v <= 0 {
+			continue
+		}
+		if min == 0 || v < min {
+			min = v
+		}
+	}
+	return min
+}
+
+func (m *Manager) triggerTier(ctx context.Context, tierName string, price float64, pos Position, rec storage.RiskRecord) {
+	if !m.beginTierExecution(pos.TradeID) {
+		return
+	}
+	traceID := m.ensureTrace(fmt.Sprintf("tier-%s-%d", tierName, time.Now().UnixNano()))
+	go func() {
+		defer m.finishTierExecution(pos.TradeID)
+		if err := m.handleTierHit(ctx, traceID, tierName, price, pos, rec); err != nil {
+			logger.Warnf("自动执行 %s 失败 trade_id=%d: %v", tierName, pos.TradeID, err)
+		}
+	}()
+}
+
+func (m *Manager) beginTierExecution(tradeID int) bool {
+	m.tierExecMu.Lock()
+	defer m.tierExecMu.Unlock()
+	if m.tierExec[tradeID] {
+		return false
+	}
+	m.tierExec[tradeID] = true
+	return true
+}
+
+func (m *Manager) finishTierExecution(tradeID int) {
+	m.tierExecMu.Lock()
+	delete(m.tierExec, tradeID)
+	m.tierExecMu.Unlock()
+}
+
+func (m *Manager) handleTierHit(ctx context.Context, traceID, tierName string, price float64, pos Position, rec storage.RiskRecord) error {
+	closePortion := tierRatioForName(rec, tierName)
+	if closePortion <= 0 {
+		return nil
+	}
+	remain := rec.RemainingRatio
+	if remain <= 0 {
+		remain = 1
+	}
+	if closePortion > remain {
+		closePortion = remain
+	}
+	closeRatio := closePortion / remain
+	if closeRatio <= 0 {
+		return nil
+	}
+	action := "close_long"
+	if strings.EqualFold(pos.Side, "short") {
+		action = "close_short"
+	}
+	reason := fmt.Sprintf("自动%s减仓 %.4f", strings.ToUpper(tierName), price)
+	dec := decision.Decision{
+		Symbol:     strings.ToUpper(pos.Symbol),
+		Action:     action,
+		CloseRatio: closeRatio,
+		Reasoning:  reason,
+	}
+	if err := m.close(ctx, traceID, dec); err != nil {
+		return err
+	}
+	oldStop := rec.StopLoss
+	rec.RemainingRatio = math.Max(0, remain-closePortion)
+	switch tierName {
+	case "tier1":
+		rec.Tier1Done = true
+		if rec.EntryPrice > 0 {
+			rec.StopLoss = rec.EntryPrice
+		}
+	case "tier2":
+		rec.Tier2Done = true
+		if rec.Tier1Target > 0 {
+			rec.StopLoss = rec.Tier1Target
+		}
+	case "tier3":
+		rec.Tier3Done = true
+	}
+	rec.Source = fmt.Sprintf("%s_auto", tierName)
+	rec.Status = "tier_hit"
+	rec.Reason = reason
+	rec.TierNotes = fmt.Sprintf("%s 命中 %.4f", strings.ToUpper(tierName), price)
+	rec.UpdatedAt = time.Now()
+	m.recordRisk(rec)
+	m.insertTierLog(context.Background(), storage.TierLog{
+		TradeID:   pos.TradeID,
+		TierName:  tierName,
+		OldTarget: targetForName(rec, tierName),
+		NewTarget: price,
+		OldRatio:  closePortion,
+		NewRatio:  closePortion,
+		Reason:    fmt.Sprintf("命中 %.4f", price),
+		Source:    "auto_tier_hit",
+		CreatedAt: time.Now(),
+	})
+	if rec.StopLoss > 0 && !floatEqual(oldStop, rec.StopLoss) && tierName != "tier3" {
+		adj := decision.Decision{Symbol: strings.ToUpper(pos.Symbol), Action: "adjust_stop_loss", StopLoss: rec.StopLoss, TakeProfit: rec.TakeProfit, Reasoning: reason}
+		if err := m.adjustStopLoss(ctx, traceID, adj); err != nil {
+			logger.Warnf("tier 调整止损失败 trade_id=%d: %v", pos.TradeID, err)
+		}
+	}
+	m.notifyTierHit(tierName, rec, pos, price, closePortion, oldStop)
+	return nil
+}
+
+func tierRatioForName(rec storage.RiskRecord, name string) float64 {
+	switch name {
+	case "tier1":
+		return ratioOrDefault(rec.Tier1Ratio, defaultTier1Ratio)
+	case "tier2":
+		return ratioOrDefault(rec.Tier2Ratio, defaultTier2Ratio)
+	case "tier3":
+		return ratioOrDefault(rec.Tier3Ratio, defaultTier3Ratio)
+	default:
+		return 0
+	}
+}
+
+func apiPositionToSnapshot(pos APIPosition) decision.PositionSnapshot {
+	snap := decision.PositionSnapshot{
+		Symbol:          strings.ToUpper(pos.Symbol),
+		Side:            strings.ToUpper(pos.Side),
+		EntryPrice:      pos.EntryPrice,
+		Quantity:        pos.Amount,
+		Stake:           pos.Stake,
+		Leverage:        pos.Leverage,
+		CurrentPrice:    pos.CurrentPrice,
+		TakeProfit:      pos.TakeProfit,
+		StopLoss:        pos.StopLoss,
+		HoldingMs:       pos.HoldingMs,
+		RemainingRatio:  pos.RemainingRatio,
+		TierNotes:       pos.TierNotes,
+		UnrealizedPnPct: pos.PnLRatio,
+		UnrealizedPn:    pos.PnLUSD,
+	}
+	if pos.Tier1.Target > 0 {
+		snap.Tier1Target = pos.Tier1.Target
+		snap.Tier1Ratio = pos.Tier1.Ratio
+		snap.Tier1Done = pos.Tier1.Done
+	}
+	if pos.Tier2.Target > 0 {
+		snap.Tier2Target = pos.Tier2.Target
+		snap.Tier2Ratio = pos.Tier2.Ratio
+		snap.Tier2Done = pos.Tier2.Done
+	}
+	if pos.Tier3.Target > 0 {
+		snap.Tier3Target = pos.Tier3.Target
+		snap.Tier3Ratio = pos.Tier3.Ratio
+		snap.Tier3Done = pos.Tier3.Done
+	}
+	if snap.RemainingRatio == 0 {
+		snap.RemainingRatio = 1
+	}
+	if snap.CurrentPrice <= 0 {
+		snap.CurrentPrice = pos.EntryPrice
+	}
+	if snap.UnrealizedPnPct == 0 && snap.EntryPrice > 0 && snap.CurrentPrice > 0 {
+		if strings.EqualFold(snap.Side, "SHORT") {
+			snap.UnrealizedPnPct = (snap.EntryPrice - snap.CurrentPrice) / snap.EntryPrice
+		} else {
+			snap.UnrealizedPnPct = (snap.CurrentPrice - snap.EntryPrice) / snap.EntryPrice
+		}
+	}
+	if snap.UnrealizedPn == 0 && snap.UnrealizedPnPct != 0 && snap.Stake > 0 {
+		snap.UnrealizedPn = snap.UnrealizedPnPct * snap.Stake
+	}
+	value := snap.Stake
+	if value == 0 && snap.CurrentPrice > 0 && snap.Quantity > 0 {
+		value = snap.CurrentPrice * snap.Quantity
+	}
+	snap.PositionValue = value
+	return snap
+}
+
+func targetForName(rec storage.RiskRecord, name string) float64 {
+	switch name {
+	case "tier1":
+		return rec.Tier1Target
+	case "tier2":
+		return rec.Tier2Target
+	case "tier3":
+		return rec.Tier3Target
+	default:
+		return 0
+	}
+}
+
+func (m *Manager) forceClose(ctx context.Context, pos Position, reasonType string, price float64, rec storage.RiskRecord) {
+	if !m.beginTierExecution(pos.TradeID) {
+		return
+	}
+	defer m.finishTierExecution(pos.TradeID)
+	action := "close_long"
+	if strings.EqualFold(pos.Side, "short") {
+		action = "close_short"
+	}
+	reason := fmt.Sprintf("触发%s %.4f", reasonType, price)
+	dec := decision.Decision{
+		Symbol:    strings.ToUpper(pos.Symbol),
+		Action:    action,
+		Reasoning: reason,
+	}
+	traceID := m.ensureTrace(fmt.Sprintf("force-%s-%d", reasonType, time.Now().UnixNano()))
+	if err := m.close(ctx, traceID, dec); err != nil {
+		logger.Warnf("强制%s失败 trade_id=%d: %v", reasonType, pos.TradeID, err)
+		return
+	}
+	note := fmt.Sprintf("%s 触发 %.4f", strings.ToUpper(reasonType), price)
+	if prev := strings.TrimSpace(rec.TierNotes); prev != "" {
+		note = prev + " | " + note
+	}
+	rec.Source = fmt.Sprintf("%s_auto", reasonType)
+	rec.Status = fmt.Sprintf("%s_sent", reasonType)
+	rec.TierNotes = note
+	rec.RemainingRatio = 0
+	rec.Tier1Done = true
+	rec.Tier2Done = true
+	rec.Tier3Done = true
+	if strings.EqualFold(reasonType, "stop_loss") {
+		rec.StopLoss = 0
+	}
+	if strings.EqualFold(reasonType, "take_profit") {
+		rec.TakeProfit = 0
+	}
+	rec.UpdatedAt = time.Now()
+	m.recordRisk(rec)
+	m.notify(fmt.Sprintf("%s 已触发 ⚠️", strings.ToUpper(reasonType)),
+		fmt.Sprintf("交易ID: %d", pos.TradeID),
+		fmt.Sprintf("标的: %s", strings.ToUpper(pos.Symbol)),
+		fmt.Sprintf("方向: %s", strings.ToUpper(pos.Side)),
+		fmt.Sprintf("触发价: %.4f", price))
+}
+
+func (m *Manager) notifyTierHit(tierName string, rec storage.RiskRecord, pos Position, price float64, portion float64, oldStop float64) {
+	nextName, nextTarget, nextRatio := nextPendingTier(rec)
+	remain := rec.RemainingRatio
+	pnlRatio := 0.0
+	if rec.EntryPrice > 0 {
+		if strings.EqualFold(pos.Side, "short") {
+			pnlRatio = (rec.EntryPrice - price) / rec.EntryPrice
+		} else {
+			pnlRatio = (price - rec.EntryPrice) / rec.EntryPrice
+		}
+	}
+	stake := rec.Stake
+	if stake == 0 {
+		stake = pos.Stake
+	}
+	pnlUSD := pnlRatio * stake
+	lines := []string{
+		fmt.Sprintf("交易ID: %d", pos.TradeID),
+		fmt.Sprintf("标的: %s (%s)", strings.ToUpper(rec.Symbol), strings.ToUpper(rec.Pair)),
+		fmt.Sprintf("方向: %s", strings.ToUpper(pos.Side)),
+		fmt.Sprintf("阶段: %s", strings.ToUpper(tierName)),
+		fmt.Sprintf("触发价: %.4f", price),
+		fmt.Sprintf("减仓比例: %s", formatPercent(portion)),
+		fmt.Sprintf("止损: %s → %s", formatPrice(oldStop), formatPrice(rec.StopLoss)),
+		fmt.Sprintf("剩余仓位: %s", formatPercent(remain)),
+		fmt.Sprintf("当前浮盈: %.2f USDT (%.2f%%)", pnlUSD, pnlRatio*100),
+	}
+	if nextName != "" {
+		lines = append(lines, fmt.Sprintf("下一阶段: %s %.4f (%s)", strings.ToUpper(nextName), nextTarget, formatPercent(nextRatio)))
+	}
+	m.notify(fmt.Sprintf("%s 已执行 ✅", strings.ToUpper(tierName)), lines...)
+}
+
+func (m *Manager) applyTiersFromDecision(rec *storage.RiskRecord, tiers *decision.DecisionTiers) {
+	if rec == nil {
+		return
+	}
+	if tiers == nil {
+		tiers = &decision.DecisionTiers{}
+	}
+	applyDefaultTierRatios(tiers)
+	rec.Tier1Target = tiers.Tier1Target
+	rec.Tier1Ratio = ratioOrDefault(tiers.Tier1Ratio, defaultTier1Ratio)
+	rec.Tier2Target = tiers.Tier2Target
+	rec.Tier2Ratio = ratioOrDefault(tiers.Tier2Ratio, defaultTier2Ratio)
+	rec.Tier3Target = tiers.Tier3Target
+	rec.Tier3Ratio = ratioOrDefault(tiers.Tier3Ratio, defaultTier3Ratio)
+	rec.TierNotes = fmt.Sprintf("T1 %.4f(%.2f), T2 %.4f(%.2f), T3 %.4f(%.2f)",
+		rec.Tier1Target, rec.Tier1Ratio, rec.Tier2Target, rec.Tier2Ratio, rec.Tier3Target, rec.Tier3Ratio)
+	if rec.RemainingRatio == 0 {
+		rec.RemainingRatio = 1
+	}
+}
+
+func (m *Manager) applyTierUpdate(ctx context.Context, traceID, symbol, side string, tiers *decision.DecisionTiers, reason, source string, logExec bool) error {
+	if tiers == nil {
+		return fmt.Errorf("tiers 不能为空")
+	}
+	symbol = strings.ToUpper(strings.TrimSpace(symbol))
+	tradeID, sideResolved, pos, ok := m.findActiveTrade(symbol)
+	if !ok {
+		return fmt.Errorf("freqtrade 没有 %s 的持仓，无法调整 tiers", symbol)
+	}
+	if side == "" {
+		side = sideResolved
+	}
+	rec, has := m.loadRiskRecord(ctx, tradeID)
+	if !has {
+		rec = storage.RiskRecord{
+			TradeID:        tradeID,
+			Symbol:         strings.ToUpper(symbol),
+			Pair:           formatFreqtradePair(symbol),
+			Side:           side,
+			EntryPrice:     pos.EntryPrice,
+			Stake:          pos.Stake,
+			Amount:         pos.Amount,
+			Leverage:       pos.Leverage,
+			RemainingRatio: 1,
+			UpdatedAt:      time.Now(),
+		}
+	}
+	old := rec
+	if err := validateTierRatios(old, tiers); err != nil {
+		m.notify("Tier 更新被拒绝 ⚠️",
+			fmt.Sprintf("交易ID: %d", tradeID),
+			fmt.Sprintf("标的: %s", strings.ToUpper(symbol)),
+			fmt.Sprintf("方向: %s", strings.ToUpper(side)),
+			fmt.Sprintf("请求来源: %s", source),
+			"缺少比例: "+err.Error(),
+		)
+		return err
+	}
+	ignored, blocked := sanitizeCompletedTiers(old, tiers)
+	if blocked {
+		upper := strings.ToUpper(strings.Join(ignored, ", "))
+		lines := []string{
+			fmt.Sprintf("交易ID: %d", tradeID),
+			fmt.Sprintf("标的: %s", strings.ToUpper(symbol)),
+			fmt.Sprintf("方向: %s", strings.ToUpper(side)),
+			fmt.Sprintf("请求来源: %s", source),
+			fmt.Sprintf("无法调整: %s 已执行", upper),
+		}
+		if rs := shortReason(reason); rs != "" {
+			lines = append(lines, "理由: "+rs)
+		}
+		m.notify("Tier 更新被拒绝 ⚠️", lines...)
+		return fmt.Errorf("tiers 已完成: %s", upper)
+	}
+	rec = applyPendingTierUpdates(rec, tiers, old)
+	rec.Source = source
+	rec.Status = "tiers_updated"
+	rec.Reason = reason
+	note := fmt.Sprintf("%s %s", source, strings.TrimSpace(reason))
+	if strings.TrimSpace(rec.TierNotes) != "" {
+		note = fmt.Sprintf("%s | %s", note, strings.TrimSpace(rec.TierNotes))
+	}
+	rec.TierNotes = note
+	m.recordRisk(rec)
+	ctxLog, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	m.logTierChange(ctxLog, tradeID, "tier1", old.Tier1Target, rec.Tier1Target, old.Tier1Ratio, rec.Tier1Ratio, reason, source)
+	m.logTierChange(ctxLog, tradeID, "tier2", old.Tier2Target, rec.Tier2Target, old.Tier2Ratio, rec.Tier2Ratio, reason, source)
+	m.logTierChange(ctxLog, tradeID, "tier3", old.Tier3Target, rec.Tier3Target, old.Tier3Ratio, rec.Tier3Ratio, reason, source)
+	lines := []string{
+		fmt.Sprintf("交易ID: %d", tradeID),
+		fmt.Sprintf("标的: %s", strings.ToUpper(symbol)),
+		fmt.Sprintf("方向: %s", strings.ToUpper(side)),
+		fmt.Sprintf("Tier1: %s → %.4f (%s → %s)", formatPrice(old.Tier1Target), rec.Tier1Target, formatPercent(old.Tier1Ratio), formatPercent(rec.Tier1Ratio)),
+		fmt.Sprintf("Tier2: %s → %.4f (%s → %s)", formatPrice(old.Tier2Target), rec.Tier2Target, formatPercent(old.Tier2Ratio), formatPercent(rec.Tier2Ratio)),
+		fmt.Sprintf("Tier3: %s → %.4f (%s → %s)", formatPrice(old.Tier3Target), rec.Tier3Target, formatPercent(old.Tier3Ratio), formatPercent(rec.Tier3Ratio)),
+		fmt.Sprintf("Trace: %s", m.ensureTrace(traceID)),
+	}
+	if len(ignored) > 0 {
+		upper := strings.ToUpper(strings.Join(ignored, ", "))
+		lines = append(lines, fmt.Sprintf("提示: %s 已完成，保持原配置", upper))
+	}
+	if rs := shortReason(reason); rs != "" {
+		lines = append(lines, "理由: "+rs)
+	}
+	m.notify("Tier 配置已更新 ⚙️", lines...)
+	if logExec {
+		m.logExecutor(ctx, traceID, decision.Decision{Symbol: symbol, Action: "update_tiers", Reasoning: reason}, tradeID, "tiers_updated", map[string]any{"tiers": tiers}, nil)
+	}
+	return nil
+}
+
+func (m *Manager) logTierChange(ctx context.Context, tradeID int, name string, oldTarget, newTarget, oldRatio, newRatio float64, reason, source string) {
+	if floatEqual(oldTarget, newTarget) && floatEqual(oldRatio, newRatio) {
+		return
+	}
+	m.insertTierLog(ctx, storage.TierLog{
+		TradeID:   tradeID,
+		TierName:  name,
+		OldTarget: oldTarget,
+		NewTarget: newTarget,
+		OldRatio:  oldRatio,
+		NewRatio:  newRatio,
+		Reason:    reason,
+		Source:    source,
+		CreatedAt: time.Now(),
+	})
+}
+
+func applyDefaultTierRatios(t *decision.DecisionTiers) {
+	if t == nil {
+		return
+	}
+	if t.Tier1Ratio <= 0 {
+		t.Tier1Ratio = defaultTier1Ratio
+	}
+	if t.Tier2Ratio <= 0 {
+		t.Tier2Ratio = defaultTier2Ratio
+	}
+	if t.Tier3Ratio <= 0 {
+		t.Tier3Ratio = defaultTier3Ratio
+	}
+}
+
+func sanitizeCompletedTiers(existing storage.RiskRecord, tiers *decision.DecisionTiers) ([]string, bool) {
+	ignored := make([]string, 0, 3)
+	if tiers == nil {
+		return ignored, false
+	}
+	requests := 0
+	if tierChangeRequested(tiers.Tier1Target, tiers.Tier1Ratio, existing.Tier1Target, existing.Tier1Ratio) {
+		requests++
+		if existing.Tier1Done {
+			ignored = append(ignored, "tier1")
+		}
+	}
+	if existing.Tier1Done {
+		tiers.Tier1Target = existing.Tier1Target
+		if existing.Tier1Ratio > 0 {
+			tiers.Tier1Ratio = existing.Tier1Ratio
+		}
+	}
+	if tierChangeRequested(tiers.Tier2Target, tiers.Tier2Ratio, existing.Tier2Target, existing.Tier2Ratio) {
+		requests++
+		if existing.Tier2Done {
+			ignored = append(ignored, "tier2")
+		}
+	}
+	if existing.Tier2Done {
+		tiers.Tier2Target = existing.Tier2Target
+		if existing.Tier2Ratio > 0 {
+			tiers.Tier2Ratio = existing.Tier2Ratio
+		}
+	}
+	if tierChangeRequested(tiers.Tier3Target, tiers.Tier3Ratio, existing.Tier3Target, existing.Tier3Ratio) {
+		requests++
+		if existing.Tier3Done {
+			ignored = append(ignored, "tier3")
+		}
+	}
+	if existing.Tier3Done {
+		tiers.Tier3Target = existing.Tier3Target
+		if existing.Tier3Ratio > 0 {
+			tiers.Tier3Ratio = existing.Tier3Ratio
+		}
+	}
+	blocked := requests > 0 && len(ignored) == requests
+	return ignored, blocked
+}
+
+func tierChangeRequested(newTarget, newRatio, oldTarget, oldRatio float64) bool {
+	targetChanged := newTarget > 0 && (oldTarget <= 0 || !floatEqual(newTarget, oldTarget))
+	ratioChanged := newRatio > 0 && (oldRatio <= 0 || !floatEqual(newRatio, oldRatio))
+	return targetChanged || ratioChanged
+}
+
+func validateTierRatios(existing storage.RiskRecord, tiers *decision.DecisionTiers) error {
+	if tiers == nil {
+		return nil
+	}
+	missing := make([]string, 0, 3)
+	if needsRatio(existing.Tier1Done, tiers.Tier1Target, tiers.Tier1Ratio, existing.Tier1Target, existing.Tier1Ratio) && tiers.Tier1Ratio <= 0 {
+		missing = append(missing, "tier1")
+	}
+	if needsRatio(existing.Tier2Done, tiers.Tier2Target, tiers.Tier2Ratio, existing.Tier2Target, existing.Tier2Ratio) && tiers.Tier2Ratio <= 0 {
+		missing = append(missing, "tier2")
+	}
+	if needsRatio(existing.Tier3Done, tiers.Tier3Target, tiers.Tier3Ratio, existing.Tier3Target, existing.Tier3Ratio) && tiers.Tier3Ratio <= 0 {
+		missing = append(missing, "tier3")
+	}
+	if len(missing) == 0 {
+		return nil
+	}
+	return fmt.Errorf("%s", strings.Join(missing, ", "))
+}
+
+func needsRatio(done bool, newTarget, newRatio, oldTarget, oldRatio float64) bool {
+	if done {
+		return false
+	}
+	return tierChangeRequested(newTarget, newRatio, oldTarget, oldRatio)
+}
+
+func applyPendingTierUpdates(rec storage.RiskRecord, tiers *decision.DecisionTiers, existing storage.RiskRecord) storage.RiskRecord {
+	if tiers == nil {
+		return rec
+	}
+	if !existing.Tier1Done {
+		if tiers.Tier1Target > 0 {
+			rec.Tier1Target = tiers.Tier1Target
+		}
+		if tiers.Tier1Ratio > 0 {
+			rec.Tier1Ratio = tiers.Tier1Ratio
+		}
+	}
+	if !existing.Tier2Done {
+		if tiers.Tier2Target > 0 {
+			rec.Tier2Target = tiers.Tier2Target
+		}
+		if tiers.Tier2Ratio > 0 {
+			rec.Tier2Ratio = tiers.Tier2Ratio
+		}
+	}
+	if !existing.Tier3Done {
+		if tiers.Tier3Target > 0 {
+			rec.Tier3Target = tiers.Tier3Target
+		}
+		if tiers.Tier3Ratio > 0 {
+			rec.Tier3Ratio = tiers.Tier3Ratio
+		}
+	}
+	return rec
 }

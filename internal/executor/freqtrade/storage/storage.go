@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -13,20 +14,44 @@ import (
 
 // RiskRecord 保存 Brale→Freqtrade 共享的止盈止损信息。
 type RiskRecord struct {
-	TradeID    int
-	Symbol     string
-	Pair       string
-	Side       string
-	EntryPrice float64
-	Stake      float64
-	Amount     float64
-	Leverage   float64
-	StopLoss   float64
-	TakeProfit float64
-	Reason     string
-	Source     string
-	Status     string
-	UpdatedAt  time.Time
+	TradeID        int
+	Symbol         string
+	Pair           string
+	Side           string
+	EntryPrice     float64
+	Stake          float64
+	Amount         float64
+	Leverage       float64
+	StopLoss       float64
+	TakeProfit     float64
+	Reason         string
+	Source         string
+	Status         string
+	UpdatedAt      time.Time
+	Tier1Target    float64
+	Tier1Ratio     float64
+	Tier1Done      bool
+	Tier2Target    float64
+	Tier2Ratio     float64
+	Tier2Done      bool
+	Tier3Target    float64
+	Tier3Ratio     float64
+	Tier3Done      bool
+	RemainingRatio float64
+	TierNotes      string
+}
+
+// TierLog 记录三段式配置或触发的历史。
+type TierLog struct {
+	TradeID   int       `json:"trade_id"`
+	TierName  string    `json:"tier_name"`
+	OldTarget float64   `json:"old_target"`
+	NewTarget float64   `json:"new_target"`
+	OldRatio  float64   `json:"old_ratio"`
+	NewRatio  float64   `json:"new_ratio"`
+	Reason    string    `json:"reason"`
+	Source    string    `json:"source"`
+	CreatedAt time.Time `json:"created_at"`
 }
 
 // Store wraps a sqlite database for risk records.
@@ -84,8 +109,12 @@ func (s *Store) Upsert(ctx context.Context, rec RiskRecord) error {
 	}
 	_, err := db.ExecContext(ctx, `
 		INSERT INTO trade_risk(trade_id, symbol, pair, side, entry_price, stake_amount, amount, leverage,
-			stop_loss, take_profit, reason, source, status, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			stop_loss, take_profit, reason, source, status, updated_at,
+			tier1_target, tier1_ratio, tier1_done,
+			tier2_target, tier2_ratio, tier2_done,
+			tier3_target, tier3_ratio, tier3_done,
+			remaining_ratio, tier_notes)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(trade_id) DO UPDATE SET
 			symbol=excluded.symbol,
 			pair=excluded.pair,
@@ -99,10 +128,25 @@ func (s *Store) Upsert(ctx context.Context, rec RiskRecord) error {
 			reason=excluded.reason,
 			source=excluded.source,
 			status=excluded.status,
-			updated_at=excluded.updated_at;
+			updated_at=excluded.updated_at,
+			tier1_target=excluded.tier1_target,
+			tier1_ratio=excluded.tier1_ratio,
+			tier1_done=excluded.tier1_done,
+			tier2_target=excluded.tier2_target,
+			tier2_ratio=excluded.tier2_ratio,
+			tier2_done=excluded.tier2_done,
+			tier3_target=excluded.tier3_target,
+			tier3_ratio=excluded.tier3_ratio,
+			tier3_done=excluded.tier3_done,
+			remaining_ratio=excluded.remaining_ratio,
+			tier_notes=excluded.tier_notes;
 	`, rec.TradeID, rec.Symbol, rec.Pair, rec.Side, nullIfZero(rec.EntryPrice), nullIfZero(rec.Stake), nullIfZero(rec.Amount),
 		nullIfZero(rec.Leverage), nullIfZero(rec.StopLoss), nullIfZero(rec.TakeProfit),
-		nullIfEmpty(rec.Reason), nullIfEmpty(rec.Source), nullIfEmpty(rec.Status), now.UnixMilli())
+		nullIfEmpty(rec.Reason), nullIfEmpty(rec.Source), nullIfEmpty(rec.Status), now.UnixMilli(),
+		nullIfZero(rec.Tier1Target), nullIfZero(rec.Tier1Ratio), boolToInt(rec.Tier1Done),
+		nullIfZero(rec.Tier2Target), nullIfZero(rec.Tier2Ratio), boolToInt(rec.Tier2Done),
+		nullIfZero(rec.Tier3Target), nullIfZero(rec.Tier3Ratio), boolToInt(rec.Tier3Done),
+		nullIfZero(rec.RemainingRatio), nullIfEmpty(rec.TierNotes))
 	return err
 }
 
@@ -122,11 +166,89 @@ func ensureSchema(db *sql.DB) error {
 		reason TEXT,
 		source TEXT,
 		status TEXT,
-		updated_at INTEGER NOT NULL
+		updated_at INTEGER NOT NULL,
+		tier1_target REAL,
+		tier1_ratio REAL,
+		tier1_done INTEGER,
+		tier2_target REAL,
+		tier2_ratio REAL,
+		tier2_done INTEGER,
+		tier3_target REAL,
+		tier3_ratio REAL,
+		tier3_done INTEGER,
+		remaining_ratio REAL,
+		tier_notes TEXT
 	);
 	CREATE INDEX IF NOT EXISTS idx_trade_risk_symbol ON trade_risk(symbol);
 	`
-	_, err := db.Exec(stmt)
+	if _, err := db.Exec(stmt); err != nil {
+		return err
+	}
+	// 额外保障：对已有库补充缺失列
+	if err := ensureRiskColumn(db, "tier1_target", "ALTER TABLE trade_risk ADD COLUMN tier1_target REAL"); err != nil {
+		return err
+	}
+	if err := ensureRiskColumn(db, "tier1_ratio", "ALTER TABLE trade_risk ADD COLUMN tier1_ratio REAL"); err != nil {
+		return err
+	}
+	if err := ensureRiskColumn(db, "tier1_done", "ALTER TABLE trade_risk ADD COLUMN tier1_done INTEGER"); err != nil {
+		return err
+	}
+	if err := ensureRiskColumn(db, "tier2_target", "ALTER TABLE trade_risk ADD COLUMN tier2_target REAL"); err != nil {
+		return err
+	}
+	if err := ensureRiskColumn(db, "tier2_ratio", "ALTER TABLE trade_risk ADD COLUMN tier2_ratio REAL"); err != nil {
+		return err
+	}
+	if err := ensureRiskColumn(db, "tier2_done", "ALTER TABLE trade_risk ADD COLUMN tier2_done INTEGER"); err != nil {
+		return err
+	}
+	if err := ensureRiskColumn(db, "tier3_target", "ALTER TABLE trade_risk ADD COLUMN tier3_target REAL"); err != nil {
+		return err
+	}
+	if err := ensureRiskColumn(db, "tier3_ratio", "ALTER TABLE trade_risk ADD COLUMN tier3_ratio REAL"); err != nil {
+		return err
+	}
+	if err := ensureRiskColumn(db, "tier3_done", "ALTER TABLE trade_risk ADD COLUMN tier3_done INTEGER"); err != nil {
+		return err
+	}
+	if err := ensureRiskColumn(db, "remaining_ratio", "ALTER TABLE trade_risk ADD COLUMN remaining_ratio REAL"); err != nil {
+		return err
+	}
+	if err := ensureRiskColumn(db, "tier_notes", "ALTER TABLE trade_risk ADD COLUMN tier_notes TEXT"); err != nil {
+		return err
+	}
+	// tier log table
+	logStmt := `
+	CREATE TABLE IF NOT EXISTS trade_tier_logs (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		trade_id INTEGER NOT NULL,
+		tier_name TEXT,
+		old_target REAL,
+		new_target REAL,
+		old_ratio REAL,
+		new_ratio REAL,
+		reason TEXT,
+		source TEXT,
+		created_at INTEGER NOT NULL
+	);
+	CREATE INDEX IF NOT EXISTS idx_trade_tier_logs_trade ON trade_tier_logs(trade_id);
+	`
+	_, err := db.Exec(logStmt)
+	return err
+}
+
+func ensureRiskColumn(db *sql.DB, name, alter string) error {
+	var exists int
+	row := db.QueryRow(`SELECT 1 FROM pragma_table_info('trade_risk') WHERE name = ?`, name)
+	err := row.Scan(&exists)
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, sql.ErrNoRows) {
+		_, execErr := db.Exec(alter)
+		return execErr
+	}
 	return err
 }
 
@@ -135,6 +257,93 @@ func nullIfZero(val float64) interface{} {
 		return nil
 	}
 	return val
+}
+
+func boolToInt(v bool) int {
+	if v {
+		return 1
+	}
+	return 0
+}
+
+// InsertTierLog 记录 tier 的变更。
+func (s *Store) InsertTierLog(ctx context.Context, log TierLog) error {
+	s.mu.Lock()
+	db := s.db
+	s.mu.Unlock()
+	if db == nil {
+		return fmt.Errorf("storage 未初始化")
+	}
+	if log.TradeID <= 0 {
+		return fmt.Errorf("trade_id 需>0")
+	}
+	created := log.CreatedAt
+	if created.IsZero() {
+		created = time.Now()
+	}
+	_, err := db.ExecContext(ctx, `
+		INSERT INTO trade_tier_logs(trade_id, tier_name, old_target, new_target, old_ratio, new_ratio, reason, source, created_at)
+		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, log.TradeID, strings.TrimSpace(log.TierName), nullIfZero(log.OldTarget), nullIfZero(log.NewTarget),
+		nullIfZero(log.OldRatio), nullIfZero(log.NewRatio), nullIfEmpty(log.Reason), nullIfEmpty(log.Source), created.UnixMilli())
+	return err
+}
+
+// ListTierLogs 返回指定 trade 的 tier 调整记录。
+func (s *Store) ListTierLogs(ctx context.Context, tradeID int, limit int) ([]TierLog, error) {
+	s.mu.Lock()
+	db := s.db
+	s.mu.Unlock()
+	if db == nil {
+		return nil, fmt.Errorf("storage 未初始化")
+	}
+	if tradeID <= 0 {
+		return nil, fmt.Errorf("trade_id 需>0")
+	}
+	if limit <= 0 {
+		limit = 50
+	}
+	rows, err := db.QueryContext(ctx, `
+		SELECT trade_id, tier_name, old_target, new_target, old_ratio, new_ratio, reason, source, created_at
+		FROM trade_tier_logs
+		WHERE trade_id = ?
+		ORDER BY created_at DESC
+		LIMIT ?`, tradeID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	logs := make([]TierLog, 0, limit)
+	for rows.Next() {
+		var log TierLog
+		var created sql.NullInt64
+		var (
+			oldTarget sql.NullFloat64
+			newTarget sql.NullFloat64
+			oldRatio  sql.NullFloat64
+			newRatio  sql.NullFloat64
+		)
+		if err := rows.Scan(&log.TradeID, &log.TierName, &oldTarget, &newTarget, &oldRatio, &newRatio, &log.Reason, &log.Source, &created); err != nil {
+			return nil, err
+		}
+		if oldTarget.Valid {
+			log.OldTarget = oldTarget.Float64
+		}
+		if newTarget.Valid {
+			log.NewTarget = newTarget.Float64
+		}
+		if oldRatio.Valid {
+			log.OldRatio = oldRatio.Float64
+		}
+		if newRatio.Valid {
+			log.NewRatio = newRatio.Float64
+		}
+		if created.Valid {
+			log.CreatedAt = time.UnixMilli(created.Int64)
+		}
+		logs = append(logs, log)
+	}
+	return logs, rows.Err()
 }
 
 func nullIfEmpty(s string) interface{} {
@@ -158,7 +367,11 @@ func (s *Store) Get(ctx context.Context, tradeID int) (RiskRecord, bool, error) 
 	}
 	row := db.QueryRowContext(ctx, `
 		SELECT trade_id, symbol, pair, side, entry_price, stake_amount, amount, leverage,
-		       stop_loss, take_profit, reason, source, status, updated_at
+		       stop_loss, take_profit, reason, source, status, updated_at,
+		       tier1_target, tier1_ratio, tier1_done,
+		       tier2_target, tier2_ratio, tier2_done,
+		       tier3_target, tier3_ratio, tier3_done,
+		       remaining_ratio, tier_notes
 		FROM trade_risk WHERE trade_id = ?`, tradeID)
 	var rec RiskRecord
 	var updated sql.NullInt64
@@ -168,9 +381,16 @@ func (s *Store) Get(ctx context.Context, tradeID int) (RiskRecord, bool, error) 
 	var lev sql.NullFloat64
 	var stop sql.NullFloat64
 	var take sql.NullFloat64
+	var tier1Target, tier1Ratio, tier2Target, tier2Ratio, tier3Target, tier3Ratio, remaining sql.NullFloat64
+	var tier1Done, tier2Done, tier3Done sql.NullInt64
+	var notes sql.NullString
 	err := row.Scan(&rec.TradeID, &rec.Symbol, &rec.Pair, &rec.Side, &entry,
 		&stake, &amount, &lev, &stop, &take,
-		&rec.Reason, &rec.Source, &rec.Status, &updated)
+		&rec.Reason, &rec.Source, &rec.Status, &updated,
+		&tier1Target, &tier1Ratio, &tier1Done,
+		&tier2Target, &tier2Ratio, &tier2Done,
+		&tier3Target, &tier3Ratio, &tier3Done,
+		&remaining, &notes)
 	if err == sql.ErrNoRows {
 		return RiskRecord{}, false, nil
 	}
@@ -197,6 +417,39 @@ func (s *Store) Get(ctx context.Context, tradeID int) (RiskRecord, bool, error) 
 	}
 	if updated.Valid {
 		rec.UpdatedAt = time.UnixMilli(updated.Int64)
+	}
+	if tier1Target.Valid {
+		rec.Tier1Target = tier1Target.Float64
+	}
+	if tier1Ratio.Valid {
+		rec.Tier1Ratio = tier1Ratio.Float64
+	}
+	if tier2Target.Valid {
+		rec.Tier2Target = tier2Target.Float64
+	}
+	if tier2Ratio.Valid {
+		rec.Tier2Ratio = tier2Ratio.Float64
+	}
+	if tier3Target.Valid {
+		rec.Tier3Target = tier3Target.Float64
+	}
+	if tier3Ratio.Valid {
+		rec.Tier3Ratio = tier3Ratio.Float64
+	}
+	if remaining.Valid {
+		rec.RemainingRatio = remaining.Float64
+	}
+	if tier1Done.Valid {
+		rec.Tier1Done = tier1Done.Int64 == 1
+	}
+	if tier2Done.Valid {
+		rec.Tier2Done = tier2Done.Int64 == 1
+	}
+	if tier3Done.Valid {
+		rec.Tier3Done = tier3Done.Int64 == 1
+	}
+	if notes.Valid {
+		rec.TierNotes = notes.String
 	}
 	return rec, true, nil
 }

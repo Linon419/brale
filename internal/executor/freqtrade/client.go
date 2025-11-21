@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -120,6 +121,19 @@ type Trade struct {
 	IsOpen       bool    `json:"is_open"`
 }
 
+// Balance 描述 freqtrade /balance 返回的核心字段。
+type Balance struct {
+	StakeCurrency string             `json:"stake_currency,omitempty"`
+	Total         float64            `json:"total,omitempty"`
+	Available     float64            `json:"available,omitempty"`
+	Used          float64            `json:"used,omitempty"`
+	Balance       float64            `json:"balance,omitempty"`
+	Stake         float64            `json:"stake_balance,omitempty"`
+	Wallets       map[string]float64 `json:"wallets,omitempty"`
+	Raw           map[string]any     `json:"raw,omitempty"`
+	UpdatedAt     time.Time          `json:"-"`
+}
+
 // ListTrades fetches currently open trades from freqtrade (uses /status endpoint).
 func (c *Client) ListTrades(ctx context.Context) ([]Trade, error) {
 	trades, err := c.fetchTrades(ctx, "/status")
@@ -176,6 +190,67 @@ func filterOpenTrades(trades []Trade) []Trade {
 		}
 	}
 	return open
+}
+
+// GetBalance 查询 freqtrade /balance 接口，返回账户权益与可用资金。
+func (c *Client) GetBalance(ctx context.Context) (Balance, error) {
+	var raw map[string]any
+	if err := c.doRequest(ctx, http.MethodGet, "/balance", nil, &raw); err != nil {
+		return Balance{}, err
+	}
+	b := Balance{Raw: raw, UpdatedAt: time.Now()}
+	if raw == nil {
+		return b, nil
+	}
+	if v, ok := raw["stake_currency"].(string); ok {
+		b.StakeCurrency = strings.ToUpper(strings.TrimSpace(v))
+	}
+	if v, ok := raw["total"]; ok {
+		b.Total = parseAnyFloat(v)
+	}
+	if v, ok := raw["available"]; ok {
+		b.Available = parseAnyFloat(v)
+	}
+	if v, ok := raw["stake_balance"]; ok {
+		b.Stake = parseAnyFloat(v)
+	}
+	if v, ok := raw["used"]; ok {
+		b.Used = parseAnyFloat(v)
+	}
+	if v, ok := raw["balance"]; ok {
+		b.Balance = parseAnyFloat(v)
+	}
+	if wallets, ok := raw["wallets"].(map[string]any); ok {
+		b.Wallets = make(map[string]float64, len(wallets))
+		for k, v := range wallets {
+			b.Wallets[strings.ToUpper(strings.TrimSpace(k))] = parseAnyFloat(v)
+		}
+	}
+	return b, nil
+}
+
+func parseAnyFloat(v any) float64 {
+	switch t := v.(type) {
+	case float64:
+		return t
+	case float32:
+		return float64(t)
+	case int:
+		return float64(t)
+	case int64:
+		return float64(t)
+	case uint64:
+		return float64(t)
+	case json.Number:
+		if f, err := t.Float64(); err == nil {
+			return f
+		}
+	case string:
+		if f, err := strconv.ParseFloat(strings.TrimSpace(t), 64); err == nil {
+			return f
+		}
+	}
+	return 0
 }
 
 func (c *Client) doRequest(ctx context.Context, method, path string, payload any, out any) error {

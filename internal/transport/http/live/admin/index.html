@@ -58,7 +58,7 @@
       </div>
       <div>
         <strong>仓位</strong>
-        <span>{{ positions.length }} 个</span>
+        <span>{{ openPositionCount }} 个持仓 / {{ positions.length }} 条记录</span>
       </div>
       <div v-if="error" class="error">{{ error }}</div>
     </section>
@@ -162,13 +162,20 @@
               <th>ID</th>
               <th>交易对</th>
               <th>方向</th>
+              <th>状态</th>
               <th>入场价</th>
+              <th>现价/平仓价</th>
+              <th>止损</th>
+              <th>止盈</th>
               <th>数量</th>
               <th>仓位</th>
               <th>杠杆</th>
+              <th>收益%</th>
+              <th>收益(USDT)</th>
               <th>持仓时长</th>
               <th>开仓时间</th>
               <th></th>
+              <th>配置</th>
             </tr>
           </thead>
           <tbody>
@@ -176,22 +183,95 @@
               <td>{{ pos.trade_id }}</td>
               <td>{{ pos.symbol }}</td>
               <td>{{ pos.side }}</td>
+              <td>{{ formatPositionStatus(pos) }}</td>
               <td>{{ formatNumber(pos.entry_price) }}</td>
+              <td>{{ formatNumber(pos.status === 'closed' ? (pos.exit_price || pos.current_price) : pos.current_price) }}</td>
+              <td>{{ formatNumber(pos.stop_loss) }}</td>
+              <td>{{ formatNumber(pos.take_profit) }}</td>
               <td>{{ formatNumber(pos.amount, 4) }}</td>
               <td>{{ formatNumber(pos.stake) }}</td>
               <td>{{ pos.leverage ? pos.leverage + 'x' : '-' }}</td>
+              <td>{{ formatPercent(pos.pnl_ratio) }}</td>
+              <td>{{ formatNumber(pos.pnl_usd) }}</td>
               <td>{{ formatDuration(pos.holding_ms) }}</td>
               <td>{{ formatTs(pos.opened_at) }}</td>
               <td>
                 <button
                   class="ghost"
                   @click="quickClose(pos)"
-                  :disabled="isClosing(pos.trade_id)"
+                  :disabled="isClosing(pos.trade_id) || isClosed(pos)"
                 >
-                  {{ isClosing(pos.trade_id) ? '关闭中…' : '快捷关闭' }}
+                  {{ isClosed(pos) ? '已平仓' : (isClosing(pos.trade_id) ? '关闭中…' : '快捷关闭') }}
+                </button>
+              </td>
+              <td>
+                <button class="ghost" @click="toggleTierEditor(pos)" :disabled="isClosed(pos)">
+                  {{ isTierEditorOpen(pos.trade_id) ? '收起' : '配置' }}
                 </button>
               </td>
             </tr>
+            <template v-for="pos in positions" :key="'tier-' + pos.trade_id">
+              <tr v-if="isTierEditorOpen(pos.trade_id)">
+                <td colspan="17" class="tier-panel" v-if="tierForms[pos.trade_id]">
+                  <div class="tier-status">
+                    <p><strong>Tier1:</strong> {{ formatTierStatus(pos.tier1) }}</p>
+                    <p><strong>Tier2:</strong> {{ formatTierStatus(pos.tier2) }}</p>
+                    <p><strong>Tier3:</strong> {{ formatTierStatus(pos.tier3) }}</p>
+                    <p><strong>剩余仓位:</strong> {{ formatPercent(pos.remaining_ratio || 0) }}</p>
+                    <p v-if="pos.tier_notes"><strong>说明:</strong> {{ pos.tier_notes }}</p>
+                  </div>
+                  <div class="tier-form">
+                    <label>Tier1 目标价
+                      <input type="number" step="0.01" v-model.number="tierForms[pos.trade_id].tier1_target" />
+                    </label>
+                    <label>比例
+                      <input type="number" step="0.01" v-model.number="tierForms[pos.trade_id].tier1_ratio" />
+                    </label>
+                    <label>Tier2 目标价
+                      <input type="number" step="0.01" v-model.number="tierForms[pos.trade_id].tier2_target" />
+                    </label>
+                    <label>比例
+                      <input type="number" step="0.01" v-model.number="tierForms[pos.trade_id].tier2_ratio" />
+                    </label>
+                    <label>Tier3 目标价
+                      <input type="number" step="0.01" v-model.number="tierForms[pos.trade_id].tier3_target" />
+                    </label>
+                    <label>比例
+                      <input type="number" step="0.01" v-model.number="tierForms[pos.trade_id].tier3_ratio" />
+                    </label>
+                    <label>备注
+                      <input type="text" v-model="tierForms[pos.trade_id].reason" placeholder="原因（选填）" />
+                    </label>
+                    <div class="tier-actions">
+                      <button class="ghost" @click="toggleTierEditor(pos)">收起</button>
+                      <button @click="saveTierConfig(pos)" :disabled="isSavingTier(pos.trade_id)">
+                        {{ isSavingTier(pos.trade_id) ? '保存中…' : '保存配置' }}
+                      </button>
+                    </div>
+                  </div>
+                  <div class="tier-logs">
+                    <div class="tier-logs-head">
+                      <h4>配置历史</h4>
+                      <div>
+                        <label>条数
+                          <input type="number" min="1" step="10" v-model.number="tierForms[pos.trade_id].logs_limit" />
+                        </label>
+                        <button class="ghost" @click="fetchTierLogs(pos)" :disabled="isTierLogsLoading(pos.trade_id)">
+                          {{ isTierLogsLoading(pos.trade_id) ? '加载中…' : '刷新' }}
+                        </button>
+                      </div>
+                    </div>
+                    <ul>
+                      <li v-if="isTierLogsLoading(pos.trade_id)">加载中…</li>
+                      <li v-else-if="!(tierLogs[pos.trade_id] && tierLogs[pos.trade_id].length)">暂无记录</li>
+                      <li v-for="log in (tierLogs[pos.trade_id] || [])" :key="log.id">
+                        {{ formatTierLog(log) }}
+                      </li>
+                    </ul>
+                  </div>
+                </td>
+              </tr>
+            </template>
           </tbody>
         </table>
       </section>

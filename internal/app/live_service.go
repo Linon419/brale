@@ -49,6 +49,13 @@ func (s *LiveService) Run(ctx context.Context) error {
 	if s == nil || s.cfg == nil {
 		return fmt.Errorf("live service not initialized")
 	}
+	if s.freqManager != nil {
+		s.freqManager.StartTierWatcher(ctx, func(sym string) freqexec.TierPriceQuote {
+			sym = strings.ToUpper(strings.TrimSpace(sym))
+			return s.latestPriceQuote(ctx, sym)
+		})
+		s.freqManager.StartPositionSync(ctx)
+	}
 
 	cfg := s.cfg
 	firstWSConnected := false
@@ -155,6 +162,7 @@ func (s *LiveService) Close() {
 func (s *LiveService) tickDecision(ctx context.Context) error {
 	cfg := s.cfg
 	input := decision.Context{Candidates: s.symbols}
+	input.Account = s.accountSnapshot()
 	if exp, ok := s.ks.(store.SnapshotExporter); ok {
 		symbols := append([]string(nil), input.Candidates...)
 		if max := 6; len(symbols) > max {
@@ -173,11 +181,12 @@ func (s *LiveService) tickDecision(ctx context.Context) error {
 			WithImages:  s.visionReady,
 		})
 	}
-	if snaps := s.livePositions(); len(snaps) > 0 {
-		input.Positions = snaps
+	positions := s.livePositions(input.Account)
+	if len(positions) > 0 {
+		input.Positions = positions
 	}
 	if s.includeLastDecision && s.lastDec != nil {
-		snap := s.lastDec.Snapshot(time.Now())
+		snap := s.filterLastDecisionSnapshot(s.lastDec.Snapshot(time.Now()), positions)
 		if len(snap) > 0 {
 			input.LastDecisions = snap
 			input.LastRawJSON = s.lastRawJSON
@@ -437,11 +446,119 @@ func (s *LiveService) persistLastDecisions(ctx context.Context, decisions []deci
 	}
 }
 
-func (s *LiveService) livePositions() []decision.PositionSnapshot {
-	if s.freqManager != nil {
-		return s.freqManager.Positions()
+func (s *LiveService) filterLastDecisionSnapshot(records []decision.DecisionMemory, positions []decision.PositionSnapshot) []decision.DecisionMemory {
+	if len(records) == 0 {
+		return nil
 	}
-	return nil
+	posMap := make(map[string]bool, len(positions))
+	for _, p := range positions {
+		sym := strings.ToUpper(strings.TrimSpace(p.Symbol))
+		if sym != "" {
+			posMap[sym] = true
+		}
+	}
+	out := make([]decision.DecisionMemory, 0, len(records))
+	for _, mem := range records {
+		sym := strings.ToUpper(strings.TrimSpace(mem.Symbol))
+		if sym == "" || len(mem.Decisions) == 0 {
+			continue
+		}
+		filtered := make([]decision.Decision, 0, len(mem.Decisions))
+		for _, d := range mem.Decisions {
+			if d.Action == "update_tiers" && !posMap[sym] {
+				continue
+			}
+			filtered = append(filtered, d)
+		}
+		if len(filtered) == 0 {
+			continue
+		}
+		mem.Symbol = sym
+		mem.Decisions = filtered
+		out = append(out, mem)
+	}
+	return out
+}
+
+func (s *LiveService) livePositions(account decision.AccountSnapshot) []decision.PositionSnapshot {
+	if s.freqManager == nil {
+		return nil
+	}
+	positions := s.freqManager.Positions()
+	if len(positions) == 0 {
+		return nil
+	}
+	total := account.Total
+	if total <= 0 {
+		total = s.cfg.Trading.StaticBalance
+	}
+	for i := range positions {
+		val := positions[i].PositionValue
+		if val <= 0 {
+			if positions[i].Stake > 0 {
+				val = positions[i].Stake
+			} else if positions[i].Quantity > 0 && positions[i].CurrentPrice > 0 {
+				val = positions[i].Quantity * positions[i].CurrentPrice
+			}
+		}
+		positions[i].PositionValue = val
+		if total > 0 && val > 0 {
+			positions[i].AccountRatio = val / total
+		}
+	}
+	return positions
+}
+
+func (s *LiveService) latestPrice(ctx context.Context, symbol string) float64 {
+	quote := s.latestPriceQuote(ctx, symbol)
+	return quote.Last
+}
+
+func (s *LiveService) latestPriceQuote(ctx context.Context, symbol string) freqexec.TierPriceQuote {
+	var quote freqexec.TierPriceQuote
+	if s == nil || s.ks == nil {
+		return quote
+	}
+	interval := ""
+	if len(s.profile.EntryTimeframes) > 0 {
+		interval = s.profile.EntryTimeframes[0]
+	} else if len(s.hIntervals) > 0 {
+		interval = s.hIntervals[0]
+	} else {
+		interval = "1m"
+	}
+	klines, err := s.ks.Get(ctx, symbol, interval)
+	if err != nil || len(klines) == 0 {
+		return quote
+	}
+	last := klines[len(klines)-1]
+	quote.Last = last.Close
+	quote.High = last.High
+	quote.Low = last.Low
+	return quote
+}
+
+func (s *LiveService) accountSnapshot() decision.AccountSnapshot {
+	if s == nil || s.freqManager == nil {
+		return decision.AccountSnapshot{Total: s.cfg.Trading.StaticBalance, Currency: "USDT"}
+	}
+	bal := s.freqManager.AccountBalance()
+	if bal.Total <= 0 {
+		bal.Total = s.cfg.Trading.StaticBalance
+	}
+	if bal.Available <= 0 && bal.Total > 0 {
+		bal.Available = bal.Total
+	}
+	currency := bal.StakeCurrency
+	if strings.TrimSpace(currency) == "" {
+		currency = "USDT"
+	}
+	return decision.AccountSnapshot{
+		Total:     bal.Total,
+		Available: bal.Available,
+		Currency:  currency,
+		UpdatedAt: bal.UpdatedAt,
+	}
 }
 
 func (s *LiveService) logDecision(d decision.Decision) {
@@ -569,7 +686,47 @@ func (s *LiveService) ListFreqtradePositions(ctx context.Context, symbol string,
 	if s == nil || s.freqManager == nil {
 		return nil
 	}
-	return s.freqManager.PositionsForAPI(symbol, limit)
+	positions := s.freqManager.PositionsForAPI(symbol, limit)
+	if len(positions) == 0 {
+		return positions
+	}
+	cache := make(map[string]float64)
+	for i := range positions {
+		pos := &positions[i]
+		if strings.EqualFold(pos.Status, "closed") {
+			if pos.ExitPrice > 0 {
+				pos.CurrentPrice = pos.ExitPrice
+			}
+			if pos.PnLUSD == 0 && pos.Stake > 0 && pos.PnLRatio != 0 {
+				pos.PnLUSD = pos.PnLRatio * pos.Stake
+			}
+			continue
+		}
+		sym := strings.ToUpper(strings.TrimSpace(pos.Symbol))
+		if sym == "" {
+			continue
+		}
+		price, ok := cache[sym]
+		if !ok {
+			price = s.latestPrice(ctx, sym)
+			cache[sym] = price
+		}
+		pos.CurrentPrice = price
+		if price <= 0 || pos.EntryPrice <= 0 {
+			continue
+		}
+		var ratio float64
+		if strings.EqualFold(pos.Side, "SHORT") {
+			ratio = (pos.EntryPrice - price) / pos.EntryPrice
+		} else {
+			ratio = (price - pos.EntryPrice) / pos.EntryPrice
+		}
+		pos.PnLRatio = ratio
+		if pos.Stake > 0 {
+			pos.PnLUSD = ratio * pos.Stake
+		}
+	}
+	return positions
 }
 
 // CloseFreqtradePosition implements livehttp.FreqtradeWebhookHandler.
@@ -598,6 +755,22 @@ func (s *LiveService) CloseFreqtradePosition(ctx context.Context, symbol, side s
 		CloseRatio: closeRatio,
 	}
 	return s.freqtradeHandleDecision(ctx, traceID, decision)
+}
+
+// UpdateFreqtradeTiers allows manual tier adjustments via HTTP API.
+func (s *LiveService) UpdateFreqtradeTiers(ctx context.Context, req freqexec.TierUpdateRequest) error {
+	if s == nil || s.freqManager == nil {
+		return fmt.Errorf("live service 未初始化")
+	}
+	return s.freqManager.UpdateTiersManual(ctx, req)
+}
+
+// ListFreqtradeTierLogs exposes tier logs for Admin API.
+func (s *LiveService) ListFreqtradeTierLogs(ctx context.Context, tradeID int, limit int) ([]freqexec.TierLog, error) {
+	if s == nil || s.freqManager == nil {
+		return nil, fmt.Errorf("live service 未初始化")
+	}
+	return s.freqManager.ListTierLogs(ctx, tradeID, limit)
 }
 
 func (s *LiveService) ensureTraceID(raw string) string {

@@ -34,6 +34,8 @@ func (r *Router) Register(group *gin.RouterGroup) {
 		group.POST("/freqtrade/webhook", r.handleFreqtradeWebhook)
 		group.GET("/freqtrade/positions", r.handleFreqtradePositions)
 		group.POST("/freqtrade/close", r.handleFreqtradeQuickClose)
+		group.POST("/freqtrade/tiers", r.handleFreqtradeUpdateTiers)
+		group.GET("/freqtrade/tier-logs", r.handleFreqtradeTierLogs)
 	}
 }
 
@@ -42,6 +44,8 @@ type FreqtradeWebhookHandler interface {
 	HandleFreqtradeWebhook(ctx context.Context, msg freqtrade.WebhookMessage) error
 	ListFreqtradePositions(ctx context.Context, symbol string, limit int) []freqtrade.APIPosition
 	CloseFreqtradePosition(ctx context.Context, symbol, side string, closeRatio float64) error
+	UpdateFreqtradeTiers(ctx context.Context, req freqtrade.TierUpdateRequest) error
+	ListFreqtradeTierLogs(ctx context.Context, tradeID int, limit int) ([]freqtrade.TierLog, error)
 }
 
 func (r *Router) handleLiveDecisions(c *gin.Context) {
@@ -143,4 +147,40 @@ func (r *Router) handleFreqtradeQuickClose(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"status": "ok"})
+}
+
+func (r *Router) handleFreqtradeUpdateTiers(c *gin.Context) {
+	if r.FreqtradeHandler == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "未配置 freqtrade 处理器"})
+		return
+	}
+	var req freqtrade.TierUpdateRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if err := r.FreqtradeHandler.UpdateFreqtradeTiers(c.Request.Context(), req); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"status": "ok"})
+}
+
+func (r *Router) handleFreqtradeTierLogs(c *gin.Context) {
+	if r.FreqtradeHandler == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "未配置 freqtrade 处理器"})
+		return
+	}
+	tradeID, _ := strconv.Atoi(c.DefaultQuery("trade_id", "0"))
+	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "50"))
+	if tradeID <= 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "trade_id 必填"})
+		return
+	}
+	logs, err := r.FreqtradeHandler.ListFreqtradeTierLogs(c.Request.Context(), tradeID, limit)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"logs": logs})
 }

@@ -7,15 +7,26 @@ import "time"
 
 // Decision 单笔 AI 决策动作（与旧版保持兼容的最小字段集）
 type Decision struct {
-	Symbol          string  `json:"symbol"`
-	Action          string  `json:"action"`             // open_long/open_short/close_long/close_short/hold/wait
-	Leverage        int     `json:"leverage,omitempty"` // 杠杆（仅开仓）
-	PositionSizeUSD float64 `json:"position_size_usd,omitempty"`
-	CloseRatio      float64 `json:"close_ratio,omitempty"`
-	StopLoss        float64 `json:"stop_loss,omitempty"`
-	TakeProfit      float64 `json:"take_profit,omitempty"`
-	Confidence      int     `json:"confidence,omitempty"`
-	Reasoning       string  `json:"reasoning,omitempty"`
+	Symbol          string         `json:"symbol"`
+	Action          string         `json:"action"`             // open_long/open_short/close_long/close_short/hold/wait
+	Leverage        int            `json:"leverage,omitempty"` // 杠杆（仅开仓）
+	PositionSizeUSD float64        `json:"position_size_usd,omitempty"`
+	CloseRatio      float64        `json:"close_ratio,omitempty"`
+	StopLoss        float64        `json:"stop_loss,omitempty"`
+	TakeProfit      float64        `json:"take_profit,omitempty"`
+	Confidence      int            `json:"confidence,omitempty"`
+	Reasoning       string         `json:"reasoning,omitempty"`
+	Tiers           *DecisionTiers `json:"tiers,omitempty"`
+}
+
+// DecisionTiers 描述三段式离场的目标与比例。
+type DecisionTiers struct {
+	Tier1Target float64 `json:"tier1_target,omitempty"`
+	Tier1Ratio  float64 `json:"tier1_ratio,omitempty"`
+	Tier2Target float64 `json:"tier2_target,omitempty"`
+	Tier2Ratio  float64 `json:"tier2_ratio,omitempty"`
+	Tier3Target float64 `json:"tier3_target,omitempty"`
+	Tier3Ratio  float64 `json:"tier3_ratio,omitempty"`
 }
 
 // DecisionResult AI 决策输出（可包含多币种）

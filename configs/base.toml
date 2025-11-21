@@ -107,7 +107,7 @@ timeout_seconds = 120
 # dir：提示词模板目录（通常保持 prompts）。
 dir = "prompts"
 # system_template：默认系统提示模板名（不含 .txt）。
-system_template = "default"
+system_template = "prompt_default"
 
 [advanced]
 # liquidity_filter_usd_m：按 OI×价格估算的最低流动性（百万 USD）。
