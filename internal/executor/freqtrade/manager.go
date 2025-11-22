@@ -95,6 +95,11 @@ type TierPriceQuote struct {
 	Low  float64
 }
 
+type pendingHit struct {
+	target float64
+	seenAt time.Time
+}
+
 func (q TierPriceQuote) isEmpty() bool {
 	return q.Last <= 0 && q.High <= 0 && q.Low <= 0
 }
@@ -119,12 +124,15 @@ type Manager struct {
 	posSyncOnce   sync.Once
 	balanceMu     sync.RWMutex
 	balance       Balance
+	pendingHitsMu sync.Mutex
+	pendingHits   map[string]pendingHit
 }
 
 const (
-	defaultTier1Ratio = 0.33
-	defaultTier2Ratio = 0.33
-	defaultTier3Ratio = 0.34
+	defaultTier1Ratio      = 0.33
+	defaultTier2Ratio      = 0.33
+	defaultTier3Ratio      = 0.34
+	autoCloseRetryInterval = 30 * time.Second
 )
 
 // Position 缓存 freqtrade 持仓信息。
@@ -169,6 +177,7 @@ func NewManager(client *Client, cfg brcfg.FreqtradeConfig, horizon string, logSt
 		riskStorePath: strings.TrimSpace(cfg.RiskStorePath),
 		notifier:      notifier,
 		tierExec:      make(map[int]bool),
+		pendingHits:   make(map[string]pendingHit),
 	}
 }
 
@@ -225,6 +234,7 @@ func (m *Manager) StartPositionSync(ctx context.Context) {
 
 const tierWatchInterval = 5 * time.Second
 const positionSyncInterval = 2 * time.Second
+const hitConfirmDelay = 2 * time.Second
 
 func (m *Manager) runTierWatcher(ctx context.Context, priceFn func(symbol string) TierPriceQuote) {
 	ticker := time.NewTicker(tierWatchInterval)
@@ -250,6 +260,30 @@ func (m *Manager) runPositionSync(ctx context.Context) {
 			m.refreshOpenPositions(ctx)
 		}
 	}
+}
+
+func (m *Manager) shouldFireHit(tradeID int, kind string, target float64) bool {
+	key := fmt.Sprintf("%d:%s", tradeID, kind)
+	now := time.Now()
+	m.pendingHitsMu.Lock()
+	defer m.pendingHitsMu.Unlock()
+	ph, ok := m.pendingHits[key]
+	if !ok || !floatEqual(ph.target, target) {
+		m.pendingHits[key] = pendingHit{target: target, seenAt: now}
+		return false
+	}
+	if now.Sub(ph.seenAt) >= hitConfirmDelay {
+		delete(m.pendingHits, key)
+		return true
+	}
+	return false
+}
+
+func (m *Manager) clearPendingHit(tradeID int, kind string) {
+	key := fmt.Sprintf("%d:%s", tradeID, kind)
+	m.pendingHitsMu.Lock()
+	delete(m.pendingHits, key)
+	m.pendingHitsMu.Unlock()
 }
 
 func (m *Manager) evaluateTiers(ctx context.Context, priceFn func(symbol string) TierPriceQuote) {
@@ -279,19 +313,31 @@ func (m *Manager) evaluateTiers(ctx context.Context, priceFn func(symbol string)
 		}
 		side := strings.ToLower(pos.Side)
 		if price, hit := priceForStopLoss(side, quote, rec.StopLoss); hit {
-			m.forceClose(ctx, pos, "stop_loss", price, rec)
+			if m.shouldFireHit(pos.TradeID, "stop_loss", rec.StopLoss) {
+				m.forceClose(ctx, pos, "stop_loss", price, rec)
+			}
 			continue
+		} else {
+			m.clearPendingHit(pos.TradeID, "stop_loss")
 		}
 		if price, hit := priceForTakeProfit(side, quote, rec.TakeProfit); hit {
-			m.forceClose(ctx, pos, "take_profit", price, rec)
+			if m.shouldFireHit(pos.TradeID, "take_profit", rec.TakeProfit) {
+				m.forceClose(ctx, pos, "take_profit", price, rec)
+			}
 			continue
+		} else {
+			m.clearPendingHit(pos.TradeID, "take_profit")
 		}
 		tierName, target, ratio := nextPendingTier(rec)
 		if tierName == "" || ratio <= 0 || target <= 0 {
 			continue
 		}
 		if price, hit := priceForTierTrigger(side, quote, target); hit {
-			m.triggerTier(ctx, tierName, price, pos, rec)
+			if m.shouldFireHit(pos.TradeID, tierName, target) {
+				m.triggerTier(ctx, tierName, price, pos, rec)
+			}
+		} else {
+			m.clearPendingHit(pos.TradeID, tierName)
 		}
 	}
 }
@@ -420,6 +466,31 @@ func (m *Manager) close(ctx context.Context, traceID string, d decision.Decision
 	return nil
 }
 
+func (m *Manager) guardStopLossChange(pos Position, rec storage.RiskRecord, newStop float64) error {
+	entry := pos.EntryPrice
+	if entry <= 0 || newStop <= 0 {
+		return nil
+	}
+	side := strings.ToLower(strings.TrimSpace(rec.Side))
+	isBreakevenMove := false
+	switch side {
+	case "short":
+		isBreakevenMove = newStop <= entry
+	default: // long as default
+		isBreakevenMove = newStop >= entry
+	}
+	if isBreakevenMove && !rec.Tier1Done {
+		return fmt.Errorf("tier1 未完成，拒绝将止损调整至入场价/保本")
+	}
+	if !rec.Tier1Done && m.cfg.MinStopDistancePct > 0 {
+		dist := math.Abs(entry-newStop) / entry
+		if dist < m.cfg.MinStopDistancePct {
+			return fmt.Errorf("止损距离入场过近(%.2f%% < %.2f%%)", dist*100, m.cfg.MinStopDistancePct*100)
+		}
+	}
+	return nil
+}
+
 func (m *Manager) adjustStopLoss(ctx context.Context, traceID string, d decision.Decision) error {
 	if d.StopLoss <= 0 {
 		return fmt.Errorf("invalid stop_loss for adjust_stop_loss")
@@ -445,6 +516,12 @@ func (m *Manager) adjustStopLoss(ctx context.Context, traceID string, d decision
 	if !changedStop && !changedTP {
 		logger.Infof("freqtrade stop-loss 调整无变化 trade_id=%d", tradeID)
 		return nil
+	}
+	if changedStop {
+		if err := m.guardStopLossChange(pos, existing, newStop); err != nil {
+			logger.Warnf("freqtrade stop-loss 调整被拒绝 trade_id=%d: %v", tradeID, err)
+			return err
+		}
 	}
 	status := "stoploss_recorded"
 	lines := []string{
@@ -719,6 +796,7 @@ func (m *Manager) applyTradeSnapshot(trades []Trade, recordStore bool) int {
 		count++
 	}
 	m.markPositionsClosed(openIDs)
+	m.retryPendingAutoCloses(openIDs)
 	return count
 }
 
@@ -879,6 +957,7 @@ func (m *Manager) handleExit(ctx context.Context, msg WebhookMessage, event stri
 	logger.Infof("freqtrade manager: exit trade_id=%d %s %s price=%.4f reason=%s", tradeID, symbol, side, closePrice, msg.ExitReason)
 	m.logWebhook(ctx, traceID, tradeID, symbol, event, msg)
 	m.recordOrder(ctx, msg, freqtradeAction(side, true), closePrice, parseFreqtradeTime(msg.CloseDate))
+	m.finalizeRiskAfterClose(tradeID, msg.ExitReason, closePrice)
 }
 
 func (m *Manager) handleExitCancel(ctx context.Context, msg WebhookMessage) {
@@ -1289,6 +1368,109 @@ func (m *Manager) markAutoActionSkipped(rec storage.RiskRecord, reasonType, deta
 	logger.Infof("freqtrade manager: %s 跳过 trade_id=%d (%s)", reasonType, rec.TradeID, detail)
 }
 
+func (m *Manager) markAutoActionPending(rec storage.RiskRecord, reasonType, detail string) {
+	if rec.TradeID <= 0 {
+		return
+	}
+	reasonType = normalizeExitReason(reasonType)
+	if reasonType == "" {
+		reasonType = "close"
+	}
+	rec.Status = fmt.Sprintf("%s_pending", reasonType)
+	rec.Source = fmt.Sprintf("%s_auto", reasonType)
+	rec.Tier1Done = true
+	rec.Tier2Done = true
+	rec.Tier3Done = true
+	if strings.EqualFold(reasonType, "stop_loss") {
+		rec.StopLoss = 0
+	}
+	if strings.EqualFold(reasonType, "take_profit") {
+		rec.TakeProfit = 0
+	}
+	rec.TierNotes = appendTierNote(rec.TierNotes, detail)
+	rec.UpdatedAt = time.Now()
+	m.recordRisk(rec)
+}
+
+func (m *Manager) finalizeRiskAfterClose(tradeID int, exitReason string, exitPrice float64) {
+	ctx := context.Background()
+	rec, ok := m.loadRiskRecord(ctx, tradeID)
+	if !ok || rec.TradeID == 0 {
+		return
+	}
+	origStatus := rec.Status
+	reason := pendingReasonFromStatus(origStatus)
+	if reason == "" {
+		reason = reasonFromStatus(origStatus)
+	}
+	if reason == "" {
+		reason = normalizeExitReason(exitReason)
+	}
+	if reason == "" {
+		reason = "close"
+	}
+	rec.Status = fmt.Sprintf("%s_done", reason)
+	source := strings.ToLower(strings.TrimSpace(rec.Source))
+	if strings.Contains(source, "_auto") || pendingReasonFromStatus(origStatus) != "" {
+		rec.Source = fmt.Sprintf("%s_auto", reason)
+	} else if source == "" || source == "open" {
+		rec.Source = reason
+	}
+	rec.Tier1Done = true
+	rec.Tier2Done = true
+	rec.Tier3Done = true
+	rec.RemainingRatio = 0
+	rec.StopLoss = 0
+	rec.TakeProfit = 0
+	rec.TierNotes = appendTierNote(rec.TierNotes, fmt.Sprintf("%s 成交 %.4f", strings.ToUpper(reason), exitPrice))
+	rec.UpdatedAt = time.Now()
+	m.recordRisk(rec)
+}
+
+func pendingReasonFromStatus(status string) string {
+	status = strings.ToLower(strings.TrimSpace(status))
+	for _, suf := range []string{"_pending", "_sent"} {
+		if strings.HasSuffix(status, suf) {
+			return strings.TrimSuffix(status, suf)
+		}
+	}
+	return ""
+}
+
+func reasonFromStatus(status string) string {
+	status = strings.ToLower(strings.TrimSpace(status))
+	for _, suf := range []string{"_pending", "_sent", "_done", "_skipped_no_position"} {
+		if strings.HasSuffix(status, suf) {
+			return strings.TrimSuffix(status, suf)
+		}
+	}
+	return status
+}
+
+func normalizeExitReason(reason string) string {
+	r := strings.ToLower(strings.TrimSpace(reason))
+	switch r {
+	case "stoploss", "stop_loss", "stoploss_on_exchange":
+		return "stop_loss"
+	case "roi", "take_profit", "tp":
+		return "take_profit"
+	case "force_exit", "forceexit":
+		return "force_exit"
+	}
+	return r
+}
+
+func appendTierNote(prev, addition string) string {
+	addition = strings.TrimSpace(addition)
+	if addition == "" {
+		return prev
+	}
+	if strings.TrimSpace(prev) == "" {
+		return addition
+	}
+	return prev + " | " + addition
+}
+
 func (m *Manager) lookupAmount(ctx context.Context, tradeID int) float64 {
 	m.mu.Lock()
 	if pos, ok := m.positions[tradeID]; ok && pos.Amount > 0 {
@@ -1377,6 +1559,7 @@ func (m *Manager) markPositionsClosed(openIDs map[int]struct{}) {
 	now := time.Now()
 	type key struct{ symbol, side string }
 	toDelete := make([]key, 0)
+	closedIDs := make([]int, 0)
 	m.mu.Lock()
 	for id, pos := range m.positions {
 		if pos.Closed {
@@ -1395,6 +1578,7 @@ func (m *Manager) markPositionsClosed(openIDs map[int]struct{}) {
 		pos.Amount = 0
 		m.positions[id] = pos
 		toDelete = append(toDelete, key{symbol: pos.Symbol, side: pos.Side})
+		closedIDs = append(closedIDs, id)
 	}
 	m.mu.Unlock()
 	for _, item := range toDelete {
@@ -1403,6 +1587,60 @@ func (m *Manager) markPositionsClosed(openIDs map[int]struct{}) {
 		}
 		m.deleteTrade(item.symbol, item.side)
 	}
+	for _, id := range closedIDs {
+		m.clearPendingHit(id, "stop_loss")
+		m.clearPendingHit(id, "take_profit")
+		m.clearPendingHit(id, "tier1")
+		m.clearPendingHit(id, "tier2")
+		m.clearPendingHit(id, "tier3")
+	}
+}
+
+func (m *Manager) retryPendingAutoCloses(openIDs map[int]struct{}) {
+	if len(openIDs) == 0 {
+		return
+	}
+	ctx := context.Background()
+	now := time.Now()
+	for id := range openIDs {
+		rec, ok := m.loadRiskRecord(ctx, id)
+		if !ok || rec.TradeID == 0 {
+			continue
+		}
+		reason := pendingReasonFromStatus(rec.Status)
+		if reason == "" {
+			continue
+		}
+		if rec.UpdatedAt.IsZero() || now.Sub(rec.UpdatedAt) < autoCloseRetryInterval {
+			continue
+		}
+		pos, ok := m.positionByID(id)
+		if !ok || pos.TradeID == 0 {
+			continue
+		}
+		logger.Warnf("freqtrade manager: %s pending trade_id=%d 超过 %s 未确认，重试强平", reason, id, autoCloseRetryInterval)
+		go m.retryForceClose(reason, pos, rec)
+	}
+}
+
+func (m *Manager) retryForceClose(reasonType string, pos Position, rec storage.RiskRecord) {
+	ctx := context.Background()
+	action := "close_long"
+	if strings.EqualFold(pos.Side, "short") {
+		action = "close_short"
+	}
+	traceID := m.ensureTrace(fmt.Sprintf("retry-%s-%d", reasonType, time.Now().UnixNano()))
+	reasoning := fmt.Sprintf("%s pending retry", strings.ToUpper(strings.TrimSpace(reasonType)))
+	dec := decision.Decision{
+		Symbol:    strings.ToUpper(pos.Symbol),
+		Action:    action,
+		Reasoning: reasoning,
+	}
+	if err := m.close(ctx, traceID, dec); err != nil {
+		logger.Warnf("freqtrade manager: %s pending 重试失败 trade_id=%d: %v", reasonType, pos.TradeID, err)
+		return
+	}
+	m.markAutoActionPending(rec, reasonType, "自动重试强平指令已发送")
 }
 
 func (m *Manager) markPositionClosed(tradeID int, symbol, side string, exitPrice, stake float64, reason string, closedAt time.Time, pnlRatio float64) Position {
@@ -1915,25 +2153,11 @@ func (m *Manager) forceClose(ctx context.Context, pos Position, reasonType strin
 		logger.Warnf("强制%s失败 trade_id=%d: %v", reasonType, pos.TradeID, err)
 		return
 	}
-	note := fmt.Sprintf("%s 触发 %.4f", strings.ToUpper(reasonType), price)
-	if prev := strings.TrimSpace(rec.TierNotes); prev != "" {
-		note = prev + " | " + note
-	}
-	rec.Source = fmt.Sprintf("%s_auto", reasonType)
-	rec.Status = fmt.Sprintf("%s_sent", reasonType)
-	rec.TierNotes = note
-	rec.RemainingRatio = 0
 	rec.Tier1Done = true
 	rec.Tier2Done = true
 	rec.Tier3Done = true
-	if strings.EqualFold(reasonType, "stop_loss") {
-		rec.StopLoss = 0
-	}
-	if strings.EqualFold(reasonType, "take_profit") {
-		rec.TakeProfit = 0
-	}
-	rec.UpdatedAt = time.Now()
-	m.recordRisk(rec)
+	note := fmt.Sprintf("%s 触发 %.4f", strings.ToUpper(reasonType), price)
+	m.markAutoActionPending(rec, reasonType, note)
 	m.notify(fmt.Sprintf("%s 已触发 ⚠️", strings.ToUpper(reasonType)),
 		fmt.Sprintf("交易ID: %d", pos.TradeID),
 		fmt.Sprintf("标的: %s", strings.ToUpper(pos.Symbol)),

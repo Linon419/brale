@@ -18,6 +18,8 @@ type WSUpdater struct {
 	// 可选：连接成功/断线回调，由上层注入以实现通知
 	OnConnected    func()
 	OnDisconnected func(error)
+	// 可选：每条行情事件的回调（用于价格缓存等）
+	OnEvent func(CandleEvent)
 
 	startOnce sync.Once
 }
@@ -67,6 +69,9 @@ func (u *WSUpdater) consume(ctx context.Context, events <-chan CandleEvent) {
 			candle := evt.Candle
 			if err := u.Update(ctx, strings.ToUpper(evt.Symbol), evt.Interval, candle); err != nil {
 				logger.Warnf("[WS] 写入 %s %s 失败: %v", evt.Symbol, evt.Interval, err)
+			}
+			if u.OnEvent != nil {
+				u.OnEvent(evt)
 			}
 		}
 	}

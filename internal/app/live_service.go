@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"strings"
+	"sync"
 	"time"
 
 	brcfg "brale/internal/config"
@@ -43,12 +44,23 @@ type LiveService struct {
 
 	freqManager *freqexec.Manager
 	visionReady bool
+
+	priceCache   map[string]cachedQuote
+	priceCacheMu sync.RWMutex
+}
+
+type cachedQuote struct {
+	quote freqexec.TierPriceQuote
+	ts    int64
 }
 
 // Run 启动实时服务，直到 ctx 取消。
 func (s *LiveService) Run(ctx context.Context) error {
 	if s == nil || s.cfg == nil {
 		return fmt.Errorf("live service not initialized")
+	}
+	if s.updater != nil {
+		s.updater.OnEvent = s.onCandleEvent
 	}
 	if s.freqManager != nil {
 		s.freqManager.StartTierWatcher(ctx, func(sym string) freqexec.TierPriceQuote {
@@ -547,6 +559,10 @@ func (s *LiveService) latestPriceQuote(ctx context.Context, symbol string) freqe
 	if s == nil || s.ks == nil {
 		return quote
 	}
+	symbol = strings.ToUpper(strings.TrimSpace(symbol))
+	if cached, ok := s.cachedQuote(symbol); ok {
+		return cached
+	}
 	interval := ""
 	if len(s.profile.EntryTimeframes) > 0 {
 		interval = s.profile.EntryTimeframes[0]
@@ -564,6 +580,44 @@ func (s *LiveService) latestPriceQuote(ctx context.Context, symbol string) freqe
 	quote.High = last.High
 	quote.Low = last.Low
 	return quote
+}
+
+func (s *LiveService) cachedQuote(symbol string) (freqexec.TierPriceQuote, bool) {
+	s.priceCacheMu.RLock()
+	cq, ok := s.priceCache[symbol]
+	s.priceCacheMu.RUnlock()
+	if !ok || (cq.quote.Last <= 0 && cq.quote.High <= 0 && cq.quote.Low <= 0) {
+		return freqexec.TierPriceQuote{}, false
+	}
+	if cq.ts <= 0 {
+		return cq.quote, true
+	}
+	if time.Since(time.UnixMilli(cq.ts)) > 30*time.Second {
+		return freqexec.TierPriceQuote{}, false
+	}
+	return cq.quote, true
+}
+
+func (s *LiveService) onCandleEvent(evt market.CandleEvent) {
+	if s == nil {
+		return
+	}
+	symbol := strings.ToUpper(strings.TrimSpace(evt.Symbol))
+	if symbol == "" {
+		return
+	}
+	c := evt.Candle
+	if c.Close <= 0 && c.High <= 0 && c.Low <= 0 {
+		return
+	}
+	ts := c.CloseTime
+	if ts == 0 {
+		ts = c.OpenTime
+	}
+	q := freqexec.TierPriceQuote{Last: c.Close, High: c.High, Low: c.Low}
+	s.priceCacheMu.Lock()
+	s.priceCache[symbol] = cachedQuote{quote: q, ts: ts}
+	s.priceCacheMu.Unlock()
 }
 
 func (s *LiveService) accountSnapshot() decision.AccountSnapshot {

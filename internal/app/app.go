@@ -248,6 +248,7 @@ func NewApp(cfg *brcfg.Config) (*App, error) {
 		lastRawJSON:         initialLastJSON,
 		freqManager:         freqManager,
 		visionReady:         visionReady,
+		priceCache:          make(map[string]cachedQuote),
 	}
 
 	var liveHTTPServe *livehttp.Server

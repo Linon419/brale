@@ -331,6 +331,7 @@ func (e *LegacyEngineAdapter) buildUserSummary(ctx context.Context, input Contex
 	JSON 每项必须包含 symbol、action、reasoning（写出 bull_score、bear_score、ATR 语境），并遵守：
 	- action 为 open_long/open_short：返回 take_profit、stop_loss（绝对价）、leverage（2–50）以及 tiers 对象（含 tier1/2/3 target 与 ratio，ratio 省略时程序默认 33%/33%/34%）。
     - 当当前有仓位时，action才可返回update_tiers，adjust_stop_loss，adjust_take_profit，不然不可返回。
+    - 只有在 Tier1 已实际成交（确认并执行平仓指令）时，才允许将止损抬到保本；未完成 Tier1 时不得因‘触达/接近’而上移止损。
 	- action 为 update_tiers：当结构或波动变化需要调整三段目标时输出，并在 tiers 对象内给出新的 target/ratio；**每个被调整的段必须同时提供 target 与 ratio**，且仅能修改未完成 (tier*_done=0) 的段位，已标注 ✅ 的段不可更改。
 	- action 为 adjust_stop_loss/adjust_take_profit：必须同时返回新的 stop_loss 与 take_profit，否则视为无效。
     - 多个动作须按逻辑顺序列出，例如先 update_tiers 再 adjust_*。

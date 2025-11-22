@@ -87,6 +87,7 @@ type FreqtradeConfig struct {
 	InsecureSkipVerify bool    `toml:"insecure_skip_verify"`
 	WebhookURL         string  `toml:"webhook_url"`
 	RiskStorePath      string  `toml:"risk_store_path"`
+	MinStopDistancePct float64 `toml:"min_stop_distance_pct"`
 }
 
 // AIConfig 包含与模型、持仓周期相关的所有设置。
@@ -763,6 +764,9 @@ func applyDefaults(c *Config) {
 	if c.Freqtrade.DefaultStakeUSD < 0 {
 		c.Freqtrade.DefaultStakeUSD = 0
 	}
+	if c.Freqtrade.MinStopDistancePct < 0 {
+		c.Freqtrade.MinStopDistancePct = 0
+	}
 }
 
 // 基础校验
@@ -861,6 +865,9 @@ func validate(c *Config) error {
 		}
 		if c.Freqtrade.DefaultLeverage < 0 {
 			return fmt.Errorf("freqtrade.default_leverage 需 >= 0")
+		}
+		if c.Freqtrade.MinStopDistancePct < 0 {
+			return fmt.Errorf("freqtrade.min_stop_distance_pct 需 >= 0")
 		}
 	}
 	if c.Trading.Mode == "" {
