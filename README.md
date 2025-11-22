@@ -22,8 +22,8 @@ Brale 是一个以 AI 决策为核心的多 Agent 量化策略工具。系统会
 如果配置中自定义了 horizon profile，则可以覆盖上述周期参数；Indicator 会自动计算所需最小样本数并驱动 `market.Warmup` 拉取更多历史。
 
 ## 参考项目
-- [nofx QuantAgent](https://github.com/nofxlabs/QuantAgent)：多 Agent 决策提示模板灵感来源，自适应 prompt 结构被 Brale 复用升级。
-- [QuantAgent Prompting](https://github.com/nofxlabs/quant-agent-prompting)：多模态指标→形态→趋势聚合的提示链条。
+- [nofx ](https://github.com/NoFxAiOS/nofx)：多 Agent 决策提示模板灵感来源，自适应 prompt 结构被 Brale 复用升级。
+- [QuantAgent Prompting](https://github.com/Y-Research-SBU/QuantAgent.git)：多模态指标→形态→趋势聚合的提示链条。
 - [freqtrade/freqtrade](https://github.com/freqtrade/freqtrade)：成熟的开源 CTA 执行引擎，Brale 通过共享策略 `configs/user_data/brale_shared_strategy.py` 与其对接。
 
 ## Docker 快速启动
