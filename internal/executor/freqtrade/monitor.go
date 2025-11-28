@@ -133,6 +133,7 @@ func (m *Manager) startPendingClose(ctx context.Context, p database.LiveOrderWit
 	tradeID := p.Order.FreqtradeID
 	symbol := strings.ToUpper(strings.TrimSpace(p.Order.Symbol))
 	side := strings.ToLower(strings.TrimSpace(p.Order.Side))
+	kindLower := strings.ToLower(strings.TrimSpace(kind))
 	if tradeID == 0 || symbol == "" || side == "" {
 		return
 	}
@@ -178,6 +179,27 @@ func (m *Manager) startPendingClose(ctx context.Context, p database.LiveOrderWit
 		Stake:          valOrZero(p.Order.StakeAmount),
 		Leverage:       valOrZero(p.Order.Leverage),
 	})
+	if kindLower == "tier1" || kindLower == "tier2" || kindLower == "tier3" {
+		target := price
+		switch kindLower {
+		case "tier1":
+			if p.Tiers.Tier1 > 0 {
+				target = p.Tiers.Tier1
+			}
+		case "tier2":
+			if p.Tiers.Tier2 > 0 {
+				target = p.Tiers.Tier2
+			}
+		case "tier3":
+			if p.Tiers.Tier3 > 0 {
+				target = p.Tiers.Tier3
+			}
+		}
+		m.notify("分段止盈触发",
+			fmt.Sprintf("交易ID: %d | 标的: %s | 方向: %s", tradeID, symbol, side),
+			fmt.Sprintf("段位: %s | 目标价: %.4f | 触发价: %.4f", strings.ToUpper(kindLower), target, price),
+		)
+	}
 	m.appendOperation(ctx, tradeID, symbol, op, map[string]any{
 		"event_type":       "CLOSING_" + strings.ToUpper(kind),
 		"price":            price,

@@ -53,9 +53,21 @@ func priceForTakeProfit(side string, quote TierPriceQuote, tp float64) (float64,
 	}
 }
 
-// priceForTierTrigger 复用止盈逻辑（tier 也是价格触达触发）。
+// priceForTierTrigger 只用最新成交价判断 tier 是否触发，避免被同根 K 线的高/低点误触。
 func priceForTierTrigger(side string, quote TierPriceQuote, target float64) (float64, bool) {
-	return priceForTakeProfit(side, quote, target)
+	if target <= 0 || quote.isEmpty() || quote.Last <= 0 {
+		return 0, false
+	}
+	switch strings.ToLower(strings.TrimSpace(side)) {
+	case "long":
+		price := quote.Last
+		return price, price >= target
+	case "short":
+		price := quote.Last
+		return price, price <= target
+	default:
+		return 0, false
+	}
 }
 
 func ratioOrDefault(val float64, def float64) float64 {
