@@ -7,7 +7,7 @@ FREQTRADE_USERDATA_ROOT := $(CURDIR)/running_log/freqtrade_data
 
 DOCKER_COMPOSE := BRALE_DATA_ROOT=$(BRALE_DATA_ROOT) FREQTRADE_USERDATA_ROOT=$(FREQTRADE_USERDATA_ROOT) docker compose
 
-.PHONY: help fmt test build run clean prepare-dirs up down logs
+.PHONY: help fmt test build run clean prepare-dirs up down logs start
 
 help:
 	@echo "可用目标："
@@ -20,6 +20,7 @@ help:
 	@echo "  make down     - docker compose down"
 	@echo "  make logs     - docker compose logs -f"
 	@echo "  make clean    - 删除 bin/"
+	@echo "  make start    - 清理 running_log、准备目录，按顺序启动 freqtrade → brale"
 
 fmt:
 	go fmt ./...
@@ -58,3 +59,33 @@ down:
 
 logs:
 	$(DOCKER_COMPOSE) logs -f
+
+start:
+	@echo "清理运行目录：$(CURDIR)/running_log"
+	sudo rm -rf $(CURDIR)/running_log
+	$(MAKE) prepare-dirs
+	@echo "构建 brale 镜像..."
+	$(DOCKER_COMPOSE) build brale
+	@echo "启动 freqtrade..."
+	$(DOCKER_COMPOSE) up -d freqtrade
+	@echo "等待 freqtrade 容器进入 running 状态..."
+	@FT_CONTAINER=`$(DOCKER_COMPOSE) ps -q freqtrade`; \
+	if [ -z "$$FT_CONTAINER" ]; then \
+		echo "freqtrade 容器未创建，启动失败"; exit 1; \
+	fi; \
+	while true; do \
+		status=$$(docker inspect -f '{{.State.Status}}' $$FT_CONTAINER 2>/dev/null); \
+		if [ "$$status" = "running" ]; then \
+			echo "freqtrade 已运行"; \
+			break; \
+		fi; \
+		if [ "$$status" = "exited" ] || [ -z "$$status" ]; then \
+			echo "freqtrade 状态异常: $$status"; \
+			$(DOCKER_COMPOSE) logs freqtrade; \
+			exit 1; \
+		fi; \
+		echo "当前状态：$$status，继续等待..."; \
+		sleep 5; \
+	done
+	@echo "启动 brale..."
+	$(DOCKER_COMPOSE) up -d brale

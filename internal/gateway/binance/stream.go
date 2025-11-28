@@ -98,16 +98,39 @@ func (c *combinedStreamsClient) AddSubscriber(stream string, buf int) <-chan []b
 
 func (c *combinedStreamsClient) BatchSubscribeKlines(symbols []string, interval string) error {
 	interval = strings.ToLower(strings.TrimSpace(interval))
-	for i := 0; i < len(symbols); i += c.batchSize {
+	streams := make([]string, 0, len(symbols))
+	for _, sym := range symbols {
+		symbol := strings.ToLower(strings.TrimSpace(sym))
+		if symbol == "" {
+			continue
+		}
+		streams = append(streams, symbol+"@kline_"+interval)
+	}
+	return c.batchSubscribeStreams(streams)
+}
+
+func (c *combinedStreamsClient) BatchSubscribeAggTrades(symbols []string) error {
+	streams := make([]string, 0, len(symbols))
+	for _, sym := range symbols {
+		symbol := strings.ToLower(strings.TrimSpace(sym))
+		if symbol == "" {
+			continue
+		}
+		streams = append(streams, symbol+"@aggTrade")
+	}
+	return c.batchSubscribeStreams(streams)
+}
+
+func (c *combinedStreamsClient) batchSubscribeStreams(streams []string) error {
+	for i := 0; i < len(streams); i += c.batchSize {
 		end := i + c.batchSize
-		if end > len(symbols) {
-			end = len(symbols)
+		if end > len(streams) {
+			end = len(streams)
 		}
-		params := make([]string, 0, end-i)
-		for _, sym := range symbols[i:end] {
-			params = append(params, strings.ToLower(sym)+"@kline_"+interval)
+		if end-i == 0 {
+			continue
 		}
-		if err := c.subscribe(params); err != nil {
+		if err := c.subscribe(streams[i:end]); err != nil {
 			return err
 		}
 		time.Sleep(100 * time.Millisecond)

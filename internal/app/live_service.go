@@ -109,6 +109,7 @@ func (s *LiveService) Run(ctx context.Context) error {
 			logger.Errorf("启动行情订阅失败: %v", err)
 		}
 	}()
+	s.startTradePriceStream(ctx)
 
 	decisionInterval := time.Duration(cfg.AI.DecisionIntervalSeconds) * time.Second
 	if decisionInterval <= 0 {
@@ -574,17 +575,81 @@ func (s *LiveService) livePositions(account decision.AccountSnapshot) []decision
 	return positions
 }
 
+func (s *LiveService) startTradePriceStream(ctx context.Context) {
+	if s == nil || s.updater == nil || s.updater.Source == nil {
+		logger.Warnf("实时成交价订阅跳过：缺少行情源")
+		return
+	}
+	active := s.cfg.Market.ResolveActiveSource()
+	opts := market.SubscribeOptions{
+		BatchSize: active.WSBatchSize,
+		Buffer:    2048,
+	}
+	stream, err := s.updater.Source.SubscribeTrades(ctx, s.symbols, opts)
+	if err != nil {
+		logger.Warnf("订阅实时成交价失败: %v", err)
+		return
+	}
+	logger.Infof("✓ 实时成交价订阅已启动 (aggTrade)")
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case ev, ok := <-stream:
+				if !ok {
+					return
+				}
+				s.handleTradePrice(ev)
+			}
+		}
+	}()
+}
+
+func (s *LiveService) handleTradePrice(ev market.TradeEvent) {
+	if s == nil {
+		return
+	}
+	price := ev.Price
+	if price <= 0 {
+		return
+	}
+	symbol := strings.ToUpper(strings.TrimSpace(ev.Symbol))
+	if symbol == "" {
+		return
+	}
+	s.lastPriceMu.Lock()
+	if s.lastPrice == nil {
+		s.lastPrice = make(map[string]float64)
+	}
+	s.lastPrice[symbol] = price
+	s.lastPriceMu.Unlock()
+
+	s.priceCacheMu.Lock()
+	cq := s.priceCache[symbol]
+	cq.quote.Last = price
+	if ev.EventTime > 0 {
+		cq.ts = ev.EventTime
+	} else if ev.TradeTime > 0 {
+		cq.ts = ev.TradeTime
+	} else {
+		cq.ts = time.Now().UnixMilli()
+	}
+	s.priceCache[symbol] = cq
+	s.priceCacheMu.Unlock()
+}
+
 func (s *LiveService) latestPrice(ctx context.Context, symbol string) float64 {
-    // 优先使用实时 lastPrice
-    symbol = strings.ToUpper(strings.TrimSpace(symbol))
-    s.lastPriceMu.RLock()
-    lp := s.lastPrice[symbol]
-    s.lastPriceMu.RUnlock()
-    if lp > 0 {
-        return lp
-    }
-    quote := s.latestPriceQuote(ctx, symbol)
-    return quote.Last
+	// 优先使用实时 lastPrice
+	symbol = strings.ToUpper(strings.TrimSpace(symbol))
+	s.lastPriceMu.RLock()
+	lp := s.lastPrice[symbol]
+	s.lastPriceMu.RUnlock()
+	if lp > 0 {
+		return lp
+	}
+	quote := s.latestPriceQuote(ctx, symbol)
+	return quote.Last
 }
 
 func (s *LiveService) latestPriceQuote(ctx context.Context, symbol string) freqexec.TierPriceQuote {
@@ -597,11 +662,12 @@ func (s *LiveService) latestPriceQuote(ctx context.Context, symbol string) freqe
 	s.lastPriceMu.RLock()
 	lp := s.lastPrice[symbol]
 	s.lastPriceMu.RUnlock()
-	if lp > 0 {
-		quote.Last = lp
-	}
 	if cached, ok := s.cachedQuote(symbol); ok {
-		return cached
+		quote = cached
+		if lp > 0 {
+			quote.Last = lp
+		}
+		return quote
 	}
 	interval := ""
 	if len(s.profile.EntryTimeframes) > 0 {
@@ -631,6 +697,9 @@ func (s *LiveService) latestPriceQuote(ctx context.Context, symbol string) freqe
 	quote.Last = last.Close
 	quote.High = last.High
 	quote.Low = last.Low
+	if lp > 0 {
+		quote.Last = lp
+	}
 	return quote
 }
 
@@ -665,16 +734,6 @@ func (s *LiveService) onCandleEvent(evt market.CandleEvent) {
 	ts := c.CloseTime
 	if ts == 0 {
 		ts = c.OpenTime
-	}
-
-	// 实时记录 lastPrice（使用收盘价作为当前价），供自动触发使用。
-	if c.Close > 0 {
-		s.lastPriceMu.Lock()
-		if s.lastPrice == nil {
-			s.lastPrice = make(map[string]float64)
-		}
-		s.lastPrice[symbol] = c.Close
-		s.lastPriceMu.Unlock()
 	}
 
 	q := freqexec.TierPriceQuote{Last: c.Close, High: c.High, Low: c.Low}

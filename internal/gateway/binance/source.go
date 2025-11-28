@@ -23,7 +23,11 @@ type Source struct {
 	mu     sync.Mutex
 	ws     *combinedStreamsClient
 	cancel context.CancelFunc
-	stats  market.SourceStats
+
+	tradeWS     *combinedStreamsClient
+	tradeCancel context.CancelFunc
+
+	stats market.SourceStats
 }
 
 func New(cfg Config) (*Source, error) {
@@ -153,6 +157,66 @@ func (s *Source) Subscribe(ctx context.Context, symbols, intervals []string, opt
 	return out, nil
 }
 
+func (s *Source) SubscribeTrades(ctx context.Context, symbols []string, opts market.SubscribeOptions) (<-chan market.TradeEvent, error) {
+	if len(symbols) == 0 {
+		return nil, fmt.Errorf("symbols are required for trade subscription")
+	}
+	batch := opts.BatchSize
+	if batch <= 0 {
+		batch = s.cfg.WSBatchSize
+	}
+	ws := newCombinedStreamsClient(s.cfg.WSBaseURL, batch)
+	ws.SetCallbacks(opts.OnConnect, opts.OnDisconnect)
+	if err := ws.Connect(); err != nil {
+		return nil, err
+	}
+
+	subCtx, cancel := context.WithCancel(ctx)
+	s.mu.Lock()
+	if s.tradeCancel != nil {
+		s.tradeCancel()
+	}
+	if s.tradeWS != nil {
+		s.tradeWS.Close()
+	}
+	s.tradeWS = ws
+	s.tradeCancel = cancel
+	s.mu.Unlock()
+
+	buffer := opts.Buffer
+	if buffer <= 0 {
+		buffer = 1024
+	}
+	out := make(chan market.TradeEvent, buffer)
+	var wg sync.WaitGroup
+	for _, sym := range symbols {
+		upper := strings.ToUpper(strings.TrimSpace(sym))
+		if upper == "" {
+			continue
+		}
+		stream := strings.ToLower(upper) + "@aggTrade"
+		sub := ws.AddSubscriber(stream, 200)
+		wg.Add(1)
+		go func(symbol string, ch <-chan []byte) {
+			defer wg.Done()
+			s.forwardAggTrade(subCtx, symbol, ch, out)
+		}(upper, sub)
+	}
+	if err := ws.BatchSubscribeAggTrades(symbols); err != nil {
+		ws.Close()
+		cancel()
+		return nil, err
+	}
+
+	go func() {
+		<-subCtx.Done()
+		ws.Close()
+		wg.Wait()
+		close(out)
+	}()
+	return out, nil
+}
+
 func (s *Source) forwardStream(ctx context.Context, symbol, interval string, stream <-chan []byte, out chan<- market.CandleEvent) {
 	for {
 		select {
@@ -187,13 +251,56 @@ func (s *Source) forwardStream(ctx context.Context, symbol, interval string, str
 	}
 }
 
+func (s *Source) forwardAggTrade(ctx context.Context, symbol string, stream <-chan []byte, out chan<- market.TradeEvent) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case msg, ok := <-stream:
+			if !ok {
+				return
+			}
+			var ev aggTradePayload
+			if err := json.Unmarshal(msg, &ev); err != nil {
+				logger.Warnf("[binance] 解码 aggTrade 帧失败: %v", err)
+				continue
+			}
+			price := ev.Price.Float()
+			if price <= 0 {
+				continue
+			}
+			event := market.TradeEvent{
+				Symbol:    symbol,
+				Price:     price,
+				Quantity:  ev.Quantity.Float(),
+				EventTime: ev.EventTime,
+				TradeTime: ev.TradeTime,
+			}
+			select {
+			case out <- event:
+			default:
+				logger.Warnf("[binance] aggTrade 事件通道已满，丢弃 %s", symbol)
+			}
+		}
+	}
+}
+
 func (s *Source) Stats() market.SourceStats {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.ws == nil {
-		return market.SourceStats{}
+	stats := market.SourceStats{}
+	if s.ws != nil {
+		stats = s.ws.Stats()
 	}
-	return s.ws.Stats()
+	if s.tradeWS != nil {
+		ts := s.tradeWS.Stats()
+		stats.Reconnects += ts.Reconnects
+		stats.SubscribeErrors += ts.SubscribeErrors
+		if stats.LastError == "" {
+			stats.LastError = ts.LastError
+		}
+	}
+	return stats
 }
 
 func (s *Source) Close() error {
@@ -206,6 +313,14 @@ func (s *Source) Close() error {
 	if s.ws != nil {
 		s.ws.Close()
 		s.ws = nil
+	}
+	if s.tradeCancel != nil {
+		s.tradeCancel()
+		s.tradeCancel = nil
+	}
+	if s.tradeWS != nil {
+		s.tradeWS.Close()
+		s.tradeWS = nil
 	}
 	return nil
 }
@@ -250,6 +365,19 @@ func toInt64Safe(row []any, idx int) int64 {
 		return 0
 	}
 	return toInt64(row[idx])
+}
+
+type aggTradePayload struct {
+	EventType  string   `json:"e"`
+	EventTime  int64    `json:"E"`
+	Symbol     string   `json:"s"`
+	TradeID    int64    `json:"a"`
+	Price      strOrNum `json:"p"`
+	Quantity   strOrNum `json:"q"`
+	FirstID    int64    `json:"f"`
+	LastID     int64    `json:"l"`
+	TradeTime  int64    `json:"T"`
+	BuyerMaker bool     `json:"m"`
 }
 
 type klineEvent struct {

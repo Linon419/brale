@@ -9,6 +9,15 @@ type CandleEvent struct {
 	Candle   Candle
 }
 
+// TradeEvent 表示实时成交价事件（例如 aggTrade）。
+type TradeEvent struct {
+	Symbol    string
+	Price     float64
+	Quantity  float64
+	EventTime int64
+	TradeTime int64
+}
+
 // SubscribeOptions 控制实时订阅行为。
 type SubscribeOptions struct {
 	BatchSize    int
@@ -30,6 +39,8 @@ type Source interface {
 	FetchHistory(ctx context.Context, symbol, interval string, limit int) ([]Candle, error)
 	// Subscribe 订阅实时 K 线，返回只读事件通道；通道关闭意味着订阅已结束。
 	Subscribe(ctx context.Context, symbols, intervals []string, opts SubscribeOptions) (<-chan CandleEvent, error)
+	// SubscribeTrades 订阅实时成交价（如 aggTrade），供策略使用真实成交价触发。
+	SubscribeTrades(ctx context.Context, symbols []string, opts SubscribeOptions) (<-chan TradeEvent, error)
 	// Stats 返回当前运行状态（若 source 不支持则返回零值）。
 	Stats() SourceStats
 	// Close 释放底层资源，例如关闭 WS 连接。

@@ -30,23 +30,17 @@ func priceForStopLoss(side string, quote TierPriceQuote, stop float64) (float64,
 	}
 }
 
-// priceForTakeProfit 返回止盈触发的参考价格（做多看高点，做空看低点）。
+// priceForTakeProfit 用最新成交价判断止盈，避免同根 K 线高/低点的误触。
 func priceForTakeProfit(side string, quote TierPriceQuote, tp float64) (float64, bool) {
 	if tp <= 0 || quote.isEmpty() || quote.Last <= 0 {
 		return 0, false
 	}
 	switch strings.ToLower(strings.TrimSpace(side)) {
 	case "long":
-		price := quote.High
-		if price <= 0 {
-			price = quote.Last
-		}
+		price := quote.Last
 		return price, price >= tp
 	case "short":
-		price := quote.Low
-		if price <= 0 {
-			price = quote.Last
-		}
+		price := quote.Last
 		return price, price <= tp
 	default:
 		return 0, false
