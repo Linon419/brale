@@ -609,6 +609,7 @@ func (m *Manager) persistLiveTiersFromDecision(ctx context.Context, tradeID int,
 		return tier, err
 	}
 	logger.Debugf("freqtrade manager: live_tiers upsert trade=%d symbol=%s", tradeID, symbol)
+	m.updateCacheOrderTiers(database.LiveOrderRecord{FreqtradeID: tradeID}, tier)
 	m.recordTierInit(ctx, tradeID, tier, reason)
 	return tier, nil
 }
