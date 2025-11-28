@@ -37,10 +37,16 @@ func priceForTakeProfit(side string, quote TierPriceQuote, tp float64) (float64,
 	}
 	switch strings.ToLower(strings.TrimSpace(side)) {
 	case "long":
-		price := quote.Last
+		price := quote.High
+		if price <= 0 {
+			price = quote.Last
+		}
 		return price, price >= tp
 	case "short":
-		price := quote.Last
+		price := quote.Low
+		if price <= 0 {
+			price = quote.Last
+		}
 		return price, price <= tp
 	default:
 		return 0, false

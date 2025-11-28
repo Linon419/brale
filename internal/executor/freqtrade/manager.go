@@ -58,15 +58,15 @@ type Manager struct {
 }
 
 const (
-	defaultTier1Ratio      = 0.33
-	defaultTier2Ratio      = 0.33
-	defaultTier3Ratio      = 0.34
-	tierWatchInterval      = 2 * time.Second
-	positionSyncInterval   = time.Minute
+	defaultTier1Ratio        = 0.33
+	defaultTier2Ratio        = 0.33
+	defaultTier3Ratio        = 0.34
+	tierWatchInterval        = 2 * time.Second
+	positionSyncInterval     = time.Minute
 	positionSyncStartupDelay = 10 * time.Second
-	hitConfirmDelay        = 2 * time.Second
-	autoCloseRetryInterval = 30 * time.Second
-	webhookContextTimeout  = 10 * time.Second
+	hitConfirmDelay          = 2 * time.Second
+	autoCloseRetryInterval   = 30 * time.Second
+	webhookContextTimeout    = 10 * time.Second
 )
 
 // Position 缓存 freqtrade 持仓信息。
@@ -95,6 +95,7 @@ func NewManager(client *Client, cfg brcfg.FreqtradeConfig, horizon string, logSt
 	} else if ps, ok := orderRec.(database.LivePositionStore); ok {
 		posStore = ps
 	}
+	initLiveOrderPnL(posStore)
 	return &Manager{
 		client:       client,
 		cfg:          cfg,
@@ -107,14 +108,24 @@ func NewManager(client *Client, cfg brcfg.FreqtradeConfig, horizon string, logSt
 		pendingDec:   make(map[string]decision.Decision),
 		tradeDec:     make(map[int]decision.Decision),
 		positions:    make(map[int]Position),
-	pendingExits: make(map[int]pendingExit),
-	horizonName:  horizon,
-	notifier:     notifier,
-	tierExec:     make(map[int]bool),
-	locker:       positionLocker,
-	missingPrice: make(map[string]bool),
-	startedAt:    time.Now(),
+		pendingExits: make(map[int]pendingExit),
+		horizonName:  horizon,
+		notifier:     notifier,
+		tierExec:     make(map[int]bool),
+		locker:       positionLocker,
+		missingPrice: make(map[string]bool),
+		startedAt:    time.Now(),
+	}
 }
+
+// initLiveOrderPnL 尝试幂等添加 pnl 列，避免旧库缺列导致写入失败。
+func initLiveOrderPnL(store database.LivePositionStore) {
+	if store == nil {
+		return
+	}
+	if err := store.AddOrderPnLColumns(); err != nil {
+		logger.Warnf("freqtrade manager: 初始化 pnl 列失败: %v", err)
+	}
 }
 
 // DecisionInput 用于执行器的输入。
@@ -418,27 +429,27 @@ func (m *Manager) Positions() []decision.PositionSnapshot {
 			holdingMs = pos.ClosedAt.Sub(pos.OpenedAt).Milliseconds()
 		}
 		snap := decision.PositionSnapshot{
-			Symbol:        strings.ToUpper(pos.Symbol),
-			Side:          strings.ToUpper(pos.Side),
-			EntryPrice:    pos.EntryPrice,
-			Quantity:      pos.Amount,
-			Stake:         pos.Stake,
-			Leverage:      pos.Leverage,
-			HoldingMs:     holdingMs,
-			PositionValue: pos.EntryPrice * pos.Amount,
-			TakeProfit:    tiers.TakeProfit,
-			StopLoss:      tiers.StopLoss,
+			Symbol:         strings.ToUpper(pos.Symbol),
+			Side:           strings.ToUpper(pos.Side),
+			EntryPrice:     pos.EntryPrice,
+			Quantity:       pos.Amount,
+			Stake:          pos.Stake,
+			Leverage:       pos.Leverage,
+			HoldingMs:      holdingMs,
+			PositionValue:  pos.EntryPrice * pos.Amount,
+			TakeProfit:     tiers.TakeProfit,
+			StopLoss:       tiers.StopLoss,
 			RemainingRatio: tiers.RemainingRatio,
-			Tier1Target:   tiers.Tier1,
-			Tier1Ratio:    tiers.Tier1Ratio,
-			Tier1Done:     tiers.Tier1Done,
-			Tier2Target:   tiers.Tier2,
-			Tier2Ratio:    tiers.Tier2Ratio,
-			Tier2Done:     tiers.Tier2Done,
-			Tier3Target:   tiers.Tier3,
-			Tier3Ratio:    tiers.Tier3Ratio,
-			Tier3Done:     tiers.Tier3Done,
-			TierNotes:     tiers.TierNotes,
+			Tier1Target:    tiers.Tier1,
+			Tier1Ratio:     tiers.Tier1Ratio,
+			Tier1Done:      tiers.Tier1Done,
+			Tier2Target:    tiers.Tier2,
+			Tier2Ratio:     tiers.Tier2Ratio,
+			Tier2Done:      tiers.Tier2Done,
+			Tier3Target:    tiers.Tier3,
+			Tier3Ratio:     tiers.Tier3Ratio,
+			Tier3Done:      tiers.Tier3Done,
+			TierNotes:      tiers.TierNotes,
 		}
 		out = append(out, snap)
 	}
@@ -501,6 +512,12 @@ func (m *Manager) PositionsForAPI(ctx context.Context, opts PositionListOptions)
 		if p.Order.EndTime != nil {
 			api.ClosedAt = timeToMillis(p.Order.EndTime)
 		}
+		if p.Order.PnLUSD != nil {
+			api.PnLUSD = *p.Order.PnLUSD
+		}
+		if p.Order.PnLRatio != nil {
+			api.PnLRatio = *p.Order.PnLRatio
+		}
 		if pos, ok := m.positions[p.Order.FreqtradeID]; ok {
 			if pos.ExitPrice > 0 {
 				api.ExitPrice = pos.ExitPrice
@@ -518,6 +535,16 @@ func (m *Manager) PositionsForAPI(ctx context.Context, opts PositionListOptions)
 				api.HoldingMs = pos.ClosedAt.Sub(pos.OpenedAt).Milliseconds()
 				api.RemainingRatio = 0
 				api.Tier1.Done, api.Tier2.Done, api.Tier3.Done = true, true, true
+			}
+		}
+		// 若 DB 中已有累计盈亏，则直接使用
+		if api.PnLUSD == 0 && p.Order.PnLUSD != nil {
+			api.PnLUSD = *p.Order.PnLUSD
+		}
+		if api.PnLRatio == 0 && p.Order.PnLRatio != nil {
+			api.PnLRatio = *p.Order.PnLRatio
+			if api.PnLUSD == 0 && api.Stake > 0 {
+				api.PnLUSD = api.PnLRatio * api.Stake
 			}
 		}
 		// CurrentPrice/ExitPrice 可结合行情或事件补充，这里以存量信息为准。

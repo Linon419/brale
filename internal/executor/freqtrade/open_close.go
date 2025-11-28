@@ -198,10 +198,9 @@ func (m *Manager) handleExit(ctx context.Context, msg WebhookMessage, event stri
 	closePrice := firstNonZero(float64(msg.CloseRate), float64(msg.OrderRate))
 	stake := float64(msg.StakeAmount)
 	closedAt := parseFreqtradeTime(msg.CloseDate)
-	pnlRatio := parseProfitRatio(msg.ProfitRatio)
 
 	logger.Debugf("freqtrade manager: exit context cache trade=%d symbol=%s side=%s cached_amount=%.6f cached_entry=%.4f", tradeID, symbol, side, pos.Amount, pos.EntryPrice)
-	m.popPendingExit(tradeID)
+	pe, _ := m.popPendingExit(tradeID)
 	traceID := m.lookupTrace(tradeID)
 	m.deleteTrace(tradeID)
 
@@ -272,6 +271,14 @@ func (m *Manager) handleExit(ctx context.Context, msg WebhookMessage, event stri
 		rawData = rawData + "\n" + exitRaw
 	}
 
+	pnlRatio := parseProfitRatio(msg.ProfitRatio)
+	pnlUSD := 0.0
+	if val := parseAnyFloat(msg.ProfitAbs); val != 0 {
+		pnlUSD = val
+	} else if pnlRatio != 0 && stake > 0 {
+		pnlUSD = pnlRatio * stake
+	}
+
 	updatedOrder := database.LiveOrderRecord{
 		FreqtradeID:   tradeID,
 		Symbol:        strings.ToUpper(symbol),
@@ -290,9 +297,17 @@ func (m *Manager) handleExit(ctx context.Context, msg WebhookMessage, event stri
 		CreatedAt:     orderRec.CreatedAt,
 		UpdatedAt:     now,
 		RawData:       rawData,
+		PnLRatio:      ptrFloat(pnlRatio),
+		PnLUSD:        ptrFloat(pnlUSD),
 	}
 	if updatedOrder.StakeAmount == nil && stake > 0 {
 		updatedOrder.StakeAmount = ptrFloat(stake)
+	}
+	if pnlRatio != 0 {
+		updatedOrder.PnLRatio = ptrFloat(pnlRatio)
+	}
+	if pnlUSD != 0 {
+		updatedOrder.PnLUSD = ptrFloat(pnlUSD)
 	}
 	if updatedOrder.CreatedAt.IsZero() {
 		updatedOrder.CreatedAt = now
@@ -303,6 +318,9 @@ func (m *Manager) handleExit(ctx context.Context, msg WebhookMessage, event stri
 	}
 	if newStatus == database.LiveOrderStatusClosed {
 		updatedOrder.EndTime = &endTs
+	}
+	if newStatus == database.LiveOrderStatusClosed {
+		updatedOrder.Amount = ptrFloat(0)
 	}
 
 	if tierRec.FreqtradeID == 0 {
@@ -321,6 +339,41 @@ func (m *Manager) handleExit(ctx context.Context, msg WebhookMessage, event stri
 			tierRec.Status = 0
 		}
 		tierRec.Timestamp = now
+	} else if pe.Kind != "" {
+		prevRemain := tierRec.RemainingRatio
+		if prevRemain <= 0 {
+			prevRemain = 1
+		}
+		fill := fill
+		prevAmt := prevAmount
+		if prevAmt > 0 {
+			ratio := math.Min(1, fill/prevAmt)
+			ratio = math.Max(0, ratio)
+			prevRemain = tierRec.RemainingRatio
+			if prevRemain <= 0 {
+				prevRemain = 1
+			}
+			tierRec.RemainingRatio = math.Max(0, prevRemain-ratio)
+		}
+		switch strings.ToLower(pe.Kind) {
+		case "tier1":
+			tierRec.Tier1Done = true
+			if pe.EntryPrice > 0 {
+				tierRec.StopLoss = pe.EntryPrice
+			}
+		case "tier2":
+			tierRec.Tier2Done = true
+		case "tier3":
+			tierRec.Tier3Done = true
+		case "take_profit":
+			tierRec.Tier1Done, tierRec.Tier2Done, tierRec.Tier3Done = true, true, true
+			tierRec.RemainingRatio = 0
+			tierRec.Status = 1
+		case "stop_loss":
+			tierRec.Tier1Done, tierRec.Tier2Done, tierRec.Tier3Done = true, true, true
+			tierRec.RemainingRatio = 0
+			tierRec.Status = 2
+		}
 	}
 	tierRec.UpdatedAt = now
 	if tierRec.CreatedAt.IsZero() {
@@ -339,7 +392,7 @@ func (m *Manager) handleExit(ctx context.Context, msg WebhookMessage, event stri
 	if newStatus == database.LiveOrderStatusClosed {
 		closedPos := m.markPositionClosed(tradeID, symbol, side, closePrice, stake, msg.ExitReason, endTs, pnlRatio)
 		closedPos.Amount = 0
-		closedPos.ExitPnLUSD = pnlRatio * stake
+		closedPos.ExitPnLUSD = pnlUSD
 		m.mu.Lock()
 		m.positions[tradeID] = closedPos
 		m.mu.Unlock()
@@ -353,6 +406,8 @@ func (m *Manager) handleExit(ctx context.Context, msg WebhookMessage, event stri
 		cur.Side = side
 		cur.Amount = newAmount
 		cur.Stake = stake
+		cur.ExitPnLRatio += pnlRatio
+		cur.ExitPnLUSD += pnlUSD
 		m.positions[tradeID] = cur
 		m.mu.Unlock()
 	}
@@ -373,6 +428,8 @@ func (m *Manager) handleExit(ctx context.Context, msg WebhookMessage, event stri
 		"closed":     fill,
 		"remaining":  newAmount,
 		"status":     statusText(newStatus),
+		"pnl_ratio":  pnlRatio,
+		"pnl_usd":    pnlUSD,
 	})
 
 	m.logWebhook(ctx, traceID, tradeID, symbol, event, msg)

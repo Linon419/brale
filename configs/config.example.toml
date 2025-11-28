@@ -115,7 +115,7 @@ timeout_seconds = 15
 insecure_skip_verify = false
 webhook_url = "http://brale:9991/api/live/freqtrade/webhook"
 risk_store_path = "/data/db/trade_risk.db"
-min_stop_distance_pct = 0.005             # 开仓验证时的最小止损距离（比例）
+min_stop_distance_pct = 0.001             # 开仓验证时的最小止损距离（比例）
 
 [advanced]
 liquidity_filter_usd_m = 15

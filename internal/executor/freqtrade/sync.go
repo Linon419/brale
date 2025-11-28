@@ -320,6 +320,13 @@ func (m *Manager) SyncOpenPositions(ctx context.Context) (int, error) {
 			_ = m.posRepo.SavePosition(ctx, order, tier)
 			m.updateCacheOrderTiers(order, tier)
 			logger.Debugf("freqtrade sync: reconcile close ghost trade=%d symbol=%s closed_amount=%.6f reason=freqtrade_missing", tradeID, order.Symbol, valOrZero(order.ClosedAmount))
+			// 同时更新内存缓存，避免残留 open。
+			m.mu.Lock()
+			pos := m.positions[tradeID]
+			pos.Closed = true
+			pos.ClosedAt = now
+			m.positions[tradeID] = pos
+			m.mu.Unlock()
 			m.notifyReconcileClosed(order, tier)
 		}()
 	}

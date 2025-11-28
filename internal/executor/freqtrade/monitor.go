@@ -158,140 +158,10 @@ func (m *Manager) startPendingClose(ctx context.Context, p database.LiveOrderWit
 		return
 	}
 
-	closeRatioOnCurrent := math.Min(1, effectiveRatio/remainingRatio)
-	closeQty := currAmount * closeRatioOnCurrent
-	if closeQty <= 0 {
-		return
-	}
-	entry := valOrZero(p.Order.Price)
 	now := time.Now()
-
-	if m.posRepo == nil {
-		return
-	}
-
-	tier := p.Tiers
-	originalSL := tier.StopLoss
-	tier.IsPlaceholder = false
-	tier.Timestamp = now
-	tier.UpdatedAt = now
-
-	slAdjusted := false
-	switch strings.ToLower(kind) {
-	case "stop_loss":
-		tier.Tier1Done, tier.Tier2Done, tier.Tier3Done = true, true, true
-		tier.RemainingRatio = 0
-		tier.Status = 2
-	case "take_profit":
-		tier.Tier1Done, tier.Tier2Done, tier.Tier3Done = true, true, true
-		tier.RemainingRatio = 0
-		tier.Status = 1
-	case "tier1":
-		tier.Tier1Done = true
-		tier.Status = 3
-		if entry > 0 && !floatEqual(tier.StopLoss, entry) {
-			tier.StopLoss = entry
-			slAdjusted = true
-		}
-		tier.RemainingRatio = math.Max(0, remainingRatio-effectiveRatio)
-	case "tier2":
-		tier.Tier2Done = true
-		tier.Status = 4
-		tier.RemainingRatio = math.Max(0, remainingRatio-effectiveRatio)
-	case "tier3":
-		tier.Tier3Done = true
-		tier.Status = 5
-		tier.RemainingRatio = math.Max(0, remainingRatio-effectiveRatio)
-	}
-	if tier.Tier3 > 0 && !floatEqual(tier.TakeProfit, tier.Tier3) {
-		tier.TakeProfit = tier.Tier3
-	}
-	fullClose := tier.RemainingRatio <= 0.00001 || closeRatioOnCurrent >= 0.999
-	if strings.EqualFold(kind, "stop_loss") || strings.EqualFold(kind, "take_profit") {
-		fullClose = true
-	}
-	if fullClose {
-		closeRatioOnCurrent = 1
-		closeQty = currAmount
-		tier.Tier1Done, tier.Tier2Done, tier.Tier3Done = true, true, true
-		if strings.EqualFold(kind, "stop_loss") {
-			tier.Status = 2
-		}
-		if strings.EqualFold(kind, "take_profit") {
-			tier.Status = 1
-		}
-		tier.RemainingRatio = 0
-	}
-
-	closingStatus := database.LiveOrderStatusClosingPartial
-	if fullClose {
-		closingStatus = database.LiveOrderStatusClosingFull
-	}
-
-	order := database.LiveOrderRecord{
-		FreqtradeID:   tradeID,
-		Symbol:        symbol,
-		Side:          side,
-		Amount:        p.Order.Amount,
-		InitialAmount: p.Order.InitialAmount,
-		StakeAmount:   p.Order.StakeAmount,
-		Leverage:      p.Order.Leverage,
-		PositionValue: p.Order.PositionValue,
-		Price:         p.Order.Price,
-		ClosedAmount:  p.Order.ClosedAmount,
-		IsSimulated:   p.Order.IsSimulated,
-		Status:        closingStatus,
-		StartTime:     p.Order.StartTime,
-		EndTime:       nil,
-		CreatedAt:     p.Order.CreatedAt,
-		UpdatedAt:     now,
-		RawData:       p.Order.RawData,
-	}
-	if order.CreatedAt.IsZero() {
-		order.CreatedAt = now
-	}
-	if order.StartTime == nil || order.StartTime.IsZero() {
-		tmp := now
-		order.StartTime = &tmp
-	}
-	if tier.FreqtradeID == 0 {
-		tier.FreqtradeID = tradeID
-	}
-	if strings.TrimSpace(tier.Symbol) == "" {
-		tier.Symbol = symbol
-	}
-
-	if err := m.posRepo.SavePosition(ctx, order, tier); err != nil {
-		m.appendOperation(ctx, tradeID, symbol, database.OperationFailed, map[string]any{
-			"event_type": strings.ToUpper(kind),
-			"price":      price,
-			"ratio":      effectiveRatio,
-			"error":      err.Error(),
-		})
-		m.notify("自动平仓写入失败 ❌",
-			fmt.Sprintf("交易ID: %d", tradeID),
-			fmt.Sprintf("标的: %s", symbol),
-			fmt.Sprintf("事件: %s", strings.ToUpper(kind)),
-			fmt.Sprintf("错误: %v", err),
-		)
-		return
-	}
-	logger.Infof("freqtrade tier trigger trade=%d symbol=%s kind=%s price=%.4f ratio=%.4f close_qty=%.4f", tradeID, symbol, kind, price, effectiveRatio, closeQty)
-
-	if slAdjusted {
-		m.posRepo.InsertModification(ctx, database.TierModificationLog{
-			FreqtradeID: tradeID,
-			Field:       database.TierFieldStopLoss,
-			OldValue:    formatPrice(originalSL),
-			NewValue:    formatPrice(tier.StopLoss),
-			Source:      3,
-			Reason:      "价格到达 tier1，上移止损到入场价",
-			Timestamp:   now,
-		})
-	}
-
-	m.updateCacheOrderTiers(order, tier)
-	expectedAmount := math.Max(0, currAmount-closeQty)
+	entry := valOrZero(p.Order.Price)
+	closeQty := currAmount * math.Min(1, effectiveRatio/remainingRatio)
+	expectedAmount := math.Max(0, currAmount-(currAmount*effectiveRatio/remainingRatio))
 	m.addPendingExit(pendingExit{
 		TradeID:        tradeID,
 		Symbol:         symbol,
@@ -314,20 +184,19 @@ func (m *Manager) startPendingClose(ctx context.Context, p database.LiveOrderWit
 		"close_ratio":      effectiveRatio,
 		"close_quantity":   closeQty,
 		"expected_amount":  expectedAmount,
-		"remaining_ratio":  tier.RemainingRatio,
-		"status":           statusText(order.Status),
+		"remaining_ratio":  p.Tiers.RemainingRatio,
 		"side":             side,
 		"stake":            valOrZero(p.Order.StakeAmount),
 		"leverage":         valOrZero(p.Order.Leverage),
 		"entry_price":      entry,
-		"take_profit":      tier.TakeProfit,
-		"stop_loss":        tier.StopLoss,
-		"tier1/2/3_done":   fmt.Sprintf("%v/%v/%v", tier.Tier1Done, tier.Tier2Done, tier.Tier3Done),
-		"tier1/2/3_target": fmt.Sprintf("%.4f/%.4f/%.4f", tier.Tier1, tier.Tier2, tier.Tier3),
+		"take_profit":      p.Tiers.TakeProfit,
+		"stop_loss":        p.Tiers.StopLoss,
+		"tier1/2/3_done":   fmt.Sprintf("%v/%v/%v", p.Tiers.Tier1Done, p.Tiers.Tier2Done, p.Tiers.Tier3Done),
+		"tier1/2/3_target": fmt.Sprintf("%.4f/%.4f/%.4f", p.Tiers.Tier1, p.Tiers.Tier2, p.Tiers.Tier3),
 	})
 
 	payload := ForceExitPayload{TradeID: fmt.Sprintf("%d", tradeID)}
-	if closingStatus == database.LiveOrderStatusClosingPartial && closeQty > 0 {
+	if closeQty > 0 {
 		payload.Amount = closeQty
 	}
 	if m.client != nil {

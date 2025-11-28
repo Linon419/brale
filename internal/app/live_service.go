@@ -47,6 +47,8 @@ type LiveService struct {
 
 	priceCache   map[string]cachedQuote
 	priceCacheMu sync.RWMutex
+	lastPrice    map[string]float64
+	lastPriceMu  sync.RWMutex
 }
 
 type cachedQuote struct {
@@ -573,8 +575,16 @@ func (s *LiveService) livePositions(account decision.AccountSnapshot) []decision
 }
 
 func (s *LiveService) latestPrice(ctx context.Context, symbol string) float64 {
-	quote := s.latestPriceQuote(ctx, symbol)
-	return quote.Last
+    // 优先使用实时 lastPrice
+    symbol = strings.ToUpper(strings.TrimSpace(symbol))
+    s.lastPriceMu.RLock()
+    lp := s.lastPrice[symbol]
+    s.lastPriceMu.RUnlock()
+    if lp > 0 {
+        return lp
+    }
+    quote := s.latestPriceQuote(ctx, symbol)
+    return quote.Last
 }
 
 func (s *LiveService) latestPriceQuote(ctx context.Context, symbol string) freqexec.TierPriceQuote {
@@ -583,6 +593,13 @@ func (s *LiveService) latestPriceQuote(ctx context.Context, symbol string) freqe
 		return quote
 	}
 	symbol = strings.ToUpper(strings.TrimSpace(symbol))
+	// 带上 lastPrice
+	s.lastPriceMu.RLock()
+	lp := s.lastPrice[symbol]
+	s.lastPriceMu.RUnlock()
+	if lp > 0 {
+		quote.Last = lp
+	}
 	if cached, ok := s.cachedQuote(symbol); ok {
 		return cached
 	}
@@ -649,6 +666,17 @@ func (s *LiveService) onCandleEvent(evt market.CandleEvent) {
 	if ts == 0 {
 		ts = c.OpenTime
 	}
+
+	// 实时记录 lastPrice（使用收盘价作为当前价），供自动触发使用。
+	if c.Close > 0 {
+		s.lastPriceMu.Lock()
+		if s.lastPrice == nil {
+			s.lastPrice = make(map[string]float64)
+		}
+		s.lastPrice[symbol] = c.Close
+		s.lastPriceMu.Unlock()
+	}
+
 	q := freqexec.TierPriceQuote{Last: c.Close, High: c.High, Low: c.Low}
 	s.priceCacheMu.Lock()
 	s.priceCache[symbol] = cachedQuote{quote: q, ts: ts}

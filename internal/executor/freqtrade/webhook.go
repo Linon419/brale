@@ -22,6 +22,7 @@ type WebhookMessage struct {
 	ExitReason  string       `json:"exit_reason"`
 	Reason      string       `json:"reason"`
 	ProfitRatio interface{}  `json:"profit_ratio"`
+	ProfitAbs   interface{}  `json:"profit_abs"`
 	IsFinalExit *bool        `json:"is_final_exit"`
 	OpenDate    string       `json:"open_date"`
 	CloseDate   string       `json:"close_date"`

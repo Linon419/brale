@@ -24,6 +24,7 @@ type LivePositionStore interface {
 	ListRecentPositions(ctx context.Context, limit int) ([]LiveOrderWithTiers, error)
 	ListRecentPositionsPaged(ctx context.Context, symbol string, limit int, offset int) ([]LiveOrderWithTiers, error)
 	CountRecentPositions(ctx context.Context, symbol string) (int, error)
+	AddOrderPnLColumns() error
 }
 
 var _ LivePositionStore = (*DecisionLogStore)(nil)
@@ -64,6 +65,8 @@ type LiveOrderRecord struct {
 	RawData       string
 	CreatedAt     time.Time
 	UpdatedAt     time.Time
+	PnLRatio      *float64
+	PnLUSD        *float64
 }
 
 // LiveTierRecord 表示 live_tiers 表的记录。
@@ -195,6 +198,8 @@ func (s *DecisionLogStore) upsertLiveOrderWithExec(ctx context.Context, exec exe
 	}
 	price := nullableFloat(rec.Price)
 	closed := nullableFloat(rec.ClosedAmount)
+	pnlRatio := nullableFloat(rec.PnLRatio)
+	pnlUSD := nullableFloat(rec.PnLUSD)
 	startTs := timeToMillisPtr(rec.StartTime)
 	endTs := timeToMillisPtr(rec.EndTime)
 	rawData := strings.TrimSpace(rec.RawData)
@@ -204,9 +209,9 @@ func (s *DecisionLogStore) upsertLiveOrderWithExec(ctx context.Context, exec exe
 	_, err := exec.ExecContext(ctx, `
 		INSERT INTO live_orders
 			(freqtrade_id, symbol, side, amount, initial_amount, stake_amount, leverage, position_value,
-			 price, closed_amount, is_simulated, status, start_timestamp, end_timestamp,
+			 price, closed_amount, pnl_ratio, pnl_usd, is_simulated, status, start_timestamp, end_timestamp,
 			 raw_data, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(freqtrade_id) DO UPDATE SET
 			symbol=COALESCE(excluded.symbol, live_orders.symbol),
 			side=COALESCE(excluded.side, live_orders.side),
@@ -217,6 +222,8 @@ func (s *DecisionLogStore) upsertLiveOrderWithExec(ctx context.Context, exec exe
 			position_value=COALESCE(excluded.position_value, live_orders.position_value),
 			price=COALESCE(excluded.price, live_orders.price),
 			closed_amount=COALESCE(excluded.closed_amount, live_orders.closed_amount),
+			pnl_ratio=COALESCE(excluded.pnl_ratio, live_orders.pnl_ratio),
+			pnl_usd=COALESCE(excluded.pnl_usd, live_orders.pnl_usd),
 			is_simulated=COALESCE(excluded.is_simulated, live_orders.is_simulated),
 			status=COALESCE(excluded.status, live_orders.status),
 			start_timestamp=COALESCE(excluded.start_timestamp, live_orders.start_timestamp),
@@ -224,7 +231,7 @@ func (s *DecisionLogStore) upsertLiveOrderWithExec(ctx context.Context, exec exe
 			raw_data=COALESCE(NULLIF(excluded.raw_data, ''), live_orders.raw_data),
 			updated_at=excluded.updated_at;
 	`, rec.FreqtradeID, symbol, side, amount, initialAmount, stake, leverage, posVal, price,
-		closed, isSim, int(status), startTs, endTs, nullIfEmptyString(rawData),
+		closed, pnlRatio, pnlUSD, isSim, int(status), startTs, endTs, nullIfEmptyString(rawData),
 		rec.CreatedAt.UnixMilli(), rec.UpdatedAt.UnixMilli())
 	return err
 }
@@ -528,7 +535,7 @@ func (s *DecisionLogStore) GetLivePosition(ctx context.Context, freqtradeID int)
 	}
 	row := db.QueryRowContext(ctx, `
 		SELECT o.freqtrade_id, o.symbol, o.side, o.amount, o.initial_amount, o.stake_amount, o.leverage, o.position_value,
-		       o.price, o.closed_amount, o.is_simulated, o.status, o.start_timestamp, o.end_timestamp, o.raw_data,
+		       o.price, o.closed_amount, o.pnl_ratio, o.pnl_usd, o.is_simulated, o.status, o.start_timestamp, o.end_timestamp, o.raw_data,
 		       o.created_at, o.updated_at,
 		       t.take_profit, t.stop_loss, t.tier1, t.tier1_ratio, t.tier1_done,
 		       t.tier2, t.tier2_ratio, t.tier2_done, t.tier3, t.tier3_ratio, t.tier3_done,
@@ -562,12 +569,14 @@ func (s *DecisionLogStore) GetLivePosition(ctx context.Context, freqtradeID int)
 		oPosVal                sql.NullFloat64
 		oPrice                 sql.NullFloat64
 		oClosed                sql.NullFloat64
+		oPnLRatio              sql.NullFloat64
+		oPnLUSD                sql.NullFloat64
 		oCreated               sql.NullInt64
 		oUpdated               sql.NullInt64
 	)
 	if err := row.Scan(
 		&o.FreqtradeID, &o.Symbol, &o.Side, &oAmount, &oInitial, &oStake, &oLeverage, &oPosVal,
-		&oPrice, &oClosed, &isSim, &o.Status, &startTs, &endTs, &rawData, &oCreated, &oUpdated,
+		&oPrice, &oClosed, &oPnLRatio, &oPnLUSD, &isSim, &o.Status, &startTs, &endTs, &rawData, &oCreated, &oUpdated,
 		&tTakeProfit, &tStopLoss, &tTier1, &tTier1Ratio, &tTier1Done,
 		&tTier2, &tTier2Ratio, &tTier2Done, &tTier3, &tTier3Ratio, &tTier3Done,
 		&tRemain, &tStatus, &tSource, &tReason, &tTierNotes, &tPlaceholder, &tEvent, &tUpdated, &tCreated,
@@ -626,6 +635,14 @@ func (s *DecisionLogStore) GetLivePosition(ctx context.Context, freqtradeID int)
 		v := oClosed.Float64
 		o.ClosedAmount = &v
 	}
+	if oPnLRatio.Valid {
+		v := oPnLRatio.Float64
+		o.PnLRatio = &v
+	}
+	if oPnLUSD.Valid {
+		v := oPnLUSD.Float64
+		o.PnLUSD = &v
+	}
 	tier.FreqtradeID = o.FreqtradeID
 	tier.Symbol = strings.ToUpper(strings.TrimSpace(o.Symbol))
 	tier.TakeProfit = tTakeProfit.Float64
@@ -672,7 +689,7 @@ func (s *DecisionLogStore) ListActivePositions(ctx context.Context, limit int) (
 	}
 	rows, err := db.QueryContext(ctx, `
 		SELECT o.freqtrade_id, o.symbol, o.side, o.amount, o.initial_amount, o.stake_amount, o.leverage, o.position_value,
-		       o.price, o.closed_amount, o.is_simulated, o.status, o.start_timestamp, o.end_timestamp, o.raw_data,
+		       o.price, o.closed_amount, o.pnl_ratio, o.pnl_usd, o.is_simulated, o.status, o.start_timestamp, o.end_timestamp, o.raw_data,
 		       o.created_at, o.updated_at,
 		       t.take_profit, t.stop_loss, t.tier1, t.tier1_ratio, t.tier1_done,
 		       t.tier2, t.tier2_ratio, t.tier2_done, t.tier3, t.tier3_ratio, t.tier3_done,
@@ -726,7 +743,7 @@ func (s *DecisionLogStore) ListRecentPositionsPaged(ctx context.Context, symbol 
 	}
 	rows, err := db.QueryContext(ctx, `
 		SELECT o.freqtrade_id, o.symbol, o.side, o.amount, o.initial_amount, o.stake_amount, o.leverage, o.position_value,
-		       o.price, o.closed_amount, o.is_simulated, o.status, o.start_timestamp, o.end_timestamp, o.raw_data,
+		       o.price, o.closed_amount, o.pnl_ratio, o.pnl_usd, o.is_simulated, o.status, o.start_timestamp, o.end_timestamp, o.raw_data,
 		       o.created_at, o.updated_at,
 		       t.take_profit, t.stop_loss, t.tier1, t.tier1_ratio, t.tier1_done,
 		       t.tier2, t.tier2_ratio, t.tier2_done, t.tier3, t.tier3_ratio, t.tier3_done,
@@ -802,10 +819,12 @@ func scanLivePositionRow(rows *sql.Rows) (LiveOrderWithTiers, error) {
 		oPosVal                sql.NullFloat64
 		oPrice                 sql.NullFloat64
 		oClosed                sql.NullFloat64
+		oPnLRatio              sql.NullFloat64
+		oPnLUSD                sql.NullFloat64
 	)
 	if err := rows.Scan(
 		&o.FreqtradeID, &o.Symbol, &o.Side, &oAmount, &oInitial, &oStake, &oLeverage, &oPosVal,
-		&oPrice, &oClosed, &isSim, &o.Status, &startTs, &endTs, &rawData, &oCreated, &oUpdated,
+		&oPrice, &oClosed, &oPnLRatio, &oPnLUSD, &isSim, &o.Status, &startTs, &endTs, &rawData, &oCreated, &oUpdated,
 		&tTakeProfit, &tStopLoss, &tTier1, &tTier1Ratio, &tTier1Done,
 		&tTier2, &tTier2Ratio, &tTier2Done, &tTier3, &tTier3Ratio, &tTier3Done,
 		&tRemain, &tStatus, &tSource, &tReason, &tTierNotes, &tPlaceholder, &tEvent, &tUpdated, &tCreated,
@@ -860,6 +879,14 @@ func scanLivePositionRow(rows *sql.Rows) (LiveOrderWithTiers, error) {
 	if oClosed.Valid {
 		v := oClosed.Float64
 		o.ClosedAmount = &v
+	}
+	if oPnLRatio.Valid {
+		v := oPnLRatio.Float64
+		o.PnLRatio = &v
+	}
+	if oPnLUSD.Valid {
+		v := oPnLUSD.Float64
+		o.PnLUSD = &v
 	}
 	tier.FreqtradeID = o.FreqtradeID
 	tier.Symbol = strings.ToUpper(strings.TrimSpace(o.Symbol))

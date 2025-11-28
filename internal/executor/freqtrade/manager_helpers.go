@@ -192,6 +192,102 @@ func (m *Manager) findActiveTrade(symbol string) (tradeID int, side string, pos 
 	return 0, "", Position{}, false
 }
 
+// reconcileGhostClose 将本地遗留的幽灵仓位标记为已平仓。
+func (m *Manager) reconcileGhostClose(ctx context.Context, symbol, side string) {
+	if m == nil || m.posRepo == nil {
+		return
+	}
+	symbol = strings.ToUpper(strings.TrimSpace(symbol))
+	side = strings.ToLower(strings.TrimSpace(side))
+	if symbol == "" || side == "" {
+		return
+	}
+	tradeID, repoSide, pos, ok := m.findActiveTrade(symbol)
+	if !ok {
+		logger.Warnf("freqtrade manager: ghost close skipped symbol=%s side=%s not found", symbol, side)
+		return
+	}
+	if repoSide != "" {
+		side = repoSide
+	}
+	lock := getPositionLock(tradeID)
+	lock.Lock()
+	defer lock.Unlock()
+
+	var (
+		order database.LiveOrderRecord
+		tier  database.LiveTierRecord
+	)
+	if o, t, found, err := m.posRepo.GetPosition(ctx, tradeID); err == nil && found {
+		order, tier = o, t
+	}
+	now := time.Now()
+	if order.FreqtradeID == 0 {
+		order.FreqtradeID = tradeID
+		order.Symbol = symbol
+		order.Side = side
+		order.CreatedAt = now
+	}
+	if strings.TrimSpace(order.Symbol) == "" {
+		order.Symbol = symbol
+	}
+	if strings.TrimSpace(order.Side) == "" {
+		order.Side = side
+	}
+	if order.CreatedAt.IsZero() {
+		order.CreatedAt = now
+	}
+	order.UpdatedAt = now
+	if order.StartTime == nil || order.StartTime.IsZero() {
+		t := pos.OpenedAt
+		if t.IsZero() {
+			t = now
+		}
+		order.StartTime = &t
+	}
+	if order.Price == nil && pos.EntryPrice > 0 {
+		order.Price = ptrFloat(pos.EntryPrice)
+	}
+	if order.StakeAmount == nil && pos.Stake > 0 {
+		order.StakeAmount = ptrFloat(pos.Stake)
+	}
+	closedAmt := valOrZero(order.ClosedAmount)
+	if closedAmt <= 0 {
+		if amt := valOrZero(order.Amount); amt > 0 {
+			closedAmt = amt
+		} else if pos.Amount > 0 {
+			closedAmt = pos.Amount
+		}
+	}
+	order.Amount = ptrFloat(0)
+	order.ClosedAmount = ptrFloat(closedAmt)
+	order.Status = database.LiveOrderStatusClosed
+	if order.EndTime == nil || order.EndTime.IsZero() {
+		end := now
+		order.EndTime = &end
+	}
+
+	if tier.FreqtradeID == 0 {
+		tier = buildPlaceholderTiers(tradeID, order.Symbol)
+	}
+	tier.UpdatedAt = now
+	if tier.Timestamp.IsZero() {
+		tier.Timestamp = now
+	}
+	if tier.CreatedAt.IsZero() {
+		tier.CreatedAt = now
+	}
+
+	if err := m.posRepo.SavePosition(ctx, order, tier); err != nil {
+		logger.Warnf("freqtrade manager: 关闭幽灵仓失败 trade=%d symbol=%s err=%v", tradeID, order.Symbol, err)
+	} else {
+		m.updateCacheOrderTiers(order, tier)
+	}
+	m.deleteTrade(order.Symbol, side)
+	m.markPositionClosed(tradeID, order.Symbol, side, valOrZero(order.Price), valOrZero(order.StakeAmount), "ghost_close", now, 0)
+	m.notifyReconcileClosed(order, tier)
+}
+
 // markPositionClosed 更新内存缓存。
 func (m *Manager) markPositionClosed(tradeID int, symbol, side string, closePrice, stake float64, reason string, closedAt time.Time, pnlRatio float64) Position {
 	m.mu.Lock()

@@ -84,7 +84,9 @@ func (m *Manager) forceExit(ctx context.Context, traceID string, d decision.Deci
 	}
 	tradeID, ok := m.lookupTrade(d.Symbol, side)
 	if !ok {
-		return tradeNotFoundError{Symbol: d.Symbol, Side: side}
+		// freqtrade 无仓位时视为本地幽灵仓，标记已平。
+		m.reconcileGhostClose(ctx, d.Symbol, side)
+		return nil
 	}
 	logger.Infof("freqtrade manager: ForceExit trace=%s symbol=%s side=%s trade_id=%d ratio=%.4f", m.ensureTrace(traceID), strings.ToUpper(d.Symbol), side, tradeID, clampCloseRatio(d.CloseRatio))
 	payload := ForceExitPayload{TradeID: fmt.Sprintf("%d", tradeID)}
