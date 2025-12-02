@@ -17,3 +17,9 @@ AGENTS.md
 data/
 .gocache/
 .gomodcache/
+
+freqtrade-config.json
+
+config.toml
+
+base.toml
