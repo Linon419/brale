@@ -2,7 +2,9 @@ package freqtrade
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"strconv"
@@ -322,6 +324,78 @@ func peTiersFromCache(m *Manager, tradeID int) database.LiveTierRecord {
 	return database.LiveTierRecord{}
 }
 
+func (m *Manager) cachedOrderStatus(tradeID int) (database.LiveOrderStatus, bool) {
+	if m == nil {
+		return 0, false
+	}
+	m.posCacheMu.RLock()
+	defer m.posCacheMu.RUnlock()
+	if m.posCache == nil {
+		return 0, false
+	}
+	if p, ok := m.posCache[tradeID]; ok {
+		return p.Order.Status, true
+	}
+	return 0, false
+}
+
+func (m *Manager) updateOrderStatus(ctx context.Context, tradeID int, symbol, side string, status database.LiveOrderStatus) {
+	if m == nil || m.posRepo == nil || tradeID <= 0 {
+		return
+	}
+	symbol = strings.ToUpper(strings.TrimSpace(symbol))
+	side = strings.ToLower(strings.TrimSpace(side))
+	if symbol == "" || side == "" {
+		return
+	}
+	now := time.Now()
+	if err := m.posRepo.UpdateOrderStatus(ctx, tradeID, status); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			order, _, ok, getErr := m.posRepo.GetPosition(ctx, tradeID)
+			if getErr != nil || !ok {
+				if getErr != nil {
+					logger.Warnf("freqtrade manager: 更新仓位状态失败 trade=%d status=%s err=%v", tradeID, statusText(status), getErr)
+				} else {
+					logger.Warnf("freqtrade manager: 更新仓位状态失败 trade=%d status=%s err=record_not_found", tradeID, statusText(status))
+				}
+				m.notify("自动平仓状态更新失败 ⚠️",
+					fmt.Sprintf("交易ID: %d", tradeID),
+					fmt.Sprintf("目标状态: %s", statusText(status)),
+					"原因: 找不到对应 live_order 记录，已跳过，请检查数据库。",
+				)
+				return
+			}
+			order.Status = status
+			order.UpdatedAt = now
+			if upErr := m.posRepo.UpsertOrder(ctx, order); upErr != nil {
+				logger.Warnf("freqtrade manager: 回退写入仓位状态失败 trade=%d status=%s err=%v", tradeID, statusText(status), upErr)
+				m.notify("自动平仓状态更新失败 ⚠️",
+					fmt.Sprintf("交易ID: %d", tradeID),
+					fmt.Sprintf("目标状态: %s", statusText(status)),
+					fmt.Sprintf("错误: %v", upErr),
+				)
+				return
+			}
+		} else {
+			logger.Warnf("freqtrade manager: 更新仓位状态失败 trade=%d status=%s err=%v", tradeID, statusText(status), err)
+			m.notify("自动平仓状态更新失败 ⚠️",
+				fmt.Sprintf("交易ID: %d", tradeID),
+				fmt.Sprintf("目标状态: %s", statusText(status)),
+				fmt.Sprintf("错误: %v", err),
+			)
+			return
+		}
+	}
+	m.posCacheMu.Lock()
+	if m.posCache != nil {
+		if cur, ok := m.posCache[tradeID]; ok {
+			cur.Order.Status = status
+			m.posCache[tradeID] = cur
+		}
+	}
+	m.posCacheMu.Unlock()
+}
+
 // marshalRaw 将 webhook/raw 对象序列化为紧凑 JSON。
 func marshalRaw(payload any) string {
 	if payload == nil {
@@ -351,6 +425,12 @@ func statusText(status database.LiveOrderStatus) string {
 	default:
 		return "open"
 	}
+}
+
+func shouldSkipFastSync(status database.LiveOrderStatus) bool {
+	return status == database.LiveOrderStatusClosed ||
+		status == database.LiveOrderStatusClosingPartial ||
+		status == database.LiveOrderStatusClosingFull
 }
 
 func statusForClose(op database.OperationType) int {
@@ -444,7 +524,45 @@ func (m *Manager) updateCacheOrderTiers(order database.LiveOrderRecord, tiers da
 	}
 	cur := m.posCache[tradeID]
 	if order.FreqtradeID > 0 {
-		cur.Order = order
+		mergedOrder := cur.Order
+		mergedOrder.FreqtradeID = order.FreqtradeID
+		if valOrZero(order.Amount) > 0 {
+			mergedOrder.Amount = order.Amount
+		}
+		if valOrZero(order.InitialAmount) > 0 {
+			mergedOrder.InitialAmount = order.InitialAmount
+		}
+		if valOrZero(order.Price) > 0 {
+			mergedOrder.Price = order.Price
+		}
+		if valOrZero(order.StakeAmount) > 0 {
+			mergedOrder.StakeAmount = order.StakeAmount
+		}
+		if valOrZero(order.Leverage) > 0 {
+			mergedOrder.Leverage = order.Leverage
+		}
+		if order.StartTime != nil {
+			mergedOrder.StartTime = order.StartTime
+		}
+		if order.EndTime != nil {
+			mergedOrder.EndTime = order.EndTime
+		}
+		if order.Status != 0 {
+			mergedOrder.Status = order.Status
+		}
+		if strings.TrimSpace(order.Symbol) != "" {
+			mergedOrder.Symbol = order.Symbol
+		}
+		if strings.TrimSpace(order.Side) != "" {
+			mergedOrder.Side = order.Side
+		}
+		if order.PositionValue != nil && valOrZero(order.PositionValue) > 0 {
+			mergedOrder.PositionValue = order.PositionValue
+		}
+		if order.ClosedAmount != nil && valOrZero(order.ClosedAmount) > 0 {
+			mergedOrder.ClosedAmount = order.ClosedAmount
+		}
+		cur.Order = mergedOrder
 	}
 	if tiers.FreqtradeID > 0 {
 		cur.Tiers = tiers
@@ -454,12 +572,16 @@ func (m *Manager) updateCacheOrderTiers(order database.LiveOrderRecord, tiers da
 
 // addPendingExit registers a pending exit action.
 func (m *Manager) addPendingExit(pe pendingExit) {
-	if m == nil {
+	if m == nil || pe.TradeID == 0 {
 		return
 	}
 	m.mu.Lock()
-	m.pendingExits[pe.TradeID] = pe
-	m.mu.Unlock()
+	defer m.mu.Unlock()
+	if m.pendingExits == nil {
+		m.pendingExits = make(map[int]*pendingExit)
+	}
+	copy := pe.clone()
+	m.pendingExits[pe.TradeID] = &copy
 }
 
 func (m *Manager) hasPendingExit(tradeID int) bool {
@@ -482,8 +604,35 @@ func (m *Manager) popPendingExit(tradeID int) (pendingExit, bool) {
 	pe, ok := m.pendingExits[tradeID]
 	if ok {
 		delete(m.pendingExits, tradeID)
+		return pe.clone(), true
 	}
-	return pe, ok
+	return pendingExit{}, false
+}
+
+func (m *Manager) peekPendingExit(tradeID int) (pendingExit, bool) {
+	if m == nil {
+		return pendingExit{}, false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	pe, ok := m.pendingExits[tradeID]
+	if !ok {
+		return pendingExit{}, false
+	}
+	return pe.clone(), true
+}
+
+func (m *Manager) updatePendingExit(pe pendingExit) {
+	if m == nil || pe.TradeID == 0 {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.pendingExits[pe.TradeID]; !ok {
+		return
+	}
+	copy := pe.clone()
+	m.pendingExits[pe.TradeID] = &copy
 }
 
 // listPendingExits returns a snapshot of pending exits.
@@ -495,9 +644,55 @@ func (m *Manager) listPendingExits() []pendingExit {
 	defer m.mu.Unlock()
 	out := make([]pendingExit, 0, len(m.pendingExits))
 	for _, pe := range m.pendingExits {
-		out = append(out, pe)
+		out = append(out, pe.clone())
 	}
 	return out
+}
+
+func (m *Manager) recordExitConfirm(tradeID int, remaining float64) {
+	if m == nil || tradeID == 0 {
+		return
+	}
+	m.exitConfirmMu.Lock()
+	if m.exitConfirms == nil {
+		m.exitConfirms = make(map[int]exitConfirm)
+	}
+	m.exitConfirms[tradeID] = exitConfirm{
+		Remaining: remaining,
+		Timestamp: time.Now(),
+	}
+	m.exitConfirmMu.Unlock()
+}
+
+func (m *Manager) clearExitConfirm(tradeID int) {
+	if m == nil || tradeID == 0 {
+		return
+	}
+	m.exitConfirmMu.Lock()
+	if m.exitConfirms != nil {
+		delete(m.exitConfirms, tradeID)
+	}
+	m.exitConfirmMu.Unlock()
+}
+
+func (m *Manager) peekExitConfirm(tradeID int) (exitConfirm, bool) {
+	if m == nil || tradeID == 0 {
+		return exitConfirm{}, false
+	}
+	m.exitConfirmMu.Lock()
+	defer m.exitConfirmMu.Unlock()
+	if m.exitConfirms == nil {
+		return exitConfirm{}, false
+	}
+	confirm, ok := m.exitConfirms[tradeID]
+	if !ok {
+		return exitConfirm{}, false
+	}
+	if time.Since(confirm.Timestamp) > exitConfirmTTL {
+		delete(m.exitConfirms, tradeID)
+		return exitConfirm{}, false
+	}
+	return confirm, true
 }
 
 // entryTag 生成 freqtrade entry tag。

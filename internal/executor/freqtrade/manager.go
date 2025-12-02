@@ -47,24 +47,31 @@ type Manager struct {
 	mu               sync.Mutex
 	horizonName      string
 	notifier         TextNotifier
-	pendingExits     map[int]pendingExit
-	tierWatchOnce    sync.Once
+	pendingExits     map[int]*pendingExit
+	priceWatchOnce   sync.Once
 	tierExecMu       sync.Mutex
 	tierExec         map[int]bool
 	posSyncOnce      sync.Once
 	fastSyncOnce     sync.Once
 	locker           *sync.Map
 	missingPrice     map[string]bool
+	priceEvents      chan priceEvent
 	startedAt        time.Time
 	hadTradeSnap     bool
 	hadOpenTrade     bool
+	exitConfirmMu    sync.Mutex
+	exitConfirms     map[int]exitConfirm
+}
+
+type exitConfirm struct {
+	Remaining float64
+	Timestamp time.Time
 }
 
 const (
 	defaultTier1Ratio        = 0.33
 	defaultTier2Ratio        = 0.33
 	defaultTier3Ratio        = 0.34
-	tierWatchInterval        = 2 * time.Second
 	positionSyncInterval     = time.Minute
 	positionSyncStartupDelay = 10 * time.Second
 	fastStatusInterval       = 5 * time.Second
@@ -74,6 +81,11 @@ const (
 	autoCloseRetryInterval   = 30 * time.Second
 	webhookContextTimeout    = 5 * time.Minute
 	pendingExitTimeout       = 10 * time.Minute
+	pendingAmountEpsilon     = 1e-6
+	priceEventBufferSize     = 2048
+	priceFlushInterval       = 500 * time.Millisecond
+	pendingCheckInterval     = 2 * time.Second
+	exitConfirmTTL           = 3 * time.Minute
 )
 
 // Position 缓存 freqtrade 持仓信息。
@@ -99,6 +111,11 @@ type queuedDecision struct {
 	decision decision.Decision
 }
 
+type priceEvent struct {
+	symbol string
+	quote  TierPriceQuote
+}
+
 // NewManager 创建 freqtrade 执行管理器。
 func NewManager(client *Client, cfg brcfg.FreqtradeConfig, horizon string, logStore Logger, orderRec market.Recorder, notifier TextNotifier) *Manager {
 	var posStore database.LivePositionStore
@@ -121,12 +138,13 @@ func NewManager(client *Client, cfg brcfg.FreqtradeConfig, horizon string, logSt
 		tradeDec:         make(map[int]decision.Decision),
 		pendingSymbolDec: make(map[string][]queuedDecision),
 		positions:        make(map[int]Position),
-		pendingExits:     make(map[int]pendingExit),
+		pendingExits:     make(map[int]*pendingExit),
 		horizonName:      horizon,
 		notifier:         notifier,
 		tierExec:         make(map[int]bool),
 		locker:           positionLocker,
 		missingPrice:     make(map[string]bool),
+		exitConfirms:     make(map[int]exitConfirm),
 		startedAt:        time.Now(),
 	}
 }
@@ -143,8 +161,9 @@ func initLiveOrderPnL(store database.LivePositionStore) {
 
 // DecisionInput 用于执行器的输入。
 type DecisionInput struct {
-	TraceID  string
-	Decision decision.Decision
+	TraceID     string
+	Decision    decision.Decision
+	MarketPrice float64
 }
 
 // Execute 根据决策调用 freqtrade ForceEnter/ForceExit/更新。
@@ -155,7 +174,7 @@ func (m *Manager) Execute(ctx context.Context, input DecisionInput) error {
 	d := input.Decision
 	switch d.Action {
 	case "open_long", "open_short":
-		return m.forceEnter(ctx, input.TraceID, d)
+		return m.forceEnter(ctx, input.TraceID, d, input.MarketPrice)
 	case "close_long", "close_short":
 		return m.forceExit(ctx, input.TraceID, d)
 	case "adjust_stop_loss":
@@ -190,14 +209,43 @@ func (m *Manager) HandleWebhook(ctx context.Context, msg WebhookMessage) {
 	}
 }
 
-// StartTierWatcher 启用三段式监控（重构后将使用 posRepo 数据）。
-func (m *Manager) StartTierWatcher(ctx context.Context, priceFn func(symbol string) TierPriceQuote) {
+// StartPriceMonitor 启动实时成交价监控（由行情事件驱动）。
+func (m *Manager) StartPriceMonitor(ctx context.Context) {
 	if m == nil {
 		return
 	}
-	m.tierWatchOnce.Do(func() {
-		go m.runTierWatcher(ctx, priceFn)
+	m.priceWatchOnce.Do(func() {
+		m.priceEvents = make(chan priceEvent, priceEventBufferSize)
+		go m.runPriceMonitor(ctx)
 	})
+}
+
+// PublishPrice 将实时成交价事件写入节流队列。
+func (m *Manager) PublishPrice(symbol string, quote TierPriceQuote) {
+	if m == nil {
+		return
+	}
+	symbol = strings.ToUpper(strings.TrimSpace(symbol))
+	if symbol == "" {
+		return
+	}
+	if quote.isEmpty() {
+		m.reportMissingPrice(symbol)
+		return
+	}
+	m.clearMissingPrice(symbol)
+	m.priceWatchOnce.Do(func() {
+		m.priceEvents = make(chan priceEvent, priceEventBufferSize)
+	})
+	if m.priceEvents == nil {
+		return
+	}
+	evt := priceEvent{symbol: symbol, quote: quote}
+	select {
+	case m.priceEvents <- evt:
+	default:
+		logger.Warnf("freqtrade manager: price queue full, drop symbol=%s", symbol)
+	}
 }
 
 // StartPositionSync 按固定频率刷新 freqtrade 仓位。
@@ -220,16 +268,44 @@ func (m *Manager) StartFastStatusSync(ctx context.Context) {
 	})
 }
 
-func (m *Manager) runTierWatcher(ctx context.Context, priceFn func(symbol string) TierPriceQuote) {
-	ticker := time.NewTicker(tierWatchInterval)
+func (m *Manager) runPriceMonitor(ctx context.Context) {
+	ticker := time.NewTicker(priceFlushInterval)
 	defer ticker.Stop()
+	pending := make(map[string]TierPriceQuote)
+	lastPendingCheck := time.Now()
 	for {
 		select {
 		case <-ctx.Done():
 			return
+		case evt := <-m.priceEvents:
+			if evt.symbol == "" || evt.quote.isEmpty() {
+				continue
+			}
+			curr := pending[evt.symbol]
+			if curr.isEmpty() {
+				pending[evt.symbol] = evt.quote
+				continue
+			}
+			curr.Last = evt.quote.Last
+			if curr.Low == 0 || (evt.quote.Low > 0 && evt.quote.Low < curr.Low) {
+				curr.Low = evt.quote.Low
+			}
+			if evt.quote.High > curr.High {
+				curr.High = evt.quote.High
+			}
+			pending[evt.symbol] = curr
 		case <-ticker.C:
-			m.evaluateTiers(ctx, priceFn)
-			m.checkPending(ctx)
+			if len(pending) > 0 {
+				batch := pending
+				pending = make(map[string]TierPriceQuote)
+				for sym, quote := range batch {
+					m.handlePriceTick(ctx, sym, quote)
+				}
+			}
+			if time.Since(lastPendingCheck) >= pendingCheckInterval {
+				m.checkPending(ctx)
+				lastPendingCheck = time.Now()
+			}
 		}
 	}
 }
@@ -269,28 +345,57 @@ func (m *Manager) handlePending(ctx context.Context, pe pendingExit, trMap map[i
 	tr, exists := trMap[tradeID]
 	now := time.Now()
 
-	currentAmount := pe.ExpectedAmount
-	if exists && tr.Amount > 0 {
+	currentAmount := pe.TargetAmount
+	if exists {
 		currentAmount = tr.Amount
 	}
-	prevAmt := pe.PrevAmount
-	closedDelta := math.Max(0, prevAmt-currentAmount)
-	success := false
-	if !exists && pe.ExpectedAmount <= 0 {
-		success = true // 完全平仓
-	} else if exists && closedDelta > 0 {
-		success = true // 数量减少
+	closedDelta := math.Max(0, pe.PrevAmount-currentAmount)
+	success := (!exists && currentAmount <= pendingAmountEpsilon) || closedDelta > pendingAmountEpsilon
+	logger.Infof("pending exit 轮询 trade=%d kind=%s state=%s prev=%.6f current=%.6f target=%.6f delta=%.6f exists=%v", tradeID, pe.Kind, pe.stateDesc(), pe.PrevAmount, currentAmount, pe.TargetAmount, closedDelta, exists)
+
+	if !success {
+		if confirm, ok := m.peekExitConfirm(tradeID); ok && confirm.Timestamp.After(pe.RequestedAt) {
+			expected := pe.TargetAmount
+			if expected < 0 {
+				expected = 0
+			}
+			if confirm.Remaining <= expected+pendingAmountEpsilon {
+				logger.Infof("pending exit 使用 webhook 确认 trade=%d kind=%s remaining=%.6f", tradeID, pe.Kind, confirm.Remaining)
+				currentAmount = confirm.Remaining
+				closedDelta = math.Max(0, pe.PrevAmount-confirm.Remaining)
+				success = closedDelta > pendingAmountEpsilon || confirm.Remaining <= pendingAmountEpsilon
+			}
+			if success {
+				m.clearExitConfirm(tradeID)
+			}
+		}
 	}
 
 	if !success {
 		if time.Since(pe.RequestedAt) < pendingExitTimeout {
+			if pe.State == pendingStateQueued {
+				pe.markWaiting()
+				m.updatePendingExit(pe)
+				m.appendOperation(ctx, tradeID, symbol, pe.Operation, map[string]any{
+					"event_type": "PENDING_" + strings.ToUpper(pe.describeKind()),
+					"status":     pe.stateDesc(),
+					"price":      pe.TargetPrice,
+					"side":       side,
+					"remaining":  currentAmount,
+				})
+				logger.Infof("pending exit 等待 trade=%d kind=%s 仓位未变化 remaining=%.6f", tradeID, pe.Kind, currentAmount)
+			}
 			return
 		}
+		logger.Warnf("pending exit 超时 trade=%d kind=%s remaining=%.6f delta=%.6f", tradeID, pe.Kind, currentAmount, closedDelta)
+		pe.markFailed("FREQTRADE_NO_FILL")
 		m.appendOperation(ctx, tradeID, symbol, pe.Operation, map[string]any{
 			"event_type": strings.ToUpper(pe.Kind),
-			"status":     "FAILED",
+			"status":     pe.stateDesc(),
 			"price":      pe.TargetPrice,
 			"side":       side,
+			"remaining":  currentAmount,
+			"reason":     pe.FailReason,
 		})
 		m.notify("自动平仓失败 ❌",
 			fmt.Sprintf("交易ID: %d", tradeID),
@@ -302,123 +407,427 @@ func (m *Manager) handlePending(ctx context.Context, pe pendingExit, trMap map[i
 		m.popPendingExit(tradeID)
 		return
 	}
+	logger.Infof("pending exit 确认 trade=%d kind=%s delta=%.6f remaining=%.6f", tradeID, pe.Kind, closedDelta, currentAmount)
+	m.clearExitConfirm(tradeID)
 
-	totalClosed := pe.PrevClosed + closedDelta
-	status := database.LiveOrderStatusPartial
-	var endTime *time.Time
-	if currentAmount <= 0.0000001 {
-		currentAmount = 0
-		status = database.LiveOrderStatusClosed
-		tmp := now
-		endTime = &tmp
+	var snapshot *Trade
+	if exists {
+		copy := tr
+		snapshot = &copy
+	} else if trade, err := m.fetchTradeDetailWithRetry(ctx, tradeID); err == nil && trade != nil {
+		snapshot = trade
 	}
 
-	orderRec := database.LiveOrderRecord{
-		FreqtradeID:  tradeID,
-		Symbol:       symbol,
-		Side:         side,
-		Amount:       ptrFloat(currentAmount),
-		ClosedAmount: ptrFloat(totalClosed),
-		Status:       status,
-		EndTime:      endTime,
-		UpdatedAt:    now,
+	if snapshot != nil {
+		pe.markConfirmed(snapshot)
+	} else {
+		pe.markConfirmed(nil)
 	}
-	_ = m.posRepo.UpsertOrder(ctx, orderRec)
+	m.updatePendingExit(pe)
 
-	tier := peTiersFromCache(m, tradeID)
-	remainingRatio := tier.RemainingRatio
-	switch pe.Kind {
-	case "stop_loss":
-		tier.Tier1Done, tier.Tier2Done, tier.Tier3Done = true, true, true
-		tier.RemainingRatio = 0
-		tier.Status = 2
-	case "take_profit":
-		tier.Tier1Done, tier.Tier2Done, tier.Tier3Done = true, true, true
-		tier.RemainingRatio = 0
-		tier.Status = 1
-	case "tier1":
-		tier.Tier1Done = true
-		tier.Status = 3
-		if pe.EntryPrice > 0 {
-			old := tier.StopLoss
-			tier.StopLoss = pe.EntryPrice
-			m.posRepo.InsertModification(ctx, database.TierModificationLog{
-				FreqtradeID: tradeID,
-				Field:       database.TierFieldStopLoss,
-				OldValue:    formatPrice(old),
-				NewValue:    formatPrice(pe.EntryPrice),
-				Source:      3,
-				Reason:      "价格到达 tier1，上移止损到入场价",
-				Timestamp:   now,
-			})
-		}
-		tier.RemainingRatio = math.Max(0, remainingRatio-pe.Ratio)
-	case "tier2":
-		tier.Tier2Done = true
-		tier.Status = 4
-		tier.RemainingRatio = math.Max(0, remainingRatio-pe.Ratio)
-	case "tier3":
-		tier.Tier3Done = true
-		tier.Status = 5
-		tier.RemainingRatio = math.Max(0, remainingRatio-pe.Ratio)
+	orderRec, _, actualClosed, err := m.finalizePendingExit(ctx, pe, snapshot)
+	if err != nil {
+		logger.Warnf("freqtrade pending: finalize trade=%d err=%v", tradeID, err)
+		return
 	}
-	if tier.RemainingRatio < 0 {
-		tier.RemainingRatio = 0
-	}
-	if status == database.LiveOrderStatusClosed {
-		tier.Tier1Done, tier.Tier2Done, tier.Tier3Done = true, true, true
-		tier.RemainingRatio = 0
-	}
-	tier.Timestamp = now
-	tier.UpdatedAt = now
-	if tier.FreqtradeID == 0 {
-		tier.FreqtradeID = tradeID
-		tier.Symbol = symbol
-	}
-	_ = m.posRepo.UpsertTiers(ctx, tier)
-	m.updateCacheOrderTiers(orderRec, tier)
 
-	m.appendOperation(ctx, tradeID, symbol, pe.Operation, map[string]any{
-		"event_type": strings.ToUpper(pe.Kind),
+	m.appendOperation(ctx, tradeID, orderRec.Symbol, pe.Operation, map[string]any{
+		"event_type": strings.ToUpper(pe.describeKind()),
 		"status":     "SUCCESS",
 		"price":      pe.TargetPrice,
-		"side":       side,
-		"closed":     closedDelta,
-		"remaining":  currentAmount,
+		"side":       orderRec.Side,
+		"closed":     actualClosed,
+		"remaining":  valOrZero(orderRec.Amount),
 		"stake":      pe.Stake,
 		"leverage":   pe.Leverage,
 	})
 
 	title := "自动平仓完成 ✅"
-	switch pe.Kind {
-	case "tier1", "tier2", "tier3":
-		title = fmt.Sprintf("自动%s完成 ✅", strings.ToUpper(pe.Kind))
-	case "stop_loss":
+	switch {
+	case strings.EqualFold(pe.Kind, "stop_loss"):
 		title = "自动止损完成 ✅"
-	case "take_profit":
+	case strings.EqualFold(pe.Kind, "take_profit"):
 		title = "自动止盈完成 ✅"
+	case strings.HasPrefix(strings.ToLower(pe.Kind), "tier"):
+		title = fmt.Sprintf("自动%s完成 ✅", strings.ToUpper(pe.describeKind()))
 	}
 	m.notify(title,
 		fmt.Sprintf("交易ID: %d", tradeID),
-		fmt.Sprintf("标的: %s", symbol),
-		fmt.Sprintf("事件: %s", strings.ToUpper(pe.Kind)),
+		fmt.Sprintf("标的: %s", orderRec.Symbol),
+		fmt.Sprintf("事件: %s", strings.ToUpper(pe.describeKind())),
 		fmt.Sprintf("触发价: %s", formatPrice(pe.TargetPrice)),
-		fmt.Sprintf("平仓数量: %s", formatQty(closedDelta)),
-		fmt.Sprintf("剩余数量: %s", formatQty(currentAmount)),
+		fmt.Sprintf("平仓数量: %s", formatQty(actualClosed)),
+		fmt.Sprintf("剩余数量: %s", formatQty(valOrZero(orderRec.Amount))),
 	)
 
-	if status == database.LiveOrderStatusClosed {
-		m.markPositionClosed(tradeID, symbol, side, pe.TargetPrice, pe.Stake, "", now, 0)
-	} else {
-		m.mu.Lock()
-		if pos, ok := m.positions[tradeID]; ok {
-			pos.Amount = currentAmount
-			m.positions[tradeID] = pos
-		}
-		m.mu.Unlock()
+	if valOrZero(orderRec.Amount) <= pendingAmountEpsilon {
+		m.markPositionClosed(tradeID, orderRec.Symbol, orderRec.Side, pe.TargetPrice, pe.Stake, "", now, valOrZero(orderRec.RealizedPnLRatio))
 	}
 
 	m.popPendingExit(tradeID)
+}
+
+func (m *Manager) finalizePendingExit(ctx context.Context, pe pendingExit, tradeSnapshot *Trade) (database.LiveOrderRecord, database.LiveTierRecord, float64, error) {
+	if m == nil || m.posRepo == nil {
+		return database.LiveOrderRecord{}, database.LiveTierRecord{}, 0, fmt.Errorf("position repo 未初始化")
+	}
+	tradeID := pe.TradeID
+	var (
+		orderRec database.LiveOrderRecord
+		tierRec  database.LiveTierRecord
+		found    bool
+		err      error
+	)
+	if m.posRepo != nil {
+		orderRec, tierRec, found, err = m.posRepo.GetPosition(ctx, tradeID)
+		if err != nil {
+			return database.LiveOrderRecord{}, database.LiveTierRecord{}, 0, err
+		}
+	}
+	now := time.Now()
+	if !found {
+		orderRec = database.LiveOrderRecord{
+			FreqtradeID: tradeID,
+			Symbol:      strings.ToUpper(firstNonEmpty(pe.Symbol)),
+			Side:        strings.ToLower(pe.Side),
+			CreatedAt:   now,
+		}
+		tierRec = buildPlaceholderTiers(tradeID, orderRec.Symbol)
+	}
+	orderRec.Symbol = strings.ToUpper(firstNonEmpty(orderRec.Symbol, pe.Symbol))
+	orderRec.Side = strings.ToLower(firstNonEmpty(orderRec.Side, pe.Side))
+	if orderRec.CreatedAt.IsZero() {
+		orderRec.CreatedAt = now
+	}
+	orderRec.UpdatedAt = now
+
+	initialAmount := deriveInitialAmount(orderRec, pe)
+	currentAmount := pe.TargetAmount
+	if tradeSnapshot != nil {
+		currentAmount = tradeSnapshot.Amount
+	}
+	if currentAmount < 0 {
+		currentAmount = 0
+	}
+	if initialAmount <= 0 {
+		initialAmount = math.Max(pe.PrevAmount, currentAmount)
+	}
+	totalClosed := math.Max(0, initialAmount-currentAmount)
+	closedDelta := math.Max(0, pe.PrevAmount-currentAmount)
+
+	status := database.LiveOrderStatusPartial
+	if currentAmount <= pendingAmountEpsilon {
+		currentAmount = 0
+		status = database.LiveOrderStatusClosed
+		end := now
+		orderRec.EndTime = &end
+	}
+	orderRec.Status = status
+	orderRec.Amount = ptrFloat(currentAmount)
+	orderRec.InitialAmount = ptrFloat(initialAmount)
+	orderRec.ClosedAmount = ptrFloat(totalClosed)
+
+	if orderRec.StartTime == nil || orderRec.StartTime.IsZero() {
+		start := now
+		if tradeSnapshot != nil {
+			open := parseFreqtradeTime(tradeSnapshot.OpenDate)
+			if !open.IsZero() {
+				start = open
+			}
+		}
+		orderRec.StartTime = &start
+	}
+	if orderRec.Price == nil || *orderRec.Price == 0 {
+		if tradeSnapshot != nil && tradeSnapshot.OpenRate > 0 {
+			orderRec.Price = ptrFloat(tradeSnapshot.OpenRate)
+		} else if pe.EntryPrice > 0 {
+			orderRec.Price = ptrFloat(pe.EntryPrice)
+		}
+	}
+	if orderRec.StakeAmount == nil || *orderRec.StakeAmount == 0 {
+		if tradeSnapshot != nil && tradeSnapshot.StakeAmount > 0 {
+			orderRec.StakeAmount = ptrFloat(tradeSnapshot.StakeAmount)
+		} else if pe.Stake > 0 {
+			orderRec.StakeAmount = ptrFloat(pe.Stake)
+		}
+	}
+	if orderRec.Leverage == nil || *orderRec.Leverage == 0 {
+		if tradeSnapshot != nil && tradeSnapshot.Leverage > 0 {
+			orderRec.Leverage = ptrFloat(tradeSnapshot.Leverage)
+		} else if pe.Leverage > 0 {
+			orderRec.Leverage = ptrFloat(pe.Leverage)
+		}
+	}
+	if orderRec.PositionValue == nil || *orderRec.PositionValue == 0 {
+		stake := valOrZero(orderRec.StakeAmount)
+		lev := valOrZero(orderRec.Leverage)
+		if stake > 0 && lev > 0 {
+			orderRec.PositionValue = ptrFloat(stake * lev)
+		}
+	}
+
+	updatePnLFromSnapshot(&orderRec, tradeSnapshot, status)
+
+	tierRec.FreqtradeID = tradeID
+	tierRec.Symbol = orderRec.Symbol
+	tierRec.UpdatedAt = now
+	if tierRec.Timestamp.IsZero() {
+		tierRec.Timestamp = now
+	}
+	if tierRec.CreatedAt.IsZero() {
+		tierRec.CreatedAt = now
+	}
+	remainingRatio := 0.0
+	if initialAmount > 0 {
+		remainingRatio = clamp01(currentAmount / initialAmount)
+	}
+	tierRec.RemainingRatio = remainingRatio
+
+	if status == database.LiveOrderStatusClosed {
+		tierRec.Tier1Done, tierRec.Tier2Done, tierRec.Tier3Done = true, true, true
+		tierRec.RemainingRatio = 0
+		tierRec.Status = statusForClose(pe.Operation)
+	} else {
+		if len(pe.CoveredTiers) == 0 && strings.HasPrefix(strings.ToLower(pe.Kind), "tier") {
+			pe.CoveredTiers = []string{strings.ToLower(pe.Kind)}
+		}
+		for _, tierName := range pe.CoveredTiers {
+			switch strings.ToLower(strings.TrimSpace(tierName)) {
+			case "tier1":
+				if !tierRec.Tier1Done && pe.EntryPrice > 0 {
+					old := tierRec.StopLoss
+					tierRec.StopLoss = pe.EntryPrice
+					m.posRepo.InsertModification(ctx, database.TierModificationLog{
+						FreqtradeID: tradeID,
+						Field:       database.TierFieldStopLoss,
+						OldValue:    formatPrice(old),
+						NewValue:    formatPrice(pe.EntryPrice),
+						Source:      3,
+						Reason:      "价格到达 tier1，上移止损到入场价",
+						Timestamp:   now,
+					})
+				}
+				tierRec.Tier1Done = true
+			case "tier2":
+				tierRec.Tier2Done = true
+			case "tier3":
+				tierRec.Tier3Done = true
+			}
+		}
+		if len(pe.CoveredTiers) > 0 {
+			last := pe.CoveredTiers[len(pe.CoveredTiers)-1]
+			tierRec.Status = statusForTier(strings.ToLower(last))
+		}
+	}
+
+	if err := m.posRepo.SavePosition(ctx, orderRec, tierRec); err != nil {
+		return orderRec, tierRec, 0, err
+	}
+	m.updateCacheOrderTiers(orderRec, tierRec)
+
+	m.mu.Lock()
+	pos := m.positions[tradeID]
+	pos.TradeID = tradeID
+	pos.Symbol = orderRec.Symbol
+	pos.Side = orderRec.Side
+	pos.Amount = currentAmount
+	pos.Stake = valOrZero(orderRec.StakeAmount)
+	pos.Leverage = valOrZero(orderRec.Leverage)
+	pos.EntryPrice = valOrZero(orderRec.Price)
+	if orderRec.StartTime != nil {
+		pos.OpenedAt = *orderRec.StartTime
+	}
+	if status == database.LiveOrderStatusClosed {
+		pos.Closed = true
+		pos.ClosedAt = now
+		pos.ExitPrice = pe.TargetPrice
+		pos.ExitPnLRatio = valOrZero(orderRec.RealizedPnLRatio)
+		pos.ExitPnLUSD = valOrZero(orderRec.RealizedPnLUSD)
+	} else {
+		pos.Closed = false
+	}
+	m.positions[tradeID] = pos
+	m.mu.Unlock()
+
+	return orderRec, tierRec, closedDelta, nil
+}
+
+func (m *Manager) pendingFromWebhook(ctx context.Context, tradeID int, symbol, side string, closePrice float64, fill float64, msg WebhookMessage) (pendingExit, error) {
+	var orderRec database.LiveOrderRecord
+	var err error
+	if m.posRepo != nil {
+		if order, _, ok, e := m.posRepo.GetPosition(ctx, tradeID); e == nil && ok {
+			orderRec = order
+		} else if e != nil {
+			err = e
+		}
+	}
+	if symbol == "" {
+		symbol = strings.ToUpper(strings.TrimSpace(orderRec.Symbol))
+	}
+	if side == "" {
+		side = strings.ToLower(strings.TrimSpace(orderRec.Side))
+	}
+	if symbol == "" || side == "" {
+		return pendingExit{}, fmt.Errorf("缺少 trade=%d 仓位信息，无法同步 exit", tradeID)
+	}
+	prevAmount := valOrZero(orderRec.Amount)
+	prevClosed := valOrZero(orderRec.ClosedAmount)
+	initial := valOrZero(orderRec.InitialAmount)
+	if initial <= 0 {
+		total := prevAmount + prevClosed
+		if total > 0 {
+			initial = total
+		} else {
+			initial = prevAmount
+		}
+	}
+	targetAmount := prevAmount
+	if fill > 0 && prevAmount > 0 {
+		if fill > prevAmount {
+			fill = prevAmount
+		}
+		targetAmount = math.Max(0, prevAmount-fill)
+	} else if targetAmount < 0 {
+		targetAmount = 0
+	}
+	reason := strings.ToLower(strings.TrimSpace(msg.ExitReason))
+	pe := pendingExit{
+		TradeID:       tradeID,
+		Symbol:        strings.ToUpper(symbol),
+		Side:          side,
+		Kind:          reason,
+		TargetPrice:   closePrice,
+		PrevAmount:    prevAmount,
+		PrevClosed:    prevClosed,
+		InitialAmount: initial,
+		TargetAmount:  targetAmount,
+		RequestedAt:   time.Now(),
+		EntryPrice:    valOrZero(orderRec.Price),
+		Stake:         valOrZero(orderRec.StakeAmount),
+		Leverage:      valOrZero(orderRec.Leverage),
+		Operation:     operationFromReason(reason, database.OperationFailed),
+	}
+	if err != nil {
+		logger.Warnf("freqtrade pending: 获取 trade=%d 仓位信息失败 err=%v，使用缓存", tradeID, err)
+	}
+	return pe, nil
+}
+
+func deriveInitialAmount(order database.LiveOrderRecord, pe pendingExit) float64 {
+	initial := valOrZero(order.InitialAmount)
+	if initial > 0 {
+		return initial
+	}
+	sum := valOrZero(order.Amount) + valOrZero(order.ClosedAmount)
+	if sum > 0 {
+		return sum
+	}
+	if pe.InitialAmount > 0 {
+		return pe.InitialAmount
+	}
+	total := pe.PrevAmount + pe.PrevClosed
+	if total > 0 {
+		return total
+	}
+	return pe.PrevAmount
+}
+
+func updatePnLFromSnapshot(order *database.LiveOrderRecord, tradeSnapshot *Trade, status database.LiveOrderStatus) {
+	if order == nil || tradeSnapshot == nil {
+		return
+	}
+	pnlRatio := tradeSnapshot.ProfitRatio
+	if pnlRatio == 0 {
+		pnlRatio = tradeSnapshot.CloseProfit
+	}
+	pnlAbs := tradeSnapshot.ProfitAbs
+	if pnlAbs == 0 {
+		pnlAbs = tradeSnapshot.CloseProfitAbs
+	}
+
+	if status == database.LiveOrderStatusClosed {
+		if tradeSnapshot.CloseRate > 0 {
+			order.CurrentPrice = ptrFloat(tradeSnapshot.CloseRate)
+		}
+		if tradeSnapshot.CloseProfit != 0 {
+			order.PnLRatio = ptrFloat(tradeSnapshot.CloseProfit)
+			order.RealizedPnLRatio = ptrFloat(tradeSnapshot.CloseProfit)
+			order.CurrentProfitRatio = ptrFloat(tradeSnapshot.CloseProfit)
+		}
+		if tradeSnapshot.CloseProfitAbs != 0 {
+			order.PnLUSD = ptrFloat(tradeSnapshot.CloseProfitAbs)
+			order.RealizedPnLUSD = ptrFloat(tradeSnapshot.CloseProfitAbs)
+			order.CurrentProfitAbs = ptrFloat(tradeSnapshot.CloseProfitAbs)
+		}
+		order.UnrealizedPnLRatio = ptrFloat(0)
+		order.UnrealizedPnLUSD = ptrFloat(0)
+	} else {
+		if tradeSnapshot.CurrentRate > 0 {
+			order.CurrentPrice = ptrFloat(tradeSnapshot.CurrentRate)
+		} else if tradeSnapshot.CloseRate > 0 {
+			order.CurrentPrice = ptrFloat(tradeSnapshot.CloseRate)
+		}
+		order.UnrealizedPnLRatio = ptrFloat(pnlRatio)
+		order.UnrealizedPnLUSD = ptrFloat(pnlAbs)
+		order.CurrentProfitRatio = ptrFloat(pnlRatio)
+		order.CurrentProfitAbs = ptrFloat(pnlAbs)
+	}
+}
+
+func statusForTier(name string) int {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "tier1":
+		return 3
+	case "tier2":
+		return 4
+	case "tier3":
+		return 5
+	default:
+		return 0
+	}
+}
+
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		v = strings.TrimSpace(v)
+		if v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+func clamp01(val float64) float64 {
+	if val < 0 {
+		return 0
+	}
+	if val > 1 {
+		return 1
+	}
+	return val
+}
+
+func operationFromReason(reason string, fallback database.OperationType) database.OperationType {
+	switch strings.ToLower(strings.TrimSpace(reason)) {
+	case "stop_loss":
+		return database.OperationStopLoss
+	case "take_profit":
+		return database.OperationTakeProfit
+	case "force_exit":
+		return database.OperationForceExit
+	case "tier1":
+		return database.OperationTier1
+	case "tier2":
+		return database.OperationTier2
+	case "tier3":
+		return database.OperationTier3
+	default:
+		if fallback != 0 {
+			return fallback
+		}
+		return database.OperationFailed
+	}
 }
 
 func (m *Manager) runPositionSync(ctx context.Context) {
@@ -431,7 +840,9 @@ func (m *Manager) runPositionSync(ctx context.Context) {
 		}
 	}
 	// 启动时同步一次，当前关闭周期性对账，避免频繁写入。
-	_, _ = m.SyncOpenPositions(ctx)
+	if _, err := m.SyncOpenPositions(ctx); err != nil {
+		logger.Errorf("freqtrade manager: 启动同步仓位失败 err=%v", err)
+	}
 }
 
 func (m *Manager) runFastStatusSync(ctx context.Context) {
@@ -504,6 +915,9 @@ func (m *Manager) applyFastStatusSnapshot(ctx context.Context, trades []Trade) {
 			continue
 		}
 		if m.hasPendingExit(tr.ID) {
+			continue
+		}
+		if status, ok := m.cachedOrderStatus(tr.ID); ok && shouldSkipFastSync(status) {
 			continue
 		}
 		symbol := freqtradePairToSymbol(tr.Pair)

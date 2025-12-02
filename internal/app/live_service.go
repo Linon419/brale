@@ -47,14 +47,24 @@ type LiveService struct {
 
 	priceCache   map[string]cachedQuote
 	priceCacheMu sync.RWMutex
-	lastPrice    map[string]float64
+	lastPrice    map[string]lastPriceEntry
 	lastPriceMu  sync.RWMutex
+
+	tradeStreamMu sync.Mutex
+	tradeStreamUp bool
 }
 
 type cachedQuote struct {
 	quote freqexec.TierPriceQuote
 	ts    int64
 }
+
+type lastPriceEntry struct {
+	price float64
+	ts    int64
+}
+
+const lastPriceMaxAge = 10 * time.Second
 
 // Run 启动实时服务，直到 ctx 取消。
 func (s *LiveService) Run(ctx context.Context) error {
@@ -65,10 +75,7 @@ func (s *LiveService) Run(ctx context.Context) error {
 		s.updater.OnEvent = s.onCandleEvent
 	}
 	if s.freqManager != nil {
-		s.freqManager.StartTierWatcher(ctx, func(sym string) freqexec.TierPriceQuote {
-			sym = strings.ToUpper(strings.TrimSpace(sym))
-			return s.latestPriceQuote(ctx, sym)
-		})
+		s.freqManager.StartPriceMonitor(ctx)
 		s.freqManager.StartPositionSync(ctx)
 		s.freqManager.StartFastStatusSync(ctx)
 	}
@@ -101,12 +108,8 @@ func (s *LiveService) Run(ctx context.Context) error {
 		}
 		_ = s.tg.SendText(msg)
 	}
-	batchSize := cfg.Market.ResolveActiveSource().WSBatchSize
-	if batchSize <= 0 {
-		batchSize = 150
-	}
 	go func() {
-		if err := s.updater.Start(ctx, s.symbols, s.hIntervals, batchSize); err != nil {
+		if err := s.updater.Start(ctx, s.symbols, s.hIntervals); err != nil {
 			logger.Errorf("启动行情订阅失败: %v", err)
 		}
 	}()
@@ -127,7 +130,7 @@ func (s *LiveService) Run(ctx context.Context) error {
 	if cfg.AI.DecisionIntervalSeconds%60 == 0 {
 		human = fmt.Sprintf("%d 分钟", cfg.AI.DecisionIntervalSeconds/60)
 	}
-	fmt.Printf("Brale 启动完成。开始订阅 K 线并写入缓存；每 %s 进行一次 AI 决策。按 Ctrl+C 退出。\n", human)
+	logger.Infof("Brale 启动完成。开始订阅 K 线并写入缓存；每 %s 进行一次 AI 决策。按 Ctrl+C 退出。\n", human)
 
 	for {
 		select {
@@ -584,10 +587,39 @@ func (s *LiveService) startTradePriceStream(ctx context.Context) {
 		logger.Warnf("实时成交价订阅跳过：缺少行情源")
 		return
 	}
-	active := s.cfg.Market.ResolveActiveSource()
 	opts := market.SubscribeOptions{
-		BatchSize: active.WSBatchSize,
-		Buffer:    2048,
+		Buffer: 2048,
+		OnConnect: func() {
+			if ctx.Err() != nil {
+				return
+			}
+			s.tradeStreamMu.Lock()
+			wasUp := s.tradeStreamUp
+			s.tradeStreamUp = true
+			s.tradeStreamMu.Unlock()
+			if s.tg != nil {
+				msg := "实时成交价流已建立 ✅"
+				if wasUp {
+					msg = "实时成交价流已恢复 ✅"
+				}
+				_ = s.tg.SendText(msg)
+			}
+		},
+		OnDisconnect: func(err error) {
+			if ctx.Err() != nil {
+				return
+			}
+			s.tradeStreamMu.Lock()
+			s.tradeStreamUp = false
+			s.tradeStreamMu.Unlock()
+			if s.tg != nil {
+				reason := "未知"
+				if err != nil && err.Error() != "" {
+					reason = err.Error()
+				}
+				_ = s.tg.SendText(fmt.Sprintf("实时成交价流断线 ⚠️\n错误: %s", reason))
+			}
+		},
 	}
 	stream, err := s.updater.Source.SubscribeTrades(ctx, s.symbols, opts)
 	if err != nil {
@@ -622,34 +654,58 @@ func (s *LiveService) handleTradePrice(ev market.TradeEvent) {
 	if symbol == "" {
 		return
 	}
+	ts := ev.EventTime
+	if ts == 0 {
+		ts = ev.TradeTime
+	}
+	if ts == 0 {
+		ts = time.Now().UnixMilli()
+	}
 	s.lastPriceMu.Lock()
 	if s.lastPrice == nil {
-		s.lastPrice = make(map[string]float64)
+		s.lastPrice = make(map[string]lastPriceEntry)
 	}
-	s.lastPrice[symbol] = price
+	s.lastPrice[symbol] = lastPriceEntry{price: price, ts: ts}
 	s.lastPriceMu.Unlock()
-
 	s.priceCacheMu.Lock()
 	cq := s.priceCache[symbol]
 	cq.quote.Last = price
-	if ev.EventTime > 0 {
-		cq.ts = ev.EventTime
-	} else if ev.TradeTime > 0 {
-		cq.ts = ev.TradeTime
-	} else {
-		cq.ts = time.Now().UnixMilli()
-	}
+	cq.ts = ts
 	s.priceCache[symbol] = cq
 	s.priceCacheMu.Unlock()
+
+	if s.freqManager != nil {
+		s.freqManager.PublishPrice(symbol, freqexec.TierPriceQuote{
+			Last: price,
+			High: price,
+			Low:  price,
+		})
+	}
+}
+
+func (s *LiveService) freshLastPrice(symbol string) (float64, bool) {
+	if s == nil {
+		return 0, false
+	}
+	s.lastPriceMu.RLock()
+	entry, ok := s.lastPrice[symbol]
+	s.lastPriceMu.RUnlock()
+	if !ok || entry.price <= 0 {
+		return 0, false
+	}
+	if entry.ts <= 0 {
+		return entry.price, true
+	}
+	if time.Since(time.UnixMilli(entry.ts)) > lastPriceMaxAge {
+		return 0, false
+	}
+	return entry.price, true
 }
 
 func (s *LiveService) latestPrice(ctx context.Context, symbol string) float64 {
-	// 优先使用实时 lastPrice
+	// 优先使用实时 lastPrice（仅在数据新鲜时）
 	symbol = strings.ToUpper(strings.TrimSpace(symbol))
-	s.lastPriceMu.RLock()
-	lp := s.lastPrice[symbol]
-	s.lastPriceMu.RUnlock()
-	if lp > 0 {
+	if lp, ok := s.freshLastPrice(symbol); ok {
 		return lp
 	}
 	quote := s.latestPriceQuote(ctx, symbol)
@@ -662,13 +718,11 @@ func (s *LiveService) latestPriceQuote(ctx context.Context, symbol string) freqe
 		return quote
 	}
 	symbol = strings.ToUpper(strings.TrimSpace(symbol))
-	// 带上 lastPrice
-	s.lastPriceMu.RLock()
-	lp := s.lastPrice[symbol]
-	s.lastPriceMu.RUnlock()
+	// 带上 lastPrice（仅使用新鲜数据）
+	lp, lastPriceFresh := s.freshLastPrice(symbol)
 	if cached, ok := s.cachedQuote(symbol); ok {
 		quote = cached
-		if lp > 0 {
+		if lastPriceFresh {
 			quote.Last = lp
 		}
 		return quote
@@ -701,7 +755,7 @@ func (s *LiveService) latestPriceQuote(ctx context.Context, symbol string) freqe
 	quote.Last = last.Close
 	quote.High = last.High
 	quote.Low = last.Low
-	if lp > 0 {
+	if lastPriceFresh {
 		quote.Last = lp
 	}
 	return quote
@@ -877,6 +931,7 @@ func (s *LiveService) freqtradeHandleDecision(ctx context.Context, traceID strin
 	}
 	traceID = s.ensureTraceID(traceID)
 	logger.Infof("freqtrade: 接收决策 trace=%s symbol=%s action=%s", traceID, strings.ToUpper(strings.TrimSpace(d.Symbol)), d.Action)
+	var marketPrice float64
 	if d.Action == "open_long" || d.Action == "open_short" {
 		price := s.latestPrice(ctx, d.Symbol)
 		if price <= 0 {
@@ -889,11 +944,13 @@ func (s *LiveService) freqtradeHandleDecision(ctx context.Context, traceID strin
 			return err
 		}
 		logger.Infof("freqtrade: 验证通过 trace=%s symbol=%s side=%s price=%.4f sl=%.4f tp=%.4f", traceID, strings.ToUpper(strings.TrimSpace(d.Symbol)), deriveSide(d.Action), price, d.StopLoss, d.TakeProfit)
+		marketPrice = price
 		traceID = s.freqManager.CacheDecision(traceID, d)
 	}
 	if err := s.freqManager.Execute(ctx, freqexec.DecisionInput{
-		TraceID:  traceID,
-		Decision: d,
+		TraceID:     traceID,
+		Decision:    d,
+		MarketPrice: marketPrice,
 	}); err != nil {
 		return err
 	}

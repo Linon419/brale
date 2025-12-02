@@ -9,8 +9,11 @@ configs/config.toml
 
 # Tests (exclude from GitHub per request)
 *_test.go
+!internal/executor/freqtrade/manager_flow_test.go
 
 # Do not publish this helper file
 AGENTS.md
 
 data/
+.gocache/
+.gomodcache/

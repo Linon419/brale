@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"math"
 	"strings"
 	"time"
 
@@ -191,357 +190,89 @@ func (m *Manager) handleExit(ctx context.Context, msg WebhookMessage, event stri
 	m.mu.Lock()
 	pos, _ := m.positions[tradeID]
 	m.mu.Unlock()
-	symbol := pos.Symbol
+	symbol := strings.ToUpper(strings.TrimSpace(pos.Symbol))
 	if symbol == "" {
-		symbol = freqtradePairToSymbol(msg.Pair)
+		symbol = strings.ToUpper(freqtradePairToSymbol(msg.Pair))
 	}
-	side := pos.Side
+	side := strings.ToLower(strings.TrimSpace(pos.Side))
 	if side == "" {
 		side = strings.ToLower(strings.TrimSpace(msg.Direction))
 	}
 	closePrice := firstNonZero(float64(msg.CloseRate), float64(msg.OrderRate))
-	stake := float64(msg.StakeAmount)
+	fill := float64(msg.Amount)
+	if fill < 0 {
+		fill = 0
+	}
 	closedAt := parseFreqtradeTime(msg.CloseDate)
-
-	logger.Debugf("freqtrade manager: exit context cache trade=%d symbol=%s side=%s cached_amount=%.6f cached_entry=%.4f", tradeID, symbol, side, pos.Amount, pos.EntryPrice)
-	pe, _ := m.popPendingExit(tradeID)
 	traceID := m.lookupTrace(tradeID)
 	m.deleteTrace(tradeID)
 
-	now := time.Now()
-
+	pendingCopy, hasPending := m.peekPendingExit(tradeID)
 	var (
-		orderRec database.LiveOrderRecord
-		tierRec  database.LiveTierRecord
-		found    bool
+		pe  pendingExit
+		err error
 	)
-	if m.posRepo != nil {
-		if o, t, ok, err := m.posRepo.GetPosition(ctx, tradeID); err == nil && ok {
-			orderRec, tierRec, found = o, t, true
-		} else if err != nil {
-			logger.Warnf("freqtrade manager: 读取 position 失败 trade=%d err=%v", tradeID, err)
+	if hasPending {
+		pe = pendingCopy
+		if pe.TargetPrice == 0 && closePrice > 0 {
+			pe.TargetPrice = closePrice
 		}
-	}
-	if !found {
-		orderRec = database.LiveOrderRecord{
-			FreqtradeID:   tradeID,
-			Symbol:        strings.ToUpper(symbol),
-			Side:          side,
-			Amount:        ptrFloat(pos.Amount),
-			InitialAmount: ptrFloat(pos.Amount),
-			StakeAmount:   ptrFloat(stake),
-			Leverage:      ptrFloat(float64(msg.Leverage)),
-			Price:         ptrFloat(pos.EntryPrice),
-			Status:        database.LiveOrderStatusOpen,
-			StartTime:     &pos.OpenedAt,
-			CreatedAt:     now,
-			UpdatedAt:     now,
-		}
-	}
-
-	prevAmount := valOrZero(orderRec.Amount)
-	if prevAmount <= 0 && pos.Amount > 0 {
-		prevAmount = pos.Amount
-	}
-	prevClosed := valOrZero(orderRec.ClosedAmount)
-	fill := float64(msg.Amount)
-	if fill <= 0 {
-		fill = prevAmount
-	}
-	if prevAmount > 0 {
-		fill = math.Min(fill, prevAmount)
-	}
-	newAmount := math.Max(0, prevAmount-fill)
-	newClosed := prevClosed + math.Min(fill, prevAmount)
-
-	newStatus := database.LiveOrderStatusPartial
-	if orderRec.Status == database.LiveOrderStatusClosingFull || newAmount <= 0.0000001 {
-		newStatus = database.LiveOrderStatusClosed
-		newAmount = 0
-	} else if orderRec.Status == database.LiveOrderStatusClosingPartial {
-		newStatus = database.LiveOrderStatusPartial
-	}
-
-	endTs := closedAt
-	if endTs.IsZero() {
-		endTs = now
-	}
-
-	rawData := strings.TrimSpace(orderRec.RawData)
-	exitRaw := marshalRaw(msg)
-	if rawData == "" {
-		rawData = exitRaw
-	} else if exitRaw != "" {
-		rawData = rawData + "\n" + exitRaw
-	}
-
-	entryPrice := valOrZero(orderRec.Price)
-	if entryPrice <= 0 {
-		entryPrice = pos.EntryPrice
-	}
-	baseStake := stake
-	if baseStake <= 0 {
-		baseStake = valOrZero(orderRec.StakeAmount)
-	}
-	if baseStake <= 0 {
-		baseStake = pos.Stake
-	}
-	if baseStake <= 0 {
-		posVal := valOrZero(orderRec.PositionValue)
-		lev := valOrZero(orderRec.Leverage)
-		if posVal > 0 && lev > 0 {
-			baseStake = posVal / lev
-		}
-	}
-	initialAmount := valOrZero(orderRec.InitialAmount)
-	if initialAmount <= 0 {
-		initialAmount = valOrZero(orderRec.Amount) + valOrZero(orderRec.ClosedAmount)
-		if initialAmount <= 0 {
-			initialAmount = prevAmount + prevClosed
-		}
-	}
-	portion := 1.0
-	if initialAmount > 0 && fill > 0 {
-		portion = math.Min(fill, initialAmount) / initialAmount
-		if portion < 0 {
-			portion = 0
-		} else if portion > 1 {
-			portion = 1
-		}
-	}
-	effectiveStake := baseStake
-	if portion > 0 && portion < 1 && effectiveStake > 0 {
-		effectiveStake = effectiveStake * portion
-	}
-	pnlRatio := parseProfitRatio(msg.ProfitRatio)
-	pnlUSD := parseAnyFloat(msg.ProfitAbs)
-	if pnlRatio == 0 && entryPrice > 0 && closePrice > 0 {
-		if strings.EqualFold(side, "short") {
-			pnlRatio = (entryPrice - closePrice) / entryPrice
-		} else {
-			pnlRatio = (closePrice - entryPrice) / entryPrice
-		}
-	}
-	if pnlUSD == 0 && pnlRatio != 0 {
-		stakeForCalc := effectiveStake
-		if stakeForCalc <= 0 {
-			stakeForCalc = baseStake
-		}
-		if stakeForCalc <= 0 {
-			stakeForCalc = stake
-		}
-		if stakeForCalc > 0 {
-			pnlUSD = pnlRatio * stakeForCalc
-		}
-	}
-	prevPnLUSD := valOrZero(orderRec.PnLUSD)
-	prevPnLRatio := valOrZero(orderRec.PnLRatio)
-	realizedPnLUSD := prevPnLUSD + pnlUSD
-	realizedPnLRatio := prevPnLRatio + pnlRatio
-
-	updatedOrder := database.LiveOrderRecord{
-		FreqtradeID:   tradeID,
-		Symbol:        strings.ToUpper(symbol),
-		Side:          side,
-		Amount:        ptrFloat(newAmount),
-		InitialAmount: orderRec.InitialAmount,
-		StakeAmount:   orderRec.StakeAmount,
-		Leverage:      orderRec.Leverage,
-		PositionValue: orderRec.PositionValue,
-		Price:         orderRec.Price,
-		ClosedAmount:  ptrFloat(newClosed),
-		IsSimulated:   orderRec.IsSimulated,
-		Status:        newStatus,
-		StartTime:     orderRec.StartTime,
-		EndTime:       nil,
-		CreatedAt:     orderRec.CreatedAt,
-		UpdatedAt:     now,
-		RawData:       rawData,
-		PnLRatio:      nil,
-		PnLUSD:        nil,
-	}
-	if updatedOrder.StakeAmount == nil && stake > 0 {
-		updatedOrder.StakeAmount = ptrFloat(stake)
-	}
-	if realizedPnLRatio != 0 {
-		updatedOrder.PnLRatio = ptrFloat(realizedPnLRatio)
-	}
-	if realizedPnLUSD != 0 {
-		updatedOrder.PnLUSD = ptrFloat(realizedPnLUSD)
-	}
-	updatedOrder.RealizedPnLRatio = ptrFloat(realizedPnLRatio)
-	updatedOrder.RealizedPnLUSD = ptrFloat(realizedPnLUSD)
-	updatedOrder.UnrealizedPnLRatio = ptrFloat(0)
-	updatedOrder.UnrealizedPnLUSD = ptrFloat(0)
-	if updatedOrder.CreatedAt.IsZero() {
-		updatedOrder.CreatedAt = now
-	}
-	if updatedOrder.StartTime == nil || updatedOrder.StartTime.IsZero() {
-		tmp := now
-		updatedOrder.StartTime = &tmp
-	}
-	if newStatus == database.LiveOrderStatusClosed {
-		updatedOrder.EndTime = &endTs
-	}
-	if newStatus == database.LiveOrderStatusClosed {
-		updatedOrder.Amount = ptrFloat(0)
-	}
-	syncAt := time.Now()
-	updatedOrder.LastStatusSync = &syncAt
-
-	finalTrade, detailErr := m.fetchTradeDetailWithRetry(ctx, tradeID)
-	if detailErr == nil && finalTrade != nil {
-		if finalTrade.CloseRate > 0 {
-			updatedOrder.CurrentPrice = ptrFloat(finalTrade.CloseRate)
-		}
-		updatedOrder.CurrentProfitRatio = ptrFloat(finalTrade.CloseProfit)
-		updatedOrder.CurrentProfitAbs = ptrFloat(finalTrade.CloseProfitAbs)
-		updatedOrder.RealizedPnLRatio = ptrFloat(finalTrade.CloseProfit)
-		updatedOrder.RealizedPnLUSD = ptrFloat(finalTrade.CloseProfitAbs)
-		syncAt = time.Now()
-		updatedOrder.LastStatusSync = &syncAt
-	} else if detailErr != nil {
-		// 若 /trades 不含该订单或返回 404，说明 freqtrade 已完全移除，保持 Closed 状态即可。
-		is404 := strings.Contains(detailErr.Error(), "404") || strings.Contains(detailErr.Error(), "Not Found")
-		if errors.Is(detailErr, errTradeNotFound) || is404 {
-			logger.Warnf("freqtrade manager: trade=%d 历史记录缺失，保持 Closed 状态", tradeID)
-			updatedOrder.Status = database.LiveOrderStatusClosed
-		} else if updatedOrder.Status != database.LiveOrderStatusClosed {
-			// 仅对未真正关闭的状态转为 retrying，等待后续补全。
-			updatedOrder.Status = database.LiveOrderStatusRetrying
-		} else {
-			logger.Warnf("freqtrade manager: trade=%d 查询盈亏失败 err=%v，但已平仓，保持 Closed", tradeID, detailErr)
-		}
-	}
-
-	if tierRec.FreqtradeID == 0 {
-		tierRec.FreqtradeID = tradeID
-		tierRec.Symbol = strings.ToUpper(symbol)
-	}
-	if newStatus == database.LiveOrderStatusClosed {
-		tierRec.Tier1Done, tierRec.Tier2Done, tierRec.Tier3Done = true, true, true
-		tierRec.RemainingRatio = 0
-		switch strings.ToLower(strings.TrimSpace(msg.ExitReason)) {
-		case "stop_loss":
-			tierRec.Status = 2
-		case "take_profit":
-			tierRec.Status = 1
-		default:
-			tierRec.Status = 0
-		}
-		tierRec.Timestamp = now
-	} else if pe.Kind != "" {
-		prevRemain := tierRec.RemainingRatio
-		if prevRemain <= 0 {
-			prevRemain = 1
-		}
-		fill := fill
-		prevAmt := prevAmount
-		if prevAmt > 0 {
-			ratio := math.Min(1, fill/prevAmt)
-			ratio = math.Max(0, ratio)
-			prevRemain = tierRec.RemainingRatio
-			if prevRemain <= 0 {
-				prevRemain = 1
-			}
-			tierRec.RemainingRatio = math.Max(0, prevRemain-ratio)
-		}
-		switch strings.ToLower(pe.Kind) {
-		case "tier1":
-			tierRec.Tier1Done = true
-			if pe.EntryPrice > 0 {
-				tierRec.StopLoss = pe.EntryPrice
-			}
-		case "tier2":
-			tierRec.Tier2Done = true
-		case "tier3":
-			tierRec.Tier3Done = true
-		case "take_profit":
-			tierRec.Tier1Done, tierRec.Tier2Done, tierRec.Tier3Done = true, true, true
-			tierRec.RemainingRatio = 0
-			tierRec.Status = 1
-		case "stop_loss":
-			tierRec.Tier1Done, tierRec.Tier2Done, tierRec.Tier3Done = true, true, true
-			tierRec.RemainingRatio = 0
-			tierRec.Status = 2
-		}
-	}
-	tierRec.UpdatedAt = now
-	if tierRec.CreatedAt.IsZero() {
-		tierRec.CreatedAt = now
-	}
-	if m.posRepo != nil {
-		if err := m.posRepo.SavePosition(ctx, updatedOrder, tierRec); err != nil {
-			logger.Errorf("freqtrade manager: 更新 live_orders (exit) 失败 trade=%d err=%v", tradeID, err)
-			logger.Debugf("freqtrade manager: exit upsert payload trade=%d symbol=%s side=%s closed_amount=%.6f status=%s ctx_err=%v", tradeID, updatedOrder.Symbol, updatedOrder.Side, valOrZero(updatedOrder.ClosedAmount), statusText(updatedOrder.Status), ctx.Err())
-		} else {
-			logger.Debugf("freqtrade manager: live_orders exit 更新 trade=%d closed_amount=%.6f status=%s", tradeID, valOrZero(updatedOrder.ClosedAmount), statusText(updatedOrder.Status))
-			m.updateCacheOrderTiers(updatedOrder, tierRec)
-		}
-	}
-
-	if newStatus == database.LiveOrderStatusClosed {
-		closedPos := m.markPositionClosed(tradeID, symbol, side, closePrice, stake, msg.ExitReason, endTs, realizedPnLRatio)
-		closedPos.Amount = 0
-		closedPos.ExitPnLUSD = realizedPnLUSD
-		m.mu.Lock()
-		m.positions[tradeID] = closedPos
-		m.mu.Unlock()
-		// 彻底关闭后清除 pending exit，避免后续重试 force_exit。
-		m.popPendingExit(tradeID)
 	} else {
-		m.mu.Lock()
-		cur := m.positions[tradeID]
-		cur.TradeID = tradeID
-		cur.Symbol = symbol
-		cur.Side = side
-		cur.Amount = newAmount
-		cur.Stake = stake
-		cur.ExitPnLRatio = realizedPnLRatio
-		cur.ExitPnLUSD = realizedPnLUSD
-		m.positions[tradeID] = cur
-		m.mu.Unlock()
+		pe, err = m.pendingFromWebhook(ctx, tradeID, symbol, side, closePrice, fill, msg)
+		if err != nil {
+			logger.Warnf("freqtrade manager: handleExit build pending trade=%d err=%v", tradeID, err)
+			return
+		}
 	}
 
-	op := database.OperationFailed
-	switch strings.ToLower(strings.TrimSpace(msg.ExitReason)) {
-	case "stop_loss":
-		op = database.OperationStopLoss
-	case "take_profit":
-		op = database.OperationTakeProfit
-	case "force_exit":
-		op = database.OperationForceExit
-	default:
-		op = database.OperationFailed
+	var snapshot *Trade
+	if trade, snapErr := m.fetchTradeDetailWithRetry(ctx, tradeID); snapErr == nil && trade != nil {
+		snapshot = trade
+	} else if snapErr != nil && !errors.Is(snapErr, errTradeNotFound) {
+		logger.Warnf("freqtrade manager: 获取 trade=%d 详情失败 err=%v", tradeID, snapErr)
 	}
-	m.appendOperation(ctx, tradeID, symbol, op, map[string]any{
+
+	orderRec, _, actualClosed, err := m.finalizePendingExit(ctx, pe, snapshot)
+	if err != nil {
+		logger.Errorf("freqtrade manager: 同步 exit 失败 trade=%d err=%v", tradeID, err)
+		return
+	}
+	if hasPending {
+		m.popPendingExit(tradeID)
+	}
+
+	newAmount := valOrZero(orderRec.Amount)
+	m.recordExitConfirm(tradeID, newAmount)
+	reason := strings.TrimSpace(msg.ExitReason)
+	op := operationFromReason(reason, pe.Operation)
+	m.appendOperation(ctx, tradeID, orderRec.Symbol, op, map[string]any{
 		"event_type": strings.ToUpper(event),
 		"price":      closePrice,
-		"reason":     strings.TrimSpace(msg.ExitReason),
-		"closed":     fill,
+		"reason":     reason,
+		"closed":     actualClosed,
 		"remaining":  newAmount,
-		"status":     statusText(newStatus),
-		"pnl_ratio":  pnlRatio,
-		"pnl_usd":    pnlUSD,
+		"status":     statusText(orderRec.Status),
+		"pnl_ratio":  valOrZero(orderRec.RealizedPnLRatio),
+		"pnl_usd":    valOrZero(orderRec.RealizedPnLUSD),
 	})
 
-	m.logWebhook(ctx, traceID, tradeID, symbol, event, msg)
-	m.recordOrder(ctx, msg, freqtradeAction(side, true), closePrice, parseFreqtradeTime(msg.CloseDate))
+	m.logWebhook(ctx, traceID, tradeID, orderRec.Symbol, event, msg)
+	m.recordOrder(ctx, msg, freqtradeAction(orderRec.Side, true), closePrice, closedAt)
 	title := "Freqtrade 平仓完成 ✅"
-	if newStatus != database.LiveOrderStatusClosed {
+	if orderRec.Status != database.LiveOrderStatusClosed {
 		title = "Freqtrade 部分平仓确认 ✅"
 	}
 	m.notify(title,
 		fmt.Sprintf("交易ID: %d", tradeID),
-		fmt.Sprintf("标的: %s", strings.ToUpper(symbol)),
-		fmt.Sprintf("方向: %s", strings.ToUpper(side)),
+		fmt.Sprintf("标的: %s", strings.ToUpper(orderRec.Symbol)),
+		fmt.Sprintf("方向: %s", strings.ToUpper(orderRec.Side)),
 		fmt.Sprintf("平仓价: %s", formatPrice(closePrice)),
-		fmt.Sprintf("成交数量: %s", formatQty(fill)),
+		fmt.Sprintf("成交数量: %s", formatQty(actualClosed)),
 		fmt.Sprintf("剩余数量: %s", formatQty(newAmount)),
-		fmt.Sprintf("原因: %s", strings.TrimSpace(msg.ExitReason)),
+		fmt.Sprintf("原因: %s", reason),
 		fmt.Sprintf("Trace: %s", traceID),
 	)
-	logger.Infof("freqtrade webhook exit trade=%d event=%s reason=%s closed=%.4f remaining=%.4f status=%s", tradeID, event, strings.TrimSpace(msg.ExitReason), fill, newAmount, statusText(newStatus))
+	logger.Infof("freqtrade webhook exit trade=%d event=%s reason=%s closed=%.4f remaining=%.4f status=%s", tradeID, event, reason, actualClosed, newAmount, statusText(orderRec.Status))
 }
 
 // handleEntryCancel 处理下单被取消。

@@ -304,7 +304,7 @@
       const headline = computed(() => {
         switch (view.value) {
           case 'decisions':
-            return { eyebrow: 'Blue Book', title: '决策档案', desc: '多 Agent 思维链· Notion 风格' };
+            return { eyebrow: 'Blue Book', title: '决策档案', desc: '多 Agent 思维链' };
           case 'positions':
             return { eyebrow: 'Red Book', title: '仓位 Command Center', desc: '实盘持仓 / 止盈止损 / tiers' };
           case 'decisionDetail':

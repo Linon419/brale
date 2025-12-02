@@ -170,7 +170,7 @@ func requestLogger() gin.HandlerFunc {
 		if query != "" {
 			fullPath = path + "?" + query
 		}
-		logger.Infof("HTTP %s %s status=%d ip=%s dur=%s", method, fullPath, status, client, dur)
+		logger.Debugf("HTTP %s %s status=%d ip=%s dur=%s", method, fullPath, status, client, dur)
 	}
 }
 

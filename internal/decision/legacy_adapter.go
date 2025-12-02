@@ -56,7 +56,7 @@ type LegacyEngineAdapter struct {
 	DebugStructuredBlocks bool
 
 	// 可选：补充 OI 与资金费率
-	Metrics *market.MetricsService
+	Metrics        *market.MetricsService
 	IncludeOI      bool
 	IncludeFunding bool
 
@@ -350,7 +350,7 @@ func (e *LegacyEngineAdapter) buildUserSummary(ctx context.Context, input Contex
 			}
 			writeInsight(ins)
 		}
-		b.WriteString("请基于这些多 Agent 结论与风险约束输出最终 JSON 决策。\n")
+		b.WriteString("请基于这些多 Agent 结论，市场衍生品数据，以及时间窗口与风险约束输出最终 JSON 决策。\n")
 	} else {
 		b.WriteString("\n## Multi-Agent Insights\n- 暂无可用结论，请谨慎观望或输出空决策。\n")
 	}

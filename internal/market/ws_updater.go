@@ -34,7 +34,7 @@ func (u *WSUpdater) Update(ctx context.Context, symbol, interval string, k Candl
 }
 
 // Start 订阅实时行情并持续写入 Store。
-func (u *WSUpdater) Start(ctx context.Context, symbols []string, intervals []string, batchSize int) error {
+func (u *WSUpdater) Start(ctx context.Context, symbols []string, intervals []string) error {
 	if u.Source == nil {
 		return fmt.Errorf("ws updater missing source")
 	}
@@ -42,7 +42,6 @@ func (u *WSUpdater) Start(ctx context.Context, symbols []string, intervals []str
 		return fmt.Errorf("ws updater requires symbols & intervals")
 	}
 	opts := SubscribeOptions{
-		BatchSize:    batchSize,
 		OnConnect:    u.OnConnected,
 		OnDisconnect: u.OnDisconnected,
 	}
@@ -53,7 +52,7 @@ func (u *WSUpdater) Start(ctx context.Context, symbols []string, intervals []str
 	u.startOnce.Do(func() {
 		go u.consume(ctx, events)
 	})
-	logger.Infof("[WS] 订阅已启动 symbols=%v intervals=%v batch=%d", symbols, intervals, batchSize)
+	logger.Infof("[WS] 订阅已启动 symbols=%v intervals=%v", symbols, intervals)
 	return nil
 }
 

@@ -2,39 +2,42 @@ package binance
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"brale/internal/logger"
 	"brale/internal/market"
+
+	"github.com/adshao/go-binance/v2/futures"
 )
 
 const maxHistoryLimit = 1500
 
-// Source 实现了 market.Source，负责 Binance REST/WS 接入。
+// Source 基于 go-binance SDK 实现 market.Source。
 type Source struct {
-	cfg        Config
-	httpClient *http.Client
+	cfg    Config
+	client *futures.Client
 
-	mu     sync.Mutex
-	ws     *combinedStreamsClient
-	cancel context.CancelFunc
+	mu           sync.Mutex
+	candleCancel context.CancelFunc
+	tradeCancel  context.CancelFunc
 
-	tradeWS     *combinedStreamsClient
-	tradeCancel context.CancelFunc
-
-	stats market.SourceStats
+	statsMu sync.Mutex
+	stats   market.SourceStats
 }
 
 func New(cfg Config) (*Source, error) {
 	final := cfg.withDefaults()
+	client := futures.NewClient("", "")
+	client.BaseURL = strings.TrimSpace(final.RESTBaseURL)
+	client.HTTPClient = &http.Client{Timeout: final.HTTPTimeout}
 	return &Source{
-		cfg:        final,
-		httpClient: &http.Client{Timeout: final.HTTPTimeout},
+		cfg:    final,
+		client: client,
 	}, nil
 }
 
@@ -53,38 +56,25 @@ func (s *Source) FetchHistory(ctx context.Context, symbol, interval string, limi
 	if interval == "" {
 		return nil, fmt.Errorf("interval is required")
 	}
-	url := fmt.Sprintf("%s/fapi/v1/klines?symbol=%s&interval=%s&limit=%d", s.cfg.RESTBaseURL, symbol, interval, limit)
-	logger.Debugf("[binance] REST %s", url)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	svc := s.client.NewKlinesService().Symbol(symbol).Interval(interval).Limit(limit)
+	kls, err := svc.Do(ctx)
 	if err != nil {
 		return nil, err
 	}
-	resp, err := s.httpClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode/100 != 2 {
-		return nil, fmt.Errorf("binance history error: %s", resp.Status)
-	}
-	var raw [][]any
-	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
-		return nil, err
-	}
-	out := make([]market.Candle, 0, len(raw))
-	for _, k := range raw {
-		if len(k) < 7 {
+	out := make([]market.Candle, 0, len(kls))
+	for _, kl := range kls {
+		if kl == nil {
 			continue
 		}
 		c := market.Candle{
-			OpenTime:  toInt64(k[0]),
-			CloseTime: toInt64(k[6]),
-			Open:      toFloat(k[1]),
-			High:      toFloat(k[2]),
-			Low:       toFloat(k[3]),
-			Close:     toFloat(k[4]),
-			Volume:    toFloat(k[5]),
-			Trades:    toInt64Safe(k, 8),
+			OpenTime:  kl.OpenTime,
+			CloseTime: kl.CloseTime,
+			Open:      parseFloat(kl.Open),
+			High:      parseFloat(kl.High),
+			Low:       parseFloat(kl.Low),
+			Close:     parseFloat(kl.Close),
+			Volume:    parseFloat(kl.Volume),
+			Trades:    kl.TradeNum,
 		}
 		out = append(out, c)
 	}
@@ -92,67 +82,27 @@ func (s *Source) FetchHistory(ctx context.Context, symbol, interval string, limi
 }
 
 func (s *Source) Subscribe(ctx context.Context, symbols, intervals []string, opts market.SubscribeOptions) (<-chan market.CandleEvent, error) {
-	if len(symbols) == 0 || len(intervals) == 0 {
-		return nil, fmt.Errorf("symbols and intervals are required for subscription")
+	mapping := buildSymbolIntervals(symbols, intervals)
+	if len(mapping) == 0 {
+		return nil, fmt.Errorf("no valid symbols or intervals for subscription")
 	}
-	batch := opts.BatchSize
-	if batch <= 0 {
-		batch = s.cfg.WSBatchSize
-	}
-	ws := newCombinedStreamsClient(s.cfg.WSBaseURL, batch)
-	ws.SetCallbacks(opts.OnConnect, opts.OnDisconnect)
-	if err := ws.Connect(); err != nil {
-		return nil, err
-	}
-
-	subCtx, cancel := context.WithCancel(ctx)
-	s.mu.Lock()
-	if s.cancel != nil {
-		s.cancel()
-	}
-	if s.ws != nil {
-		s.ws.Close()
-	}
-	s.ws = ws
-	s.cancel = cancel
-	s.mu.Unlock()
-
 	buffer := opts.Buffer
 	if buffer <= 0 {
 		buffer = 512
 	}
 	out := make(chan market.CandleEvent, buffer)
-	var wg sync.WaitGroup
+	subCtx, cancel := context.WithCancel(ctx)
 
-	nIntervals := normalizeIntervals(intervals)
-	for _, sym := range symbols {
-		upper := strings.ToUpper(strings.TrimSpace(sym))
-		if upper == "" {
-			continue
-		}
-		for _, iv := range nIntervals {
-			stream := strings.ToLower(sym) + "@kline_" + iv
-			sub := ws.AddSubscriber(stream, 200)
-			wg.Add(1)
-			go func(symbol, interval string, ch <-chan []byte) {
-				defer wg.Done()
-				s.forwardStream(subCtx, symbol, interval, ch, out)
-			}(upper, iv, sub)
-		}
+	s.mu.Lock()
+	if s.candleCancel != nil {
+		s.candleCancel()
 	}
-	for _, iv := range nIntervals {
-		if err := ws.BatchSubscribeKlines(symbols, iv); err != nil {
-			ws.Close()
-			cancel()
-			return nil, err
-		}
-	}
+	s.candleCancel = cancel
+	s.mu.Unlock()
 
 	go func() {
-		<-subCtx.Done()
-		ws.Close()
-		wg.Wait()
-		close(out)
+		defer close(out)
+		s.runKlineLoop(subCtx, mapping, out, opts)
 	}()
 	return out, nil
 }
@@ -161,264 +111,307 @@ func (s *Source) SubscribeTrades(ctx context.Context, symbols []string, opts mar
 	if len(symbols) == 0 {
 		return nil, fmt.Errorf("symbols are required for trade subscription")
 	}
-	batch := opts.BatchSize
-	if batch <= 0 {
-		batch = s.cfg.WSBatchSize
+	targets := make([]string, 0, len(symbols))
+	for _, sym := range symbols {
+		upper := strings.ToUpper(strings.TrimSpace(sym))
+		if upper != "" {
+			targets = append(targets, upper)
+		}
 	}
-	ws := newCombinedStreamsClient(s.cfg.WSBaseURL, batch)
-	ws.SetCallbacks(opts.OnConnect, opts.OnDisconnect)
-	if err := ws.Connect(); err != nil {
-		return nil, err
+	if len(targets) == 0 {
+		return nil, fmt.Errorf("no valid symbols for trade subscription")
 	}
-
-	subCtx, cancel := context.WithCancel(ctx)
-	s.mu.Lock()
-	if s.tradeCancel != nil {
-		s.tradeCancel()
-	}
-	if s.tradeWS != nil {
-		s.tradeWS.Close()
-	}
-	s.tradeWS = ws
-	s.tradeCancel = cancel
-	s.mu.Unlock()
-
 	buffer := opts.Buffer
 	if buffer <= 0 {
 		buffer = 1024
 	}
 	out := make(chan market.TradeEvent, buffer)
-	var wg sync.WaitGroup
-	for _, sym := range symbols {
-		upper := strings.ToUpper(strings.TrimSpace(sym))
-		if upper == "" {
-			continue
-		}
-		stream := strings.ToLower(upper) + "@aggTrade"
-		sub := ws.AddSubscriber(stream, 200)
-		wg.Add(1)
-		go func(symbol string, ch <-chan []byte) {
-			defer wg.Done()
-			s.forwardAggTrade(subCtx, symbol, ch, out)
-		}(upper, sub)
+	subCtx, cancel := context.WithCancel(ctx)
+
+	s.mu.Lock()
+	if s.tradeCancel != nil {
+		s.tradeCancel()
 	}
-	if err := ws.BatchSubscribeAggTrades(symbols); err != nil {
-		ws.Close()
-		cancel()
-		return nil, err
-	}
+	s.tradeCancel = cancel
+	s.mu.Unlock()
 
 	go func() {
-		<-subCtx.Done()
-		ws.Close()
-		wg.Wait()
-		close(out)
+		defer close(out)
+		s.runTradeLoop(subCtx, targets, out, opts)
 	}()
 	return out, nil
 }
 
-func (s *Source) forwardStream(ctx context.Context, symbol, interval string, stream <-chan []byte, out chan<- market.CandleEvent) {
+func (s *Source) runKlineLoop(ctx context.Context, mapping map[string][]string, out chan<- market.CandleEvent, opts market.SubscribeOptions) {
+	delay := time.Second
 	for {
-		select {
-		case <-ctx.Done():
+		if ctx.Err() != nil {
 			return
-		case msg, ok := <-stream:
+		}
+		var errMu sync.Mutex
+		var lastErr error
+		handler := func(event *futures.WsKlineEvent) {
+			ce, ok := convertKlineEvent(event)
 			if !ok {
 				return
 			}
-			var ev klineEvent
-			if err := json.Unmarshal(msg, &ev); err != nil {
-				logger.Warnf("[binance] 解码 WS 帧失败: %v", err)
-				continue
-			}
-			c := market.Candle{
-				OpenTime:  ev.Kline.StartTime,
-				CloseTime: ev.Kline.CloseTime,
-				Open:      ev.Kline.OpenPrice.Float(),
-				High:      ev.Kline.HighPrice.Float(),
-				Low:       ev.Kline.LowPrice.Float(),
-				Close:     ev.Kline.ClosePrice.Float(),
-				Volume:    ev.Kline.Volume.Float(),
-				Trades:    int64(ev.Kline.NumberOfTrades),
-			}
-			event := market.CandleEvent{Symbol: symbol, Interval: interval, Candle: c}
 			select {
-			case out <- event:
+			case <-ctx.Done():
+				return
+			case out <- ce:
 			default:
-				logger.Warnf("[binance] 事件通道已满，丢弃 %s %s", symbol, interval)
+				logger.Warnf("[binance] kline channel full, drop %s %s", ce.Symbol, ce.Interval)
 			}
 		}
+		errHandler := func(err error) {
+			if err == nil {
+				return
+			}
+			errMu.Lock()
+			lastErr = err
+			errMu.Unlock()
+		}
+		doneC, stopC, err := futures.WsCombinedKlineServeMultiInterval(mapping, handler, errHandler)
+		if err != nil {
+			s.recordSubscribeError(err)
+			if opts.OnDisconnect != nil {
+				opts.OnDisconnect(err)
+			}
+			if !sleepWithContext(ctx, delay) {
+				return
+			}
+			delay = nextDelay(delay)
+			continue
+		}
+		delay = time.Second
+		if opts.OnConnect != nil {
+			opts.OnConnect()
+		}
+		select {
+		case <-ctx.Done():
+			close(stopC)
+			<-doneC
+			return
+		case <-doneC:
+		}
+		close(stopC)
+		errMu.Lock()
+		errCopy := lastErr
+		errMu.Unlock()
+		s.recordReconnect(errCopy)
+		if opts.OnDisconnect != nil {
+			opts.OnDisconnect(errCopy)
+		}
+		if !sleepWithContext(ctx, delay) {
+			return
+		}
+		delay = nextDelay(delay)
 	}
 }
 
-func (s *Source) forwardAggTrade(ctx context.Context, symbol string, stream <-chan []byte, out chan<- market.TradeEvent) {
+func (s *Source) runTradeLoop(ctx context.Context, symbols []string, out chan<- market.TradeEvent, opts market.SubscribeOptions) {
+	delay := time.Second
 	for {
-		select {
-		case <-ctx.Done():
+		if ctx.Err() != nil {
 			return
-		case msg, ok := <-stream:
+		}
+		var errMu sync.Mutex
+		var lastErr error
+		handler := func(event *futures.WsAggTradeEvent) {
+			te, ok := convertAggTradeEvent(event)
 			if !ok {
 				return
 			}
-			var ev aggTradePayload
-			if err := json.Unmarshal(msg, &ev); err != nil {
-				logger.Warnf("[binance] 解码 aggTrade 帧失败: %v", err)
-				continue
-			}
-			price := ev.Price.Float()
-			if price <= 0 {
-				continue
-			}
-			event := market.TradeEvent{
-				Symbol:    symbol,
-				Price:     price,
-				Quantity:  ev.Quantity.Float(),
-				EventTime: ev.EventTime,
-				TradeTime: ev.TradeTime,
-			}
 			select {
-			case out <- event:
+			case <-ctx.Done():
+				return
+			case out <- te:
 			default:
-				logger.Warnf("[binance] aggTrade 事件通道已满，丢弃 %s", symbol)
+				logger.Warnf("[binance] aggTrade channel full, drop %s", te.Symbol)
 			}
 		}
+		errHandler := func(err error) {
+			if err == nil {
+				return
+			}
+			errMu.Lock()
+			lastErr = err
+			errMu.Unlock()
+		}
+		doneC, stopC, err := futures.WsCombinedAggTradeServe(symbols, handler, errHandler)
+		if err != nil {
+			s.recordSubscribeError(err)
+			if opts.OnDisconnect != nil {
+				opts.OnDisconnect(err)
+			}
+			if !sleepWithContext(ctx, delay) {
+				return
+			}
+			delay = nextDelay(delay)
+			continue
+		}
+		delay = time.Second
+		if opts.OnConnect != nil {
+			opts.OnConnect()
+		}
+		select {
+		case <-ctx.Done():
+			close(stopC)
+			<-doneC
+			return
+		case <-doneC:
+		}
+		close(stopC)
+		errMu.Lock()
+		errCopy := lastErr
+		errMu.Unlock()
+		s.recordReconnect(errCopy)
+		if opts.OnDisconnect != nil {
+			opts.OnDisconnect(errCopy)
+		}
+		if !sleepWithContext(ctx, delay) {
+			return
+		}
+		delay = nextDelay(delay)
 	}
 }
 
 func (s *Source) Stats() market.SourceStats {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	stats := market.SourceStats{}
-	if s.ws != nil {
-		stats = s.ws.Stats()
-	}
-	if s.tradeWS != nil {
-		ts := s.tradeWS.Stats()
-		stats.Reconnects += ts.Reconnects
-		stats.SubscribeErrors += ts.SubscribeErrors
-		if stats.LastError == "" {
-			stats.LastError = ts.LastError
-		}
-	}
-	return stats
+	s.statsMu.Lock()
+	defer s.statsMu.Unlock()
+	return s.stats
 }
 
 func (s *Source) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.cancel != nil {
-		s.cancel()
-		s.cancel = nil
-	}
-	if s.ws != nil {
-		s.ws.Close()
-		s.ws = nil
+	if s.candleCancel != nil {
+		s.candleCancel()
+		s.candleCancel = nil
 	}
 	if s.tradeCancel != nil {
 		s.tradeCancel()
 		s.tradeCancel = nil
 	}
-	if s.tradeWS != nil {
-		s.tradeWS.Close()
-		s.tradeWS = nil
-	}
 	return nil
 }
 
-func normalizeIntervals(intervals []string) []string {
-	out := make([]string, 0, len(intervals))
-	for _, iv := range intervals {
-		trimmed := strings.ToLower(strings.TrimSpace(iv))
-		if trimmed != "" {
-			out = append(out, trimmed)
+func buildSymbolIntervals(symbols, intervals []string) map[string][]string {
+	out := make(map[string][]string)
+	for _, sym := range symbols {
+		upper := strings.ToUpper(strings.TrimSpace(sym))
+		if upper == "" {
+			continue
+		}
+		for _, iv := range intervals {
+			interval := strings.ToLower(strings.TrimSpace(iv))
+			if interval == "" {
+				continue
+			}
+			out[upper] = appendUnique(out[upper], interval)
 		}
 	}
 	return out
 }
 
-func toFloat(v any) float64 {
-	switch t := v.(type) {
-	case string:
-		f, _ := strconv.ParseFloat(t, 64)
-		return f
-	case float64:
-		return t
-	default:
-		return 0
-	}
-}
-
-func toInt64(v any) int64 {
-	switch t := v.(type) {
-	case float64:
-		return int64(t)
-	case string:
-		f, _ := strconv.ParseFloat(t, 64)
-		return int64(f)
-	default:
-		return 0
-	}
-}
-
-func toInt64Safe(row []any, idx int) int64 {
-	if idx < 0 || idx >= len(row) {
-		return 0
-	}
-	return toInt64(row[idx])
-}
-
-type aggTradePayload struct {
-	EventType  string   `json:"e"`
-	EventTime  int64    `json:"E"`
-	Symbol     string   `json:"s"`
-	TradeID    int64    `json:"a"`
-	Price      strOrNum `json:"p"`
-	Quantity   strOrNum `json:"q"`
-	FirstID    int64    `json:"f"`
-	LastID     int64    `json:"l"`
-	TradeTime  int64    `json:"T"`
-	BuyerMaker bool     `json:"m"`
-}
-
-type klineEvent struct {
-	EventType string `json:"e"`
-	EventTime int64  `json:"E"`
-	Symbol    string `json:"s"`
-	Kline     struct {
-		StartTime           int64    `json:"t"`
-		CloseTime           int64    `json:"T"`
-		Symbol              string   `json:"s"`
-		Interval            string   `json:"i"`
-		OpenPrice           strOrNum `json:"o"`
-		ClosePrice          strOrNum `json:"c"`
-		HighPrice           strOrNum `json:"h"`
-		LowPrice            strOrNum `json:"l"`
-		Volume              strOrNum `json:"v"`
-		NumberOfTrades      int      `json:"n"`
-		IsFinal             bool     `json:"x"`
-		QuoteVolume         strOrNum `json:"q"`
-		TakerBuyBaseVolume  strOrNum `json:"V"`
-		TakerBuyQuoteVolume strOrNum `json:"Q"`
-		Ignore              strOrNum `json:"B"`
-	} `json:"k"`
-}
-
-type strOrNum string
-
-func (s *strOrNum) UnmarshalJSON(b []byte) error {
-	if len(b) > 0 && b[0] == '"' {
-		var v string
-		if err := json.Unmarshal(b, &v); err != nil {
-			return err
+func appendUnique(target []string, val string) []string {
+	for _, existing := range target {
+		if existing == val {
+			return target
 		}
-		*s = strOrNum(v)
-		return nil
 	}
-	*s = strOrNum(string(b))
-	return nil
+	return append(target, val)
 }
 
-func (s strOrNum) Float() float64 {
-	f, _ := strconv.ParseFloat(string(s), 64)
+func parseFloat(v string) float64 {
+	f, _ := strconv.ParseFloat(strings.TrimSpace(v), 64)
 	return f
+}
+
+func convertKlineEvent(ev *futures.WsKlineEvent) (market.CandleEvent, bool) {
+	if ev == nil {
+		return market.CandleEvent{}, false
+	}
+	c := market.Candle{
+		OpenTime:  ev.Kline.StartTime,
+		CloseTime: ev.Kline.EndTime,
+		Open:      parseFloat(ev.Kline.Open),
+		High:      parseFloat(ev.Kline.High),
+		Low:       parseFloat(ev.Kline.Low),
+		Close:     parseFloat(ev.Kline.Close),
+		Volume:    parseFloat(ev.Kline.Volume),
+		Trades:    ev.Kline.TradeNum,
+	}
+	symbol := strings.ToUpper(strings.TrimSpace(ev.Symbol))
+	interval := strings.ToLower(strings.TrimSpace(ev.Kline.Interval))
+	if symbol == "" || interval == "" {
+		return market.CandleEvent{}, false
+	}
+	return market.CandleEvent{Symbol: symbol, Interval: interval, Candle: c}, true
+}
+
+func convertAggTradeEvent(ev *futures.WsAggTradeEvent) (market.TradeEvent, bool) {
+	if ev == nil {
+		return market.TradeEvent{}, false
+	}
+	price := parseFloat(ev.Price)
+	if price <= 0 {
+		return market.TradeEvent{}, false
+	}
+	quantity := parseFloat(ev.Quantity)
+	symbol := strings.ToUpper(strings.TrimSpace(ev.Symbol))
+	if symbol == "" {
+		return market.TradeEvent{}, false
+	}
+	return market.TradeEvent{
+		Symbol:    symbol,
+		Price:     price,
+		Quantity:  quantity,
+		EventTime: ev.Time,
+		TradeTime: ev.TradeTime,
+	}, true
+}
+
+func sleepWithContext(ctx context.Context, d time.Duration) bool {
+	if d <= 0 {
+		d = time.Second
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
+func nextDelay(current time.Duration) time.Duration {
+	if current <= 0 {
+		return time.Second
+	}
+	next := current * 2
+	if next > 30*time.Second {
+		next = 30 * time.Second
+	}
+	return next
+}
+
+func (s *Source) recordSubscribeError(err error) {
+	if err == nil {
+		return
+	}
+	s.statsMu.Lock()
+	s.stats.SubscribeErrors++
+	s.stats.LastError = err.Error()
+	s.statsMu.Unlock()
+}
+
+func (s *Source) recordReconnect(err error) {
+	s.statsMu.Lock()
+	s.stats.Reconnects++
+	if err != nil && err.Error() != "" {
+		s.stats.LastError = err.Error()
+	}
+	s.statsMu.Unlock()
 }

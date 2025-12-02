@@ -2,6 +2,8 @@ package freqtrade
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -64,7 +66,15 @@ func (m *Manager) SyncOpenPositions(ctx context.Context) (int, error) {
 		m.hadTradeSnap = true
 	}
 
-	active, _ := m.posRepo.ActivePositions(ctx, 500)
+	active, err := m.posRepo.ActivePositions(ctx, 500)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			active = nil
+		} else {
+			logger.Errorf("freqtrade sync: ActivePositions 查询失败 err=%v", err)
+			return 0, err
+		}
+	}
 	activeMap := make(map[int]database.LiveOrderWithTiers, len(active))
 	for _, p := range active {
 		activeMap[p.Order.FreqtradeID] = p
@@ -79,6 +89,9 @@ func (m *Manager) SyncOpenPositions(ctx context.Context) (int, error) {
 				activeMap[p.Order.FreqtradeID] = p
 			}
 		}
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		logger.Errorf("freqtrade sync: RecentPositions 查询失败 err=%v", err)
+		return 0, err
 	}
 
 	count := 0
@@ -97,6 +110,10 @@ func (m *Manager) SyncOpenPositions(ctx context.Context) (int, error) {
 			defer lock.Unlock()
 			if m.hasPendingExit(tradeID) {
 				logger.Debugf("freqtrade sync: skip trade=%d pending exit", tradeID)
+				return
+			}
+			if confirm, ok := m.peekExitConfirm(tradeID); ok && confirm.Remaining <= pendingAmountEpsilon {
+				logger.Debugf("freqtrade sync: skip trade=%d due to recent confirmed exit (remaining=%.6f)", tradeID, confirm.Remaining)
 				return
 			}
 			symbol := freqtradePairToSymbol(tr.Pair)
@@ -193,7 +210,13 @@ func (m *Manager) SyncOpenPositions(ctx context.Context) (int, error) {
 			if existed {
 				tier = existing.Tiers
 			} else if m.posRepo != nil {
-				if storedOrder, storedTier, ok, err := m.posRepo.GetPosition(ctx, tradeID); err == nil && ok {
+				storedOrder, storedTier, ok, err := m.posRepo.GetPosition(ctx, tradeID)
+				if err != nil {
+					if !errors.Is(err, sql.ErrNoRows) {
+						logger.Errorf("freqtrade sync: GetPosition 失败 trade=%d err=%v", tradeID, err)
+						return
+					}
+				} else if ok {
 					existing = database.LiveOrderWithTiers{Order: storedOrder, Tiers: storedTier}
 					existed = true
 					tier = storedTier
@@ -230,9 +253,14 @@ func (m *Manager) SyncOpenPositions(ctx context.Context) (int, error) {
 			if err := m.posRepo.SavePosition(ctx, order, tier); err == nil {
 				m.updateCacheOrderTiers(order, tier)
 			} else {
+				logger.Errorf("freqtrade sync: SavePosition 失败 trade=%d symbol=%s err=%v", tradeID, symbol, err)
 				// 回退到非事务写入，避免因兼容问题丢失数据。
-				_ = m.posRepo.UpsertOrder(ctx, order)
-				_ = m.posRepo.UpsertTiers(ctx, tier)
+				if upErr := m.posRepo.UpsertOrder(ctx, order); upErr != nil {
+					logger.Errorf("freqtrade sync: UpsertOrder 回退失败 trade=%d symbol=%s err=%v", tradeID, symbol, upErr)
+				}
+				if tierErr := m.posRepo.UpsertTiers(ctx, tier); tierErr != nil {
+					logger.Errorf("freqtrade sync: UpsertTiers 回退失败 trade=%d symbol=%s err=%v", tradeID, symbol, tierErr)
+				}
 				m.updateCacheOrderTiers(order, tier)
 			}
 			if !existed {
@@ -337,7 +365,10 @@ func (m *Manager) SyncOpenPositions(ctx context.Context) (int, error) {
 			// 同步删除映射，避免残留。
 			m.deleteTrade(strings.ToUpper(order.Symbol), order.Side)
 
-			_ = m.posRepo.SavePosition(ctx, order, tier)
+			if err := m.posRepo.SavePosition(ctx, order, tier); err != nil {
+				logger.Errorf("freqtrade sync: ghost close SavePosition 失败 trade=%d symbol=%s err=%v", tradeID, order.Symbol, err)
+				return
+			}
 			m.updateCacheOrderTiers(order, tier)
 			logger.Debugf("freqtrade sync: reconcile close ghost trade=%d symbol=%s closed_amount=%.6f reason=freqtrade_missing", tradeID, order.Symbol, valOrZero(order.ClosedAmount))
 			// 同时更新内存缓存，避免残留 open。

@@ -86,6 +86,7 @@ type FreqtradeConfig struct {
 	WebhookURL         string  `toml:"webhook_url"`
 	RiskStorePath      string  `toml:"risk_store_path"`
 	MinStopDistancePct float64 `toml:"min_stop_distance_pct"`
+	EntrySlipPct       float64 `toml:"entry_slip_pct"`
 	EntryTag           string  `toml:"entry_tag"`
 }
 
@@ -180,12 +181,9 @@ type MarketConfig struct {
 }
 
 type MarketSource struct {
-	Name            string `toml:"name"`
-	Enabled         bool   `toml:"enabled"`
-	RESTBaseURL     string `toml:"rest_base_url"`
-	WSBaseURL       string `toml:"ws_base_url"`
-	RateLimitPerMin int    `toml:"rate_limit_per_min"`
-	WSBatchSize     int    `toml:"ws_batch_size"`
+	Name        string `toml:"name"`
+	Enabled     bool   `toml:"enabled"`
+	RESTBaseURL string `toml:"rest_base_url"`
 }
 
 // HorizonProfile 描述特定持仓周期所需的时间段与指标参数。
@@ -349,12 +347,9 @@ type RSIConfig struct {
 func (m MarketConfig) ResolveActiveSource() MarketSource {
 	if len(m.Sources) == 0 {
 		return MarketSource{
-			Name:            "binance",
-			Enabled:         true,
-			RESTBaseURL:     "https://fapi.binance.com",
-			WSBaseURL:       "wss://fstream.binance.com/stream",
-			RateLimitPerMin: 1200,
-			WSBatchSize:     150,
+			Name:        "binance",
+			Enabled:     true,
+			RESTBaseURL: "https://fapi.binance.com",
 		}
 	}
 	active := strings.ToLower(strings.TrimSpace(m.ActiveSource))
@@ -691,27 +686,15 @@ func applyDefaults(c *Config) {
 	}
 	if len(c.Market.Sources) == 0 {
 		c.Market.Sources = []MarketSource{{
-			Name:            "binance",
-			Enabled:         true,
-			RESTBaseURL:     "https://fapi.binance.com",
-			WSBaseURL:       "wss://fstream.binance.com/stream",
-			RateLimitPerMin: 1200,
-			WSBatchSize:     150,
+			Name:        "binance",
+			Enabled:     true,
+			RESTBaseURL: "https://fapi.binance.com",
 		}}
 	}
 	for i := range c.Market.Sources {
 		src := &c.Market.Sources[i]
 		if src.RESTBaseURL == "" {
 			src.RESTBaseURL = "https://fapi.binance.com"
-		}
-		if src.WSBaseURL == "" {
-			src.WSBaseURL = "wss://fstream.binance.com/stream"
-		}
-		if src.RateLimitPerMin <= 0 {
-			src.RateLimitPerMin = 1200
-		}
-		if src.WSBatchSize <= 0 {
-			src.WSBatchSize = 150
 		}
 		if src.Name == "" {
 			src.Name = fmt.Sprintf("market_%d", i)
@@ -777,6 +760,9 @@ func applyDefaults(c *Config) {
 	if c.Freqtrade.MinStopDistancePct < 0 {
 		c.Freqtrade.MinStopDistancePct = 0
 	}
+	if c.Freqtrade.EntrySlipPct < 0 {
+		c.Freqtrade.EntrySlipPct = 0
+	}
 }
 
 // 基础校验
@@ -838,8 +824,8 @@ func validate(c *Config) error {
 			continue
 		}
 		enabled++
-		if strings.TrimSpace(src.RESTBaseURL) == "" || strings.TrimSpace(src.WSBaseURL) == "" {
-			return fmt.Errorf("market source %s 需配置 rest_base_url 与 ws_base_url", src.Name)
+		if strings.TrimSpace(src.RESTBaseURL) == "" {
+			return fmt.Errorf("market source %s 缺少 rest_base_url", src.Name)
 		}
 		name := strings.ToLower(strings.TrimSpace(src.Name))
 		if activeName == "" || name == activeName {
@@ -889,6 +875,9 @@ func validate(c *Config) error {
 		}
 		if c.Freqtrade.MinStopDistancePct < 0 {
 			return fmt.Errorf("freqtrade.min_stop_distance_pct 需 >= 0")
+		}
+		if c.Freqtrade.EntrySlipPct < 0 {
+			return fmt.Errorf("freqtrade.entry_slip_pct 需 >= 0")
 		}
 	}
 	if c.Trading.Mode == "" {

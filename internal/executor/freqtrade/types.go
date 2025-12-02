@@ -128,23 +128,6 @@ type pendingHit struct {
 	seenAt int64
 }
 
-type pendingExit struct {
-	TradeID        int
-	Symbol         string
-	Side           string
-	Kind           string // stop_loss, take_profit, tier1, tier2, tier3
-	TargetPrice    float64
-	Ratio          float64
-	PrevAmount     float64
-	PrevClosed     float64
-	ExpectedAmount float64
-	RequestedAt    time.Time
-	Operation      database.OperationType
-	EntryPrice     float64
-	Stake          float64
-	Leverage       float64
-}
-
 func formatQty(val float64) string {
 	if val == 0 {
 		return "-"

@@ -13,7 +13,7 @@ import (
 
 // forceEnter/forceExit 封装 freqtrade 下单，供 Execute 使用。
 
-func (m *Manager) forceEnter(ctx context.Context, traceID string, d decision.Decision) error {
+func (m *Manager) forceEnter(ctx context.Context, traceID string, d decision.Decision, marketPrice float64) error {
 	pair := formatFreqtradePair(d.Symbol)
 	if pair == "" {
 		return fmt.Errorf("unable to convert symbol %s to freqtrade pair", d.Symbol)
@@ -35,8 +35,6 @@ func (m *Manager) forceEnter(ctx context.Context, traceID string, d decision.Dec
 	if lev <= 0 && m.cfg.DefaultLeverage > 0 {
 		lev = float64(m.cfg.DefaultLeverage)
 	}
-	logger.Infof("freqtrade manager: ForceEnter trace=%s symbol=%s pair=%s side=%s stake=%.2f lev=%.2f", m.ensureTrace(traceID), strings.ToUpper(d.Symbol), pair, side, stake, lev)
-
 	payload := ForceEnterPayload{
 		Pair:        pair,
 		Side:        side,
@@ -45,6 +43,15 @@ func (m *Manager) forceEnter(ctx context.Context, traceID string, d decision.Dec
 	}
 	if lev > 0 {
 		payload.Leverage = lev
+	}
+	if limitPrice, ok := m.entryLimitPrice(side, marketPrice); ok {
+		payload.Price = ptrFloat(limitPrice)
+		payload.OrderType = "limit"
+		logger.Infof("freqtrade manager: ForceEnter trace=%s symbol=%s pair=%s side=%s stake=%.2f lev=%.2f market=%.4f limit=%.4f slip=%.4f",
+			m.ensureTrace(traceID), strings.ToUpper(d.Symbol), pair, side, stake, lev, marketPrice, limitPrice, m.cfg.EntrySlipPct)
+	} else {
+		logger.Infof("freqtrade manager: ForceEnter trace=%s symbol=%s pair=%s side=%s stake=%.2f lev=%.2f",
+			m.ensureTrace(traceID), strings.ToUpper(d.Symbol), pair, side, stake, lev)
 	}
 
 	recData := map[string]any{"payload": payload, "status": "forceenter"}
@@ -114,8 +121,38 @@ func (m *Manager) forceExit(ctx context.Context, traceID string, d decision.Deci
 	if !(ratio > 0 && ratio < 1 && payload.Amount > 0) {
 		m.deleteTrade(d.Symbol, side)
 	}
+	status := database.LiveOrderStatusClosingFull
+	if ratio > 0 && ratio < 1 && payload.Amount > 0 {
+		status = database.LiveOrderStatusClosingPartial
+	}
+	m.updateOrderStatus(ctx, tradeID, d.Symbol, side, status)
 	logger.Infof("freqtrade manager: ForceExit success trace=%s trade_id=%d ratio=%.4f", m.ensureTrace(traceID), tradeID, clampCloseRatio(d.CloseRatio))
 	return nil
+}
+
+func (m *Manager) entryLimitPrice(side string, marketPrice float64) (float64, bool) {
+	if m == nil {
+		return 0, false
+	}
+	price := marketPrice
+	if price <= 0 {
+		return 0, false
+	}
+	slip := m.cfg.EntrySlipPct
+	if slip < 0 {
+		slip = 0
+	}
+	switch strings.ToLower(strings.TrimSpace(side)) {
+	case "long":
+		return price * (1 + slip), true
+	case "short":
+		if slip >= 1 {
+			slip = 0.999
+		}
+		return price * (1 - slip), true
+	default:
+		return 0, false
+	}
 }
 
 // persistPendingPosition 在发送建仓请求后立即写入 live_orders/live_tiers，标记为待确认。

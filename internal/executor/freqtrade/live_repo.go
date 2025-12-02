@@ -35,6 +35,14 @@ func (r *PositionRepo) UpsertOrder(ctx context.Context, rec database.LiveOrderRe
 	return r.store.UpsertLiveOrder(ctx, rec)
 }
 
+// UpdateOrderStatus 只更新 status。
+func (r *PositionRepo) UpdateOrderStatus(ctx context.Context, tradeID int, status database.LiveOrderStatus) error {
+	if r == nil || r.store == nil {
+		return fmt.Errorf("live position store 未初始化")
+	}
+	return r.store.UpdateOrderStatus(ctx, tradeID, status)
+}
+
 // UpsertTiers 写入/更新 live_tiers。
 func (r *PositionRepo) UpsertTiers(ctx context.Context, rec database.LiveTierRecord) error {
 	if r == nil || r.store == nil {
@@ -64,7 +72,9 @@ func (r *PositionRepo) AppendOperation(ctx context.Context, op database.TradeOpe
 		return
 	}
 	logger.Infof("PositionRepo: 写入操作流水 trade=%d 标的=%s op=%d", op.FreqtradeID, strings.ToUpper(op.Symbol), op.Operation)
-	_ = r.store.AppendTradeOperation(ctx, op)
+	if err := r.store.AppendTradeOperation(ctx, op); err != nil {
+		logger.Errorf("PositionRepo: 写入操作流水失败 trade=%d 标的=%s err=%v", op.FreqtradeID, strings.ToUpper(op.Symbol), err)
+	}
 }
 
 // InsertModification 写入 live_modification_log。
@@ -74,7 +84,9 @@ func (r *PositionRepo) InsertModification(ctx context.Context, log database.Tier
 	}
 	logger.Infof("PositionRepo: 写入修改流水 trade=%d 字段=%d 旧值=%s 新值=%s 来源=%d 原因=%s",
 		log.FreqtradeID, log.Field, strings.TrimSpace(log.OldValue), strings.TrimSpace(log.NewValue), log.Source, strings.TrimSpace(log.Reason))
-	_ = r.store.InsertTierModification(ctx, log)
+	if err := r.store.InsertTierModification(ctx, log); err != nil {
+		logger.Errorf("PositionRepo: 写入修改流水失败 trade=%d 字段=%d err=%v", log.FreqtradeID, log.Field, err)
+	}
 }
 
 // ActivePositions 返回活跃仓位及 tier 状态。

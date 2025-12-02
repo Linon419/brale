@@ -109,6 +109,18 @@ func floatEqual(a, b float64) bool {
 	return math.Abs(a-b) < eps
 }
 
+func approxEqual(a, b, tol float64) bool {
+	if tol <= 0 {
+		return floatEqual(a, b)
+	}
+	return math.Abs(a-b) < tol
+}
+
+func visibleEqual(a, b float64) bool {
+	const visibleEps = 1e-4
+	return approxEqual(a, b, visibleEps)
+}
+
 func freqtradeAction(side string, closing bool) string {
 	switch side {
 	case "long":

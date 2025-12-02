@@ -64,7 +64,10 @@ func (m *Manager) adjustStopLoss(ctx context.Context, traceID string, d decision
 	if err := m.validateTierRecord(entry, side, tierRec, true); err != nil {
 		return err
 	}
-	_ = m.posRepo.UpsertTiers(ctx, tierRec)
+	if err := m.posRepo.UpsertTiers(ctx, tierRec); err != nil {
+		logger.Errorf("freqtrade adjust_stop_loss: 写入 live_tiers 失败 trade=%d err=%v", tradeID, err)
+		return err
+	}
 	m.updateCacheOrderTiers(database.LiveOrderRecord{FreqtradeID: tradeID}, tierRec)
 	logger.Infof("freqtrade adjust_stop_loss trade=%d symbol=%s changed_stop=%v changed_tp=%v new_sl=%.4f new_tp=%.4f", tradeID, strings.ToUpper(d.Symbol), changedStop, changedTP, newStop, newTP)
 
@@ -171,7 +174,10 @@ func (m *Manager) adjustTakeProfit(ctx context.Context, traceID string, d decisi
 	if err := m.validateTierRecord(entry, side, tierRec, true); err != nil {
 		return err
 	}
-	_ = m.posRepo.UpsertTiers(ctx, tierRec)
+	if err := m.posRepo.UpsertTiers(ctx, tierRec); err != nil {
+		logger.Errorf("freqtrade adjust_take_profit: 写入 live_tiers 失败 trade=%d err=%v", tradeID, err)
+		return err
+	}
 	logger.Infof("freqtrade adjust_take_profit trade=%d symbol=%s changed_tp=%v changed_sl=%v new_tp=%.4f new_sl=%.4f", tradeID, strings.ToUpper(d.Symbol), changedTP, changedStop, newTP, newStop)
 
 	if changedTP {
@@ -313,15 +319,28 @@ func (m *Manager) updateTiers(ctx context.Context, traceID string, d decision.De
 	if !changed {
 		return nil
 	}
+	visibleChanged := !(visibleEqual(old.TakeProfit, newRec.TakeProfit) &&
+		visibleEqual(old.StopLoss, newRec.StopLoss) &&
+		visibleEqual(old.Tier1, newRec.Tier1) &&
+		visibleEqual(old.Tier2, newRec.Tier2) &&
+		visibleEqual(old.Tier3, newRec.Tier3) &&
+		visibleEqual(old.Tier1Ratio, newRec.Tier1Ratio) &&
+		visibleEqual(old.Tier2Ratio, newRec.Tier2Ratio) &&
+		visibleEqual(old.Tier3Ratio, newRec.Tier3Ratio))
 	if err := m.validateTierRecord(entry, side, newRec, enforceOffset); err != nil {
 		logger.Warnf("freqtrade update_tiers: validation failed trade=%d symbol=%s side=%s entry=%.4f err=%v", tradeID, strings.ToUpper(d.Symbol), side, entry, err)
 		return err
 	}
 	if err := m.posRepo.UpsertTiers(ctx, newRec); err != nil {
+		logger.Errorf("freqtrade update_tiers: 写入 live_tiers 失败 trade=%d err=%v", tradeID, err)
 		return err
 	}
 	m.updateCacheOrderTiers(database.LiveOrderRecord{FreqtradeID: tradeID, Symbol: strings.ToUpper(d.Symbol), Side: side, Status: orderRec.Status}, newRec)
 	logger.Infof("freqtrade update_tiers trade=%d symbol=%s tier_changed=%v", tradeID, strings.ToUpper(d.Symbol), changed)
+	if !visibleChanged {
+		logger.Debugf("freqtrade update_tiers trade=%d symbol=%s change below visible threshold, skip notify", tradeID, strings.ToUpper(d.Symbol))
+		return nil
+	}
 
 	writeMod := func(field database.TierField, oldV, newV float64) {
 		if floatEqual(oldV, newV) {

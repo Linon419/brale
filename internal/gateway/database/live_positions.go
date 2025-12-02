@@ -13,6 +13,7 @@ import (
 // LivePositionStore 描述新的仓位/tiers 存储能力。
 type LivePositionStore interface {
 	UpsertLiveOrder(ctx context.Context, rec LiveOrderRecord) error
+	UpdateOrderStatus(ctx context.Context, tradeID int, status LiveOrderStatus) error
 	UpsertLiveTiers(ctx context.Context, rec LiveTierRecord) error
 	SavePosition(ctx context.Context, order LiveOrderRecord, tier LiveTierRecord) error
 	InsertTierModification(ctx context.Context, log TierModificationLog) error
@@ -274,6 +275,34 @@ func (s *DecisionLogStore) UpsertLiveOrder(ctx context.Context, rec LiveOrderRec
 		return fmt.Errorf("decision log store 未初始化")
 	}
 	return s.upsertLiveOrderWithExec(ctx, db, rec)
+}
+
+// UpdateOrderStatus 仅更新 live_orders.status/updated_at。
+func (s *DecisionLogStore) UpdateOrderStatus(ctx context.Context, tradeID int, status LiveOrderStatus) error {
+	s.mu.Lock()
+	db := s.db
+	s.mu.Unlock()
+	if db == nil {
+		return fmt.Errorf("decision log store 未初始化")
+	}
+	if tradeID <= 0 {
+		return fmt.Errorf("freqtrade_id 必填")
+	}
+	if status == 0 {
+		status = LiveOrderStatusOpen
+	}
+	now := time.Now().UnixMilli()
+	res, err := db.ExecContext(ctx, `
+		UPDATE live_orders
+		SET status = ?, updated_at = ?
+		WHERE freqtrade_id = ?`, int(status), now, tradeID)
+	if err != nil {
+		return err
+	}
+	if rows, err := res.RowsAffected(); err == nil && rows == 0 {
+		return sql.ErrNoRows
+	}
+	return err
 }
 
 func (s *DecisionLogStore) upsertLiveTiersWithExec(ctx context.Context, exec interface {
