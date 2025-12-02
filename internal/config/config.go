@@ -181,9 +181,24 @@ type MarketConfig struct {
 }
 
 type MarketSource struct {
-	Name        string `toml:"name"`
-	Enabled     bool   `toml:"enabled"`
-	RESTBaseURL string `toml:"rest_base_url"`
+	Name        string      `toml:"name"`
+	Enabled     bool        `toml:"enabled"`
+	RESTBaseURL string      `toml:"rest_base_url"`
+	Proxy       ProxyConfig `toml:"proxy"`
+}
+
+type ProxyConfig struct {
+	Enabled bool   `toml:"enabled"`
+	RESTURL string `toml:"rest_url"`
+	WSURL   string `toml:"ws_url"`
+}
+
+func (p *ProxyConfig) normalize() {
+	if p == nil {
+		return
+	}
+	p.RESTURL = strings.TrimSpace(p.RESTURL)
+	p.WSURL = strings.TrimSpace(p.WSURL)
 }
 
 // HorizonProfile 描述特定持仓周期所需的时间段与指标参数。
@@ -693,6 +708,7 @@ func applyDefaults(c *Config) {
 	}
 	for i := range c.Market.Sources {
 		src := &c.Market.Sources[i]
+		src.Proxy.normalize()
 		if src.RESTBaseURL == "" {
 			src.RESTBaseURL = "https://fapi.binance.com"
 		}
@@ -826,6 +842,9 @@ func validate(c *Config) error {
 		enabled++
 		if strings.TrimSpace(src.RESTBaseURL) == "" {
 			return fmt.Errorf("market source %s 缺少 rest_base_url", src.Name)
+		}
+		if src.Proxy.Enabled && src.Proxy.RESTURL == "" && src.Proxy.WSURL == "" {
+			return fmt.Errorf("market source %s 启用了代理但未配置 rest_url 或 ws_url", src.Name)
 		}
 		name := strings.ToLower(strings.TrimSpace(src.Name))
 		if activeName == "" || name == activeName {

@@ -19,7 +19,10 @@ func NewSourceFromConfig(cfg *brcfg.Config) (market.Source, error) {
 	switch name {
 	case "", "binance", "binance-futures":
 		return binance.New(binance.Config{
-			RESTBaseURL: active.RESTBaseURL,
+			RESTBaseURL:  active.RESTBaseURL,
+			ProxyEnabled: active.Proxy.Enabled,
+			RESTProxyURL: active.Proxy.RESTURL,
+			WSProxyURL:   active.Proxy.WSURL,
 		})
 	default:
 		return nil, fmt.Errorf("unsupported market source: %s", active.Name)

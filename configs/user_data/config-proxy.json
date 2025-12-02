@@ -38,8 +38,15 @@
     "name": "binance",
     "key": "",
     "secret": "",
-    "ccxt_config": {},
-    "ccxt_async_config": {},
+    "ccxt_config": {
+      "proxies": {
+        "http": "http://host.docker.internal:10080",
+        "https": "http://host.docker.internal:10080"
+      }
+    },
+    "ccxt_async_config": {
+      "aiohttp_proxy": "http://host.docker.internal:10080"
+    },
     "pair_whitelist": [],
     "pair_blacklist": [
       "BNB/.*"
@@ -56,8 +63,8 @@
   ],
   "telegram": {
     "enabled": true,
-    "token": "7979485253:AAGtmW6v8eumkHMoQ3JClVo9iatwEa1rJpw",
-    "chat_id": "-1003001441406"
+    "token": "",
+    "chat_id": ""
   },
   "api_server": {
     "enabled": true,
@@ -65,11 +72,11 @@
     "listen_port": 8080,
     "verbosity": "info",
     "enable_openapi": false,
-    "jwt_secret_key": "fdd3b45b748d0aa84ad0fcab427f8606081f74076baa0c851085b35945cf62f0",
-    "ws_token": "_C_BHNRzaI8LSRRddcvJ4ram4mawCxkksw",
+    "jwt_secret_key": "",
+    "ws_token": "",
     "CORS_origins": [],
-    "username": "lauk",
-    "password": "881016"
+    "username": "",
+    "password": ""
   },
   "webhook": {
     "enabled": true,

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -34,7 +35,30 @@ func New(cfg Config) (*Source, error) {
 	final := cfg.withDefaults()
 	client := futures.NewClient("", "")
 	client.BaseURL = strings.TrimSpace(final.RESTBaseURL)
-	client.HTTPClient = &http.Client{Timeout: final.HTTPTimeout}
+	httpClient := &http.Client{Timeout: final.HTTPTimeout}
+	if final.ProxyEnabled && final.RESTProxyURL != "" {
+		proxyURL, err := url.Parse(final.RESTProxyURL)
+		if err != nil {
+			return nil, fmt.Errorf("invalid REST proxy url: %w", err)
+		}
+		baseTransport, ok := http.DefaultTransport.(*http.Transport)
+		if !ok || baseTransport == nil {
+			return nil, fmt.Errorf("http DefaultTransport is not *http.Transport")
+		}
+		transport := baseTransport.Clone()
+		transport.Proxy = http.ProxyURL(proxyURL)
+		httpClient.Transport = transport
+	}
+	client.HTTPClient = httpClient
+	if final.ProxyEnabled {
+		wsProxy := final.WSProxyURL
+		if wsProxy == "" {
+			wsProxy = final.RESTProxyURL
+		}
+		if wsProxy != "" {
+			futures.SetWsProxyUrl(wsProxy)
+		}
+	}
 	return &Source{
 		cfg:    final,
 		client: client,
