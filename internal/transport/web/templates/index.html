@@ -24,6 +24,7 @@
                     <button class="nav-item" :class="{active: view==='desk'}" @click="switchView('desk')">Desk · 总览</button>
                     <button class="nav-item" :class="{active: view==='decisions'}" @click="switchView('decisions')">Blue Book · 决策</button>
                     <button class="nav-item" :class="{active: view==='positions'}" @click="switchView('positions')">Red Book · 仓位</button>
+                    <button class="nav-item" :class="{active: view==='manualOpen'}" @click="switchView('manualOpen')">Manual · 手动开仓</button>
                     <button class="nav-item" :class="{active: view==='logs'}" @click="switchView('logs')">Logs · 实时</button>
                 </div>
                 <div class="nav-footer">无鉴权 · 实盘 API</div>
@@ -327,6 +328,99 @@
                                     <div class="pos-sub mt-2">已实现 [[ formatUSD(p.realized_pnl_usd !== undefined ? p.realized_pnl_usd : p.pnl_usd) ]]</div>
                                 </div>
                             </div>
+                        </div>
+                    </div>
+                </section>
+
+                <section v-if="view==='manualOpen'" class="stack">
+                    <div class="notion-block">
+                        <div class="block-header">
+                            <div>
+                                <p class="notion-section-title">Manual Trade</p>
+                                <h2>手动开仓（免审）</h2>
+                                <p class="muted">⚠️ 该操作跳过 AI 审查，直接推送至 Freqtrade，请谨慎填写每一个参数。</p>
+                            </div>
+                            <div class="actions items-end">
+                                <div class="text-right mr-4">
+                                    <p class="muted">最新价 [[ formatNumber(manualOpen.price.last) ]]</p>
+                                    <p class="muted text-xs">H [[ formatNumber(manualOpen.price.high) ]] · L [[ formatNumber(manualOpen.price.low) ]]</p>
+                                </div>
+                                <button class="pill-btn" @click="loadManualPrice" :disabled="manualOpen.loadingPrice || !manualOpen.symbol">刷新价格</button>
+                            </div>
+                        </div>
+                        <div class="callout warning">
+                            <strong>无需审查：</strong>该表单用于人工信号或紧急开仓，提交后立即执行，系统仅进行基础校验（Tier 比例=100%、止损/止盈方向正确）。
+                        </div>
+                        <div class="grid gap-4" style="grid-template-columns: repeat(12, minmax(0, 1fr));">
+                            <label class="form-row col-span-4">
+                                <span>交易对</span>
+                                <select class="input" v-model="manualOpen.symbol">
+                                    <option v-for="sym in defaultSymbols" :value="sym" :key="sym">[[ sym ]]</option>
+                                </select>
+                            </label>
+                            <div class="form-row col-span-4">
+                                <span>方向</span>
+                                <div class="flex gap-2">
+                                    <button class="pill-btn" :class="{primary: manualOpen.side==='long'}" @click.prevent="manualOpen.side='long'">做多</button>
+                                    <button class="pill-btn danger" :class="{primary: manualOpen.side==='short'}" @click.prevent="manualOpen.side='short'">做空</button>
+                                </div>
+                            </div>
+                            <label class="form-row col-span-4">
+                                <span>杠杆</span>
+                                <input class="input" type="number" min="1" step="1" v-model.number="manualOpen.leverage">
+                            </label>
+
+                            <label class="form-row col-span-4">
+                                <span>仓位（USD）</span>
+                                <input class="input" type="number" min="1" step="10" v-model.number="manualOpen.position_size_usd">
+                            </label>
+                            <label class="form-row col-span-4">
+                                <span>止损</span>
+                                <input class="input" type="number" step="0.0001" v-model.number="manualOpen.stop_loss">
+                            </label>
+                            <label class="form-row col-span-4">
+                                <span>止盈</span>
+                                <input class="input" type="number" step="0.0001" v-model.number="manualOpen.take_profit">
+                            </label>
+
+                            <label class="form-row col-span-4">
+                                <span>Tier1 目标</span>
+                                <input class="input" type="number" step="0.0001" v-model.number="manualOpen.tier1_target">
+                            </label>
+                            <label class="form-row col-span-4">
+                                <span>Tier1 比例 (0-1)</span>
+                                <input class="input" type="number" min="0" max="1" step="0.01" v-model.number="manualOpen.tier1_ratio">
+                            </label>
+
+                            <label class="form-row col-span-4">
+                                <span>Tier2 目标</span>
+                                <input class="input" type="number" step="0.0001" v-model.number="manualOpen.tier2_target">
+                            </label>
+                            <label class="form-row col-span-4">
+                                <span>Tier2 比例 (0-1)</span>
+                                <input class="input" type="number" min="0" max="1" step="0.01" v-model.number="manualOpen.tier2_ratio">
+                            </label>
+
+                            <label class="form-row col-span-4">
+                                <span>Tier3 目标</span>
+                                <input class="input" type="number" step="0.0001" v-model.number="manualOpen.tier3_target">
+                            </label>
+                            <label class="form-row col-span-4">
+                                <span>Tier3 比例 (0-1)</span>
+                                <input class="input" type="number" min="0" max="1" step="0.01" v-model.number="manualOpen.tier3_ratio">
+                            </label>
+
+                            <label class="form-row col-span-12">
+                                <span>备注 / 理由（写入决策日志）</span>
+                                <input class="input" type="text" v-model="manualOpen.reason" placeholder="例如：双底形态 + FOMC 空窗口，人工信号">
+                            </label>
+                        </div>
+                        <div class="muted text-sm mt-4">
+                            Tier 比例合计：[[ formatPercent(manualTierSum) ]] （需等于 100%）。如果需要 33/33/34，可直接填 0.33/0.33/0.34。
+                        </div>
+                        <div class="mt-4 flex justify-between items-center">
+                            <p class="muted text-xs">提交后立即执行，建议在刷新当前价后 30 秒内完成。</p>
+                            <button class="pill-btn primary" @click="submitManualOpen" :disabled="manualOpen.submitting">立即开仓</button>
                         </div>
                     </div>
                 </section>

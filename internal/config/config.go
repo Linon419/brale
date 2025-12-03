@@ -9,59 +9,175 @@ import (
 	toml "github.com/pelletier/go-toml/v2"
 )
 
-// 配置结构体（与规划一致，保留必要字段，便于后续扩展）
+const (
+	defaultAppEnv            = "dev"                                          // config: app.env
+	defaultAppLogLevel       = "info"                                         // config: app.log_level
+	defaultAppHTTPAddr       = ":9991"                                        // config: app.http_addr
+	defaultAppLogPath        = "/data/logs/brale-live.log"                    // config: app.log_path
+	defaultAppLLMLogPath     = "/data/logs/brale-llm.log"                     // config: app.llm_log_path
+	defaultSymbolsProvider   = "default"                                      // config: symbols.provider
+	defaultKlineMaxCached    = 300                                            // config: kline.max_cached
+	defaultMarketName        = "binance"                                      // config: market.sources.name
+	defaultMarketREST        = "https://fapi.binance.com"                     // config: market.sources.rest_base_url
+	defaultAIAggregation     = "meta"                                         // config: ai.aggregation
+	defaultAIDecisionLog     = "/data/live/decisions.db"                      // config: ai.decision_log_path
+	defaultAIDecisionAge     = 3600                                           // config: ai.last_decision_max_age_seconds
+	defaultAIDecisionEvery   = 600                                            // config: ai.decision_interval_seconds
+	defaultAIMultiBlocks     = 4                                              // config: ai.multi_agent.max_blocks
+	defaultMCPTimeout        = 120                                            // config: mcp.timeout_seconds
+	defaultFreqtradeAPI      = "http://freqtrade:8080/api/v1"                 // config: freqtrade.api_url
+	defaultFreqtradeStake    = 100                                            // config: freqtrade.default_stake_usd
+	defaultFreqtradeLev      = 1                                              // config: freqtrade.default_leverage
+	defaultFreqtradeTimeout  = 15                                             // config: freqtrade.timeout_seconds
+	defaultFreqtradeWebhook  = "http://brale:9991/api/live/freqtrade/webhook" // config: freqtrade.webhook_url
+	defaultFreqtradeRiskDB   = "/data/db/trade_risk.db"                       // config: freqtrade.risk_store_path
+	defaultAdvancedLiquidity = 15                                             // config: advanced.liquidity_filter_usd_m
+	defaultAdvancedRR        = 1                                              // config: advanced.min_risk_reward
+	defaultAdvancedCooldown  = 180                                            // config: advanced.open_cooldown_seconds
+	defaultAdvancedMaxOpen   = 3                                              // config: advanced.max_opens_per_cycle
+	defaultTradingMode       = "static"                                       // config: trading.mode
+	defaultTradingMaxPct     = 0.01                                           // config: trading.max_position_pct
+	defaultTradingLeverage   = 10                                             // config: trading.default_leverage
+)
+
+// Config 是 Brale 的主配置载体。
 type Config struct {
-	App struct {
-		Env      string `toml:"env"`
-		LogLevel string `toml:"log_level"`
-		HTTPAddr string `toml:"http_addr"`
-		LogPath  string `toml:"log_path"`
-		LLMLog   string `toml:"llm_log_path"`
-		LLMDump  bool   `toml:"llm_dump_payload"`
-	} `toml:"app"`
-
-	Symbols struct {
-		Provider    string   `toml:"provider"`
-		DefaultList []string `toml:"default_list"`
-		APIURL      string   `toml:"api_url"` // 当 provider=http 时，从该地址拉取币种列表
-	} `toml:"symbols"`
-
-	Kline struct {
-		MaxCached int `toml:"max_cached"`
-	} `toml:"kline"`
-
-	Market MarketConfig `toml:"market"`
-
-	AI AIConfig `toml:"ai"`
-
-	MCP struct {
-		TimeoutSeconds int `toml:"timeout_seconds"`
-	} `toml:"mcp"`
-
-	Prompt struct {
-		Dir            string `toml:"dir"`
-		SystemTemplate string `toml:"system_template"`
-	} `toml:"prompt"`
-
-	Notify struct {
-		Telegram struct {
-			Enabled  bool   `toml:"enabled"`
-			BotToken string `toml:"bot_token"`
-			ChatID   string `toml:"chat_id"`
-		} `toml:"telegram"`
-	} `toml:"notify"`
-
+	App       AppConfig       `toml:"app"`
+	Symbols   SymbolsConfig   `toml:"symbols"`
+	Kline     KlineConfig     `toml:"kline"`
+	Market    MarketConfig    `toml:"market"`
+	AI        AIConfig        `toml:"ai"`
+	MCP       MCPConfig       `toml:"mcp"`
+	Prompt    PromptConfig    `toml:"prompt"`
+	Notify    NotifyConfig    `toml:"notify"`
 	Freqtrade FreqtradeConfig `toml:"freqtrade"`
+	Advanced  AdvancedConfig  `toml:"advanced"`
+	Trading   TradingConfig   `toml:"trading"`
+}
 
-	Advanced struct {
-		LiquidityFilterUSDM int     `toml:"liquidity_filter_usd_m"`
-		MinRiskReward       float64 `toml:"min_risk_reward"`
-		OpenCooldownSeconds int     `toml:"open_cooldown_seconds"`
-		MaxOpensPerCycle    int     `toml:"max_opens_per_cycle"`
-		TierMinDistancePct  float64 `toml:"tier_min_distance_pct"`
-	} `toml:"advanced"`
+type AppConfig struct {
+	Env      string `toml:"env"`
+	LogLevel string `toml:"log_level"`
+	HTTPAddr string `toml:"http_addr"`
+	LogPath  string `toml:"log_path"`
+	LLMLog   string `toml:"llm_log_path"`
+	LLMDump  bool   `toml:"llm_dump_payload"`
+}
 
-	Trading TradingConfig `toml:"trading"`
+func (a *AppConfig) applyDefaults(keys keySet) {
+	if a == nil {
+		return
+	}
+	applyFieldDefaults(keys,
+		stringFieldDefault("app.env", &a.Env, defaultAppEnv),
+		stringFieldDefault("app.log_level", &a.LogLevel, defaultAppLogLevel),
+		stringFieldDefault("app.http_addr", &a.HTTPAddr, defaultAppHTTPAddr),
+		stringFieldDefault("app.log_path", &a.LogPath, defaultAppLogPath),
+		stringFieldDefault("app.llm_log_path", &a.LLMLog, defaultAppLLMLogPath),
+	)
+}
+
+type SymbolsConfig struct {
+	Provider    string   `toml:"provider"`
+	DefaultList []string `toml:"default_list"`
+	APIURL      string   `toml:"api_url"`
+}
+
+func (s *SymbolsConfig) applyDefaults(keys keySet) {
+	if s == nil {
+		return
+	}
+	applyFieldDefaults(keys,
+		stringFieldDefault("symbols.provider", &s.Provider, defaultSymbolsProvider),
+	)
+}
+
+type KlineConfig struct {
+	MaxCached int `toml:"max_cached"`
+}
+
+func (k *KlineConfig) applyDefaults(keys keySet) {
+	if k == nil {
+		return
+	}
+	applyFieldDefaults(keys,
+		fieldDefault{
+			key:   "kline.max_cached",
+			need:  func() bool { return k.MaxCached <= 0 },
+			apply: func() { k.MaxCached = defaultKlineMaxCached },
+		},
+	)
+}
+
+type MCPConfig struct {
+	TimeoutSeconds int `toml:"timeout_seconds"`
+}
+
+func (m *MCPConfig) applyDefaults(keys keySet) {
+	if m == nil {
+		return
+	}
+	applyFieldDefaults(keys,
+		fieldDefault{
+			key:   "mcp.timeout_seconds",
+			need:  func() bool { return m.TimeoutSeconds <= 0 },
+			apply: func() { m.TimeoutSeconds = defaultMCPTimeout },
+		},
+	)
+}
+
+type PromptConfig struct {
+	Dir            string `toml:"dir"`
+	SystemTemplate string `toml:"system_template"`
+}
+
+func (p *PromptConfig) applyDefaults(keys keySet) {
+	if p == nil {
+		return
+	}
+	applyFieldDefaults(keys,
+		stringFieldDefault("prompt.dir", &p.Dir, "prompts"),
+		stringFieldDefault("prompt.system_template", &p.SystemTemplate, "default"),
+	)
+}
+
+type NotifyConfig struct {
+	Telegram TelegramConfig `toml:"telegram"`
+}
+
+type TelegramConfig struct {
+	Enabled  bool   `toml:"enabled"`
+	BotToken string `toml:"bot_token"`
+	ChatID   string `toml:"chat_id"`
+}
+
+type AdvancedConfig struct {
+	LiquidityFilterUSDM int     `toml:"liquidity_filter_usd_m"`
+	MinRiskReward       float64 `toml:"min_risk_reward"`
+	OpenCooldownSeconds int     `toml:"open_cooldown_seconds"`
+	MaxOpensPerCycle    int     `toml:"max_opens_per_cycle"`
+	TierMinDistancePct  float64 `toml:"tier_min_distance_pct"`
+}
+
+func (a *AdvancedConfig) applyDefaults() {
+	if a == nil {
+		return
+	}
+	if a.LiquidityFilterUSDM <= 0 {
+		a.LiquidityFilterUSDM = defaultAdvancedLiquidity // config: advanced.liquidity_filter_usd_m
+	}
+	if a.MinRiskReward <= 0 {
+		a.MinRiskReward = defaultAdvancedRR // config: advanced.min_risk_reward
+	}
+	if a.OpenCooldownSeconds <= 0 {
+		a.OpenCooldownSeconds = defaultAdvancedCooldown // config: advanced.open_cooldown_seconds
+	}
+	if a.MaxOpensPerCycle <= 0 {
+		a.MaxOpensPerCycle = defaultAdvancedMaxOpen // config: advanced.max_opens_per_cycle
+	}
+	if a.TierMinDistancePct <= 0 {
+		a.TierMinDistancePct = 0.002
+	}
 }
 
 // TradingConfig 控制模拟/实盘资金来源与默认仓位策略。
@@ -70,6 +186,24 @@ type TradingConfig struct {
 	MaxPositionPct     float64 `toml:"max_position_pct"`     // 单笔最大占用比例 0~1
 	DefaultPositionUSD float64 `toml:"default_position_usd"` // 若>0，直接作为 fallback 仓位
 	DefaultLeverage    int     `toml:"default_leverage"`     // 缺省杠杆
+}
+
+func (t *TradingConfig) applyDefaults() {
+	if t == nil {
+		return
+	}
+	if strings.TrimSpace(t.Mode) == "" {
+		t.Mode = defaultTradingMode // config: trading.mode
+	}
+	if t.MaxPositionPct <= 0 || t.MaxPositionPct > 1 {
+		t.MaxPositionPct = defaultTradingMaxPct // config: trading.max_position_pct
+	}
+	if t.DefaultLeverage <= 0 {
+		t.DefaultLeverage = defaultTradingLeverage // config: trading.default_leverage
+	}
+	if t.DefaultPositionUSD < 0 {
+		t.DefaultPositionUSD = 0
+	}
 }
 
 // FreqtradeConfig 描述外部执行引擎的访问方式。
@@ -90,6 +224,42 @@ type FreqtradeConfig struct {
 	EntryTag           string  `toml:"entry_tag"`
 }
 
+func (f *FreqtradeConfig) applyDefaults(keys keySet) {
+	if f == nil {
+		return
+	}
+	applyFieldDefaults(keys,
+		boolFieldDefault("freqtrade.enabled", &f.Enabled, true),
+		stringFieldDefault("freqtrade.api_url", &f.APIURL, defaultFreqtradeAPI),
+		stringFieldDefault("freqtrade.webhook_url", &f.WebhookURL, defaultFreqtradeWebhook),
+		stringFieldDefault("freqtrade.risk_store_path", &f.RiskStorePath, defaultFreqtradeRiskDB),
+		fieldDefault{
+			key:   "freqtrade.default_stake_usd",
+			need:  func() bool { return f.DefaultStakeUSD <= 0 },
+			apply: func() { f.DefaultStakeUSD = defaultFreqtradeStake },
+		},
+		fieldDefault{
+			key:   "freqtrade.default_leverage",
+			need:  func() bool { return f.DefaultLeverage <= 0 },
+			apply: func() { f.DefaultLeverage = defaultFreqtradeLev },
+		},
+		fieldDefault{
+			key:   "freqtrade.timeout_seconds",
+			need:  func() bool { return f.TimeoutSeconds <= 0 },
+			apply: func() { f.TimeoutSeconds = defaultFreqtradeTimeout },
+		},
+	)
+	if f.DefaultStakeUSD < 0 {
+		f.DefaultStakeUSD = 0
+	}
+	if f.MinStopDistancePct < 0 {
+		f.MinStopDistancePct = 0
+	}
+	if f.EntrySlipPct < 0 {
+		f.EntrySlipPct = 0
+	}
+}
+
 // AIConfig 包含与模型、持仓周期相关的所有设置。
 type AIConfig struct {
 	Aggregation             string                    `toml:"aggregation"`
@@ -106,6 +276,56 @@ type AIConfig struct {
 	ProviderPresets         map[string]ModelPreset    `toml:"provider_presets"`
 	Models                  []AIModelConfig           `toml:"models"`
 	MultiAgent              MultiAgentConfig          `toml:"multi_agent"`
+}
+
+func (a *AIConfig) applyDefaults(keys keySet) {
+	if a == nil {
+		return
+	}
+	if a.ProviderPresets == nil {
+		a.ProviderPresets = make(map[string]ModelPreset)
+	}
+	applyFieldDefaults(keys,
+		stringFieldDefault("ai.aggregation", &a.Aggregation, defaultAIAggregation),
+		stringFieldDefault("ai.decision_log_path", &a.DecisionLogPath, defaultAIDecisionLog),
+		boolFieldDefault("ai.log_each_model", &a.LogEachModel, true),
+		boolFieldDefault("ai.include_last_decision", &a.IncludeLastDecision, true),
+	)
+	if a.LastDecisionMaxAgeSec <= 0 {
+		a.LastDecisionMaxAgeSec = defaultAIDecisionAge // config: ai.last_decision_max_age_seconds
+	}
+	if a.DecisionIntervalSeconds <= 0 {
+		a.DecisionIntervalSeconds = defaultAIDecisionEvery // config: ai.decision_interval_seconds
+	}
+	a.ProviderPreference = normalizePreferenceList(a.ProviderPreference)
+	profileDefaults := a.ProfileDefaults
+	profileDefaults.normalize()
+	if profileDefaults.AnalysisSlice <= 0 {
+		profileDefaults.AnalysisSlice = 46
+		if profileDefaults.SliceDropTail <= 0 {
+			profileDefaults.SliceDropTail = 3
+		}
+	}
+	a.ProfileDefaults = profileDefaults
+	if len(a.HoldingProfiles) == 0 {
+		a.HoldingProfiles = defaultHorizonProfiles(profileDefaults)
+	} else {
+		normalized := make(map[string]HorizonProfile, len(a.HoldingProfiles))
+		for name, profile := range a.HoldingProfiles {
+			normalized[name] = normalizeHorizonProfile(profile, profileDefaults)
+		}
+		a.HoldingProfiles = normalized
+	}
+	if strings.TrimSpace(a.ActiveHorizon) == "" {
+		a.ActiveHorizon = "one_hour"
+	}
+	if _, ok := a.HoldingProfiles[a.ActiveHorizon]; !ok {
+		for name := range a.HoldingProfiles {
+			a.ActiveHorizon = name
+			break
+		}
+	}
+	a.MultiAgent.applyDefaults(keys)
 }
 
 // ModelPreset 描述可复用的 API 连接配置。
@@ -157,21 +377,27 @@ type MultiAgentConfig struct {
 	MaxBlocks         int    `toml:"max_blocks"`
 }
 
-func (m *MultiAgentConfig) applyDefaults() {
+func (m *MultiAgentConfig) applyDefaults(keys keySet) {
 	if m == nil {
 		return
 	}
-	if m.IndicatorTemplate == "" {
-		m.IndicatorTemplate = "agent_indicator"
+	applyFieldDefaults(keys,
+		boolFieldDefault("ai.multi_agent.enabled", &m.Enabled, true),
+		stringFieldDefault("ai.multi_agent.indicator_template", &m.IndicatorTemplate, "agent_indicator"),
+		stringFieldDefault("ai.multi_agent.pattern_template", &m.PatternTemplate, "agent_pattern"),
+		stringFieldDefault("ai.multi_agent.trend_template", &m.TrendTemplate, "agent_trend"),
+	)
+	if strings.TrimSpace(m.IndicatorProvider) == "" {
+		m.IndicatorProvider = "deepseek"
 	}
-	if m.PatternTemplate == "" {
-		m.PatternTemplate = "agent_pattern"
+	if strings.TrimSpace(m.PatternProvider) == "" {
+		m.PatternProvider = "qwen"
 	}
-	if m.TrendTemplate == "" {
-		m.TrendTemplate = "agent_trend"
+	if strings.TrimSpace(m.TrendProvider) == "" {
+		m.TrendProvider = "vanchin"
 	}
 	if m.MaxBlocks <= 0 {
-		m.MaxBlocks = 4
+		m.MaxBlocks = defaultAIMultiBlocks
 	}
 }
 
@@ -191,6 +417,36 @@ type ProxyConfig struct {
 	Enabled bool   `toml:"enabled"`
 	RESTURL string `toml:"rest_url"`
 	WSURL   string `toml:"ws_url"`
+}
+
+func (m *MarketConfig) applyDefaults() {
+	if m == nil {
+		return
+	}
+	if len(m.Sources) == 0 {
+		m.Sources = []MarketSource{{
+			Name:        defaultMarketName,
+			Enabled:     true,
+			RESTBaseURL: defaultMarketREST,
+		}}
+	}
+	for i := range m.Sources {
+		src := &m.Sources[i]
+		src.Proxy.normalize()
+		if strings.TrimSpace(src.Name) == "" {
+			if i == 0 {
+				src.Name = defaultMarketName
+			} else {
+				src.Name = fmt.Sprintf("market_%d", i)
+			}
+		}
+		if src.RESTBaseURL == "" {
+			src.RESTBaseURL = defaultMarketREST
+		}
+	}
+	if strings.TrimSpace(m.ActiveSource) == "" {
+		m.ActiveSource = firstEnabledMarket(m.Sources)
+	}
 }
 
 func (p *ProxyConfig) normalize() {
@@ -518,6 +774,16 @@ func defaultHorizonProfiles(defaults HorizonProfileDefaults) map[string]HorizonP
 				RSI: RSIConfig{Period: 14, Oversold: 35, Overbought: 65},
 			},
 		}, defaults),
+		"quant_agent": normalizeHorizonProfile(HorizonProfile{
+			EntryTimeframes:      []string{"1h"},
+			ConfirmTimeframes:    []string{"4h", "1d"},
+			BackgroundTimeframes: []string{"1w"},
+			SliceDropTail:        1,
+			Indicators: HorizonIndicators{
+				EMA: EMAConfig{Fast: 21, Mid: 50, Slow: 200},
+				RSI: RSIConfig{Period: 14, Oversold: 35, Overbought: 65},
+			},
+		}, defaults),
 	}
 }
 
@@ -528,6 +794,7 @@ func Load(path string) (*Config, error) {
 		return nil, err
 	}
 	var cfg Config
+	setKeys := make(keySet)
 	for _, file := range files {
 		data, err := os.ReadFile(file)
 		if err != nil {
@@ -536,16 +803,84 @@ func Load(path string) (*Config, error) {
 		if err := toml.Unmarshal(data, &cfg); err != nil {
 			return nil, fmt.Errorf("解析 TOML 失败(%s): %w", file, err)
 		}
+		if err := collectConfigKeys(data, setKeys); err != nil {
+			return nil, fmt.Errorf("收集配置键失败(%s): %w", file, err)
+		}
 	}
-	applyDefaults(&cfg)
+	cfg.applyDefaults(setKeys)
 	if err := validate(&cfg); err != nil {
 		return nil, err
 	}
 	return &cfg, nil
 }
 
-type includeHeader struct {
-	Include []string `toml:"include"`
+type keySet map[string]struct{}
+
+func (k keySet) mark(path string) {
+	path = strings.ToLower(strings.TrimSpace(path))
+	if path == "" {
+		return
+	}
+	k[path] = struct{}{}
+}
+
+func (k keySet) isSet(path string) bool {
+	if len(k) == 0 {
+		return false
+	}
+	path = strings.ToLower(strings.TrimSpace(path))
+	if path == "" {
+		return false
+	}
+	_, ok := k[path]
+	return ok
+}
+
+type fieldDefault struct {
+	key   string
+	need  func() bool
+	apply func()
+}
+
+func applyFieldDefaults(keys keySet, defs ...fieldDefault) {
+	for _, def := range defs {
+		if def.apply == nil {
+			continue
+		}
+		if def.key != "" && keys.isSet(def.key) {
+			continue
+		}
+		if def.need != nil && !def.need() {
+			continue
+		}
+		def.apply()
+	}
+}
+
+func stringFieldDefault(key string, target *string, def string) fieldDefault {
+	return fieldDefault{
+		key: key,
+		need: func() bool {
+			return target != nil && strings.TrimSpace(*target) == ""
+		},
+		apply: func() {
+			if target != nil {
+				*target = def
+			}
+		},
+	}
+}
+
+func boolFieldDefault(key string, target *bool, def bool) fieldDefault {
+	return fieldDefault{
+		key:  key,
+		need: func() bool { return target != nil },
+		apply: func() {
+			if target != nil {
+				*target = def
+			}
+		},
+	}
 }
 
 func resolveConfigIncludes(path string) ([]string, error) {
@@ -581,13 +916,13 @@ func collectConfigFiles(path string, seen, stack map[string]bool) ([]string, err
 	if err != nil {
 		return nil, fmt.Errorf("读取配置失败(%s): %w", path, err)
 	}
-	var header includeHeader
-	if err := toml.Unmarshal(data, &header); err != nil {
+	includes, err := parseIncludeList(data)
+	if err != nil {
 		return nil, fmt.Errorf("解析 include 失败(%s): %w", path, err)
 	}
 	dir := filepath.Dir(path)
 	var ordered []string
-	for _, inc := range header.Include {
+	for _, inc := range includes {
 		inc = strings.TrimSpace(inc)
 		if inc == "" {
 			continue
@@ -630,154 +965,117 @@ func normalizePreferenceList(pref []string) []string {
 	return out
 }
 
+func setDefaultBool(target *bool, def bool, path string, set map[string]bool) {
+	if target == nil {
+		return
+	}
+	if isKeySet(set, path) {
+		return
+	}
+	*target = def
+}
+
+func isKeySet(set map[string]bool, path string) bool {
+	if len(set) == 0 {
+		return false
+	}
+	path = strings.ToLower(strings.TrimSpace(path))
+	if path == "" {
+		return false
+	}
+	return set[path]
+}
+
+func collectConfigKeys(data []byte, dest keySet) error {
+	if dest == nil {
+		return nil
+	}
+	var raw map[string]any
+	if err := toml.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	flattenConfigKeys("", raw, dest)
+	return nil
+}
+
+func parseIncludeList(data []byte) ([]string, error) {
+	var doc map[string]any
+	if err := toml.Unmarshal(data, &doc); err != nil {
+		return nil, err
+	}
+	raw, ok := doc["include"]
+	if !ok {
+		return nil, nil
+	}
+	arr, ok := raw.([]any)
+	if !ok {
+		return nil, fmt.Errorf("include 需为字符串数组")
+	}
+	out := make([]string, 0, len(arr))
+	for _, item := range arr {
+		str, ok := item.(string)
+		if !ok {
+			return nil, fmt.Errorf("include 仅支持字符串")
+		}
+		str = strings.TrimSpace(str)
+		if str != "" {
+			out = append(out, str)
+		}
+	}
+	return out, nil
+}
+
+func flattenConfigKeys(prefix string, node any, dest keySet) {
+	switch val := node.(type) {
+	case map[string]any:
+		for k, v := range val {
+			next := strings.ToLower(strings.TrimSpace(k))
+			if next == "" {
+				continue
+			}
+			if prefix != "" {
+				next = prefix + "." + next
+			}
+			flattenConfigKeys(next, v, dest)
+		}
+	case []any:
+		if prefix != "" {
+			dest.mark(prefix)
+		}
+		for _, item := range val {
+			flattenConfigKeys(prefix, item, dest)
+		}
+	default:
+		if prefix != "" {
+			dest.mark(prefix)
+		}
+	}
+}
+
 // 默认值设置
-func applyDefaults(c *Config) {
-	if c.App.Env == "" {
-		c.App.Env = "dev"
-	}
-	if c.App.LogLevel == "" {
-		c.App.LogLevel = "info"
-	}
-	if c.Kline.MaxCached <= 0 {
-		c.Kline.MaxCached = 100
-	}
-	if c.Prompt.Dir == "" {
-		c.Prompt.Dir = "prompts"
-	}
-	if c.Prompt.SystemTemplate == "" {
-		c.Prompt.SystemTemplate = "default"
-	}
-	if strings.TrimSpace(c.App.HTTPAddr) == "" {
-		c.App.HTTPAddr = ":9991"
-	}
-	if c.AI.ProviderPresets == nil {
-		c.AI.ProviderPresets = make(map[string]ModelPreset)
-	}
-	c.AI.ProviderPreference = normalizePreferenceList(c.AI.ProviderPreference)
-	profileDefaults := c.AI.ProfileDefaults
-	profileDefaults.normalize()
-	if profileDefaults.AnalysisSlice <= 0 {
-		// 再兜底一次，防止 normalize 被重置。
-		profileDefaults.AnalysisSlice = 46
-		if profileDefaults.SliceDropTail <= 0 {
-			profileDefaults.SliceDropTail = 3
+func (c *Config) applyDefaults(keys keySet) {
+	c.App.applyDefaults(keys)
+	c.Symbols.applyDefaults(keys)
+	c.Kline.applyDefaults(keys)
+	c.Prompt.applyDefaults(keys)
+	c.MCP.applyDefaults(keys)
+	c.Market.applyDefaults()
+	c.AI.applyDefaults(keys)
+	c.Freqtrade.applyDefaults(keys)
+	c.Advanced.applyDefaults()
+	c.Trading.applyDefaults()
+	// 依赖 AI 周期推导调整 K 线缓存
+	if profile, ok := c.AI.HoldingProfiles[c.AI.ActiveHorizon]; ok {
+		lookbacks := profile.LookbackMap(20)
+		maxLookback := 0
+		for _, bars := range lookbacks {
+			if bars > maxLookback {
+				maxLookback = bars
+			}
 		}
-	}
-	c.AI.ProfileDefaults = profileDefaults
-
-	// Horizon profiles 与周期派生
-	if len(c.AI.HoldingProfiles) == 0 {
-		c.AI.HoldingProfiles = defaultHorizonProfiles(profileDefaults)
-	} else {
-		normalized := make(map[string]HorizonProfile, len(c.AI.HoldingProfiles))
-		for name, profile := range c.AI.HoldingProfiles {
-			normalized[name] = normalizeHorizonProfile(profile, profileDefaults)
+		if c.Kline.MaxCached < maxLookback+50 {
+			c.Kline.MaxCached = maxLookback + 50
 		}
-		c.AI.HoldingProfiles = normalized
-	}
-	if c.AI.ActiveHorizon == "" {
-		c.AI.ActiveHorizon = "one_hour"
-	}
-	if _, ok := c.AI.HoldingProfiles[c.AI.ActiveHorizon]; !ok {
-		for name := range c.AI.HoldingProfiles {
-			c.AI.ActiveHorizon = name
-			break
-		}
-	}
-	activeProfile := c.AI.HoldingProfiles[c.AI.ActiveHorizon]
-	derivedIntervals := activeProfile.AllTimeframes()
-	if len(derivedIntervals) == 0 {
-		derivedIntervals = []string{"5m"}
-	}
-	lookbacks := activeProfile.LookbackMap(20)
-	maxLookback := 0
-	for _, bars := range lookbacks {
-		if bars > maxLookback {
-			maxLookback = bars
-		}
-	}
-	if c.Kline.MaxCached < maxLookback+50 {
-		c.Kline.MaxCached = maxLookback + 50
-	}
-	if len(c.Market.Sources) == 0 {
-		c.Market.Sources = []MarketSource{{
-			Name:        "binance",
-			Enabled:     true,
-			RESTBaseURL: "https://fapi.binance.com",
-		}}
-	}
-	for i := range c.Market.Sources {
-		src := &c.Market.Sources[i]
-		src.Proxy.normalize()
-		if src.RESTBaseURL == "" {
-			src.RESTBaseURL = "https://fapi.binance.com"
-		}
-		if src.Name == "" {
-			src.Name = fmt.Sprintf("market_%d", i)
-		}
-	}
-	if c.Market.ActiveSource == "" {
-		c.Market.ActiveSource = firstEnabledMarket(c.Market.Sources)
-	}
-	if c.AI.DecisionLogPath == "" {
-		c.AI.DecisionLogPath = filepath.Join("data", "live", "decisions.db")
-	}
-	if c.AI.LastDecisionMaxAgeSec <= 0 {
-		c.AI.LastDecisionMaxAgeSec = 3600
-	}
-	if !c.AI.IncludeLastDecision {
-		c.AI.IncludeLastDecision = true
-	}
-	c.AI.MultiAgent.applyDefaults()
-
-	if c.MCP.TimeoutSeconds <= 0 {
-		c.MCP.TimeoutSeconds = 120
-	}
-	// 决策周期（秒），默认 60s
-	if c.AI.DecisionIntervalSeconds <= 0 {
-		c.AI.DecisionIntervalSeconds = 60
-	}
-	// 与旧项目保持一致：默认 RR 底线 3.0
-	if c.Advanced.MinRiskReward <= 0 {
-		c.Advanced.MinRiskReward = 3.0
-	}
-	if c.Advanced.OpenCooldownSeconds <= 0 {
-		c.Advanced.OpenCooldownSeconds = 180
-	} // 3分钟冷却
-	if c.Advanced.MaxOpensPerCycle <= 0 {
-		c.Advanced.MaxOpensPerCycle = 3
-	}
-	if c.Advanced.TierMinDistancePct <= 0 {
-		c.Advanced.TierMinDistancePct = 0.002
-	}
-
-	// Trading defaults
-	if c.Trading.Mode == "" {
-		c.Trading.Mode = "static"
-	}
-	if c.Trading.MaxPositionPct <= 0 || c.Trading.MaxPositionPct > 1 {
-		c.Trading.MaxPositionPct = 0.05
-	}
-	if c.Trading.DefaultLeverage <= 0 {
-		c.Trading.DefaultLeverage = 2
-	}
-	if c.Trading.DefaultPositionUSD < 0 {
-		c.Trading.DefaultPositionUSD = 0
-	}
-	if c.Freqtrade.TimeoutSeconds <= 0 {
-		c.Freqtrade.TimeoutSeconds = 15
-	}
-	if c.Freqtrade.DefaultLeverage < 0 {
-		c.Freqtrade.DefaultLeverage = 0
-	}
-	if c.Freqtrade.DefaultStakeUSD < 0 {
-		c.Freqtrade.DefaultStakeUSD = 0
-	}
-	if c.Freqtrade.MinStopDistancePct < 0 {
-		c.Freqtrade.MinStopDistancePct = 0
-	}
-	if c.Freqtrade.EntrySlipPct < 0 {
-		c.Freqtrade.EntrySlipPct = 0
 	}
 }
 

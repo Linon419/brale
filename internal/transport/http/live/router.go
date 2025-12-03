@@ -52,6 +52,8 @@ func (r *Router) Register(group *gin.RouterGroup) {
 		group.GET("/freqtrade/positions/:id", r.handleFreqtradePositionDetail)
 		group.POST("/freqtrade/close", r.handleFreqtradeQuickClose)
 		group.POST("/freqtrade/tiers", r.handleFreqtradeUpdateTiers)
+		group.POST("/freqtrade/manual-open", r.handleFreqtradeManualOpen)
+		group.GET("/freqtrade/price", r.handleFreqtradePriceQuote)
 		group.GET("/freqtrade/tier-logs", r.handleFreqtradeTierLogs)
 		group.GET("/freqtrade/events", r.handleFreqtradeEvents)
 	}
@@ -65,6 +67,8 @@ type FreqtradeWebhookHandler interface {
 	UpdateFreqtradeTiers(ctx context.Context, req freqtrade.TierUpdateRequest) error
 	ListFreqtradeTierLogs(ctx context.Context, tradeID int, limit int) ([]freqtrade.TierLog, error)
 	ListFreqtradeEvents(ctx context.Context, tradeID int, limit int) ([]freqtrade.TradeEvent, error)
+	ManualOpenPosition(ctx context.Context, req freqtrade.ManualOpenRequest) error
+	GetLatestPriceQuote(ctx context.Context, symbol string) (freqtrade.TierPriceQuote, error)
 }
 
 func (r *Router) handleLiveDecisions(c *gin.Context) {
@@ -423,6 +427,26 @@ func (r *Router) handleFreqtradeUpdateTiers(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"status": "ok"})
 }
 
+func (r *Router) handleFreqtradeManualOpen(c *gin.Context) {
+	if r.FreqtradeHandler == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "未配置 freqtrade 处理器"})
+		return
+	}
+	var req freqtrade.ManualOpenRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		logger.Errorf("[api] freqtrade manual open bind failed ip=%s err=%v", c.ClientIP(), err)
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if err := r.FreqtradeHandler.ManualOpenPosition(c.Request.Context(), req); err != nil {
+		logger.Errorf("[api] freqtrade manual open failed ip=%s symbol=%s err=%v", c.ClientIP(), strings.ToUpper(strings.TrimSpace(req.Symbol)), err)
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	logger.Infof("[api] freqtrade manual open ip=%s symbol=%s side=%s size=%.2f", c.ClientIP(), strings.ToUpper(strings.TrimSpace(req.Symbol)), strings.ToLower(strings.TrimSpace(req.Side)), req.PositionSizeUSD)
+	c.JSON(http.StatusOK, gin.H{"status": "ok"})
+}
+
 func (r *Router) handleFreqtradeTierLogs(c *gin.Context) {
 	if r.FreqtradeHandler == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "未配置 freqtrade 处理器"})
@@ -463,4 +487,28 @@ func (r *Router) handleFreqtradeEvents(c *gin.Context) {
 	}
 	logger.Infof("[api] freqtrade events ip=%s trade_id=%d limit=%d returned=%d", c.ClientIP(), tradeID, limit, len(events))
 	c.JSON(http.StatusOK, gin.H{"events": events})
+}
+
+func (r *Router) handleFreqtradePriceQuote(c *gin.Context) {
+	if r.FreqtradeHandler == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "未配置 freqtrade 处理器"})
+		return
+	}
+	symbol := strings.ToUpper(strings.TrimSpace(c.Query("symbol")))
+	if symbol == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "symbol 不能为空"})
+		return
+	}
+	quote, err := r.FreqtradeHandler.GetLatestPriceQuote(c.Request.Context(), symbol)
+	if err != nil {
+		logger.Errorf("[api] freqtrade price quote failed ip=%s symbol=%s err=%v", c.ClientIP(), symbol, err)
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"symbol": symbol,
+		"last":   quote.Last,
+		"high":   quote.High,
+		"low":    quote.Low,
+	})
 }

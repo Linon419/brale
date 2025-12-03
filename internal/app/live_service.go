@@ -1051,6 +1051,75 @@ func (s *LiveService) ListFreqtradeEvents(ctx context.Context, tradeID int, limi
 	return s.freqManager.ListTradeEvents(ctx, tradeID, limit)
 }
 
+// ManualOpenPosition 提供管理后台手动开仓（免审）的快捷通道。
+func (s *LiveService) ManualOpenPosition(ctx context.Context, req freqexec.ManualOpenRequest) error {
+	if s == nil || s.freqManager == nil {
+		return fmt.Errorf("freqtrade 执行器未启用")
+	}
+	symbol := strings.ToUpper(strings.TrimSpace(req.Symbol))
+	if symbol == "" {
+		return fmt.Errorf("symbol 不能为空")
+	}
+	side := strings.ToLower(strings.TrimSpace(req.Side))
+	var action string
+	switch side {
+	case "long":
+		action = "open_long"
+	case "short":
+		action = "open_short"
+	default:
+		return fmt.Errorf("side 只能是 long 或 short")
+	}
+	if req.Leverage <= 0 {
+		return fmt.Errorf("leverage 必须大于 0")
+	}
+	if req.PositionSizeUSD <= 0 {
+		return fmt.Errorf("position_size_usd 必须大于 0")
+	}
+	tiers := &decision.DecisionTiers{
+		Tier1Target: req.Tier1Target,
+		Tier1Ratio:  req.Tier1Ratio,
+		Tier2Target: req.Tier2Target,
+		Tier2Ratio:  req.Tier2Ratio,
+		Tier3Target: req.Tier3Target,
+		Tier3Ratio:  req.Tier3Ratio,
+	}
+	reason := strings.TrimSpace(req.Reason)
+	if reason == "" {
+		reason = "手动开仓（免审）"
+	} else {
+		reason = fmt.Sprintf("手动开仓: %s", reason)
+	}
+	logger.Warnf("freqtrade: 管理后台手动开仓 symbol=%s side=%s size=%.2f lev=%d", symbol, side, req.PositionSizeUSD, req.Leverage)
+	return s.freqtradeHandleDecision(ctx, "", decision.Decision{
+		Symbol:          symbol,
+		Action:          action,
+		Leverage:        req.Leverage,
+		PositionSizeUSD: req.PositionSizeUSD,
+		StopLoss:        req.StopLoss,
+		TakeProfit:      req.TakeProfit,
+		Tiers:           tiers,
+		Reasoning:       reason,
+	})
+}
+
+// GetLatestPriceQuote 返回管理后台所需的最新成交价。
+func (s *LiveService) GetLatestPriceQuote(ctx context.Context, symbol string) (freqexec.TierPriceQuote, error) {
+	var empty freqexec.TierPriceQuote
+	if s == nil {
+		return empty, fmt.Errorf("live service 未初始化")
+	}
+	symbol = strings.ToUpper(strings.TrimSpace(symbol))
+	if symbol == "" {
+		return empty, fmt.Errorf("symbol 不能为空")
+	}
+	quote := s.latestPriceQuote(ctx, symbol)
+	if quote.Last <= 0 {
+		return quote, fmt.Errorf("未获取到 %s 的最新价格", symbol)
+	}
+	return quote, nil
+}
+
 func (s *LiveService) ensureTraceID(raw string) string {
 	id := strings.TrimSpace(raw)
 	if id != "" {

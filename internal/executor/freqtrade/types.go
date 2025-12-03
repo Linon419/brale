@@ -108,6 +108,23 @@ type TierUpdateRequest struct {
 	Reason      string  `json:"reason" form:"reason"`
 }
 
+// ManualOpenRequest 描述手动开仓需要的最小字段。
+type ManualOpenRequest struct {
+	Symbol          string  `json:"symbol" form:"symbol"`
+	Side            string  `json:"side" form:"side"`
+	PositionSizeUSD float64 `json:"position_size_usd" form:"position_size_usd"`
+	Leverage        int     `json:"leverage" form:"leverage"`
+	StopLoss        float64 `json:"stop_loss" form:"stop_loss"`
+	TakeProfit      float64 `json:"take_profit" form:"take_profit"`
+	Tier1Target     float64 `json:"tier1_target" form:"tier1_target"`
+	Tier1Ratio      float64 `json:"tier1_ratio" form:"tier1_ratio"`
+	Tier2Target     float64 `json:"tier2_target" form:"tier2_target"`
+	Tier2Ratio      float64 `json:"tier2_ratio" form:"tier2_ratio"`
+	Tier3Target     float64 `json:"tier3_target" form:"tier3_target"`
+	Tier3Ratio      float64 `json:"tier3_ratio" form:"tier3_ratio"`
+	Reason          string  `json:"reason" form:"reason"`
+}
+
 type PositionListOptions struct {
 	Symbol      string
 	Page        int

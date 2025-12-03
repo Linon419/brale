@@ -260,6 +260,26 @@
         tier3_ratio: '',
         reason: '',
       });
+      const symbolFallback =
+        defaultSymbols.value && defaultSymbols.value.length ? defaultSymbols.value[0] : '';
+      const manualOpen = reactive({
+        symbol: init.symbol || symbolFallback,
+        side: 'short',
+        leverage: 5,
+        position_size_usd: 100,
+        stop_loss: '',
+        take_profit: '',
+        tier1_target: '',
+        tier1_ratio: 0.33,
+        tier2_target: '',
+        tier2_ratio: 0.33,
+        tier3_target: '',
+        tier3_ratio: 0.34,
+        reason: '',
+        price: { last: 0, high: 0, low: 0 },
+        loadingPrice: false,
+        submitting: false,
+      });
       const toast = reactive({ message: '', type: 'info' });
 
       const loadingAny = computed(
@@ -269,7 +289,9 @@
           positions.loading ||
           decisionDetail.loading ||
           positionDetail.loading ||
-          logs.loading,
+          logs.loading ||
+          manualOpen.submitting ||
+          manualOpen.loadingPrice,
       );
 
       const decisionTotalPages = computed(() => Math.max(1, Math.ceil(decisions.total / decisions.pageSize)));
@@ -282,6 +304,13 @@
           if (s.provider_id) set.add(s.provider_id);
         });
         return Array.from(set);
+      });
+
+      const manualTierSum = computed(() => {
+        const r1 = Number(manualOpen.tier1_ratio) || 0;
+        const r2 = Number(manualOpen.tier2_ratio) || 0;
+        const r3 = Number(manualOpen.tier3_ratio) || 0;
+        return r1 + r2 + r3;
       });
 
       const filteredDecisionSteps = computed(() => {
@@ -307,6 +336,8 @@
             return { eyebrow: 'Blue Book', title: '决策档案', desc: '多 Agent 思维链' };
           case 'positions':
             return { eyebrow: 'Red Book', title: '仓位 Command Center', desc: '实盘持仓 / 止盈止损 / tiers' };
+          case 'manualOpen':
+            return { eyebrow: 'Manual', title: '手动开仓', desc: '跳过 AI 审查，直接推送 Freqtrade' };
           case 'decisionDetail':
             return { eyebrow: 'Decision Trace', title: `决策 #${decisionDetail.id || ''}`, desc: '完整的 prompt + 输出' };
           case 'positionDetail':
@@ -326,11 +357,21 @@
         }, 3200);
       };
 
+      const ensureManualSymbol = () => {
+        if (!manualOpen.symbol && defaultSymbols.value && defaultSymbols.value.length) {
+          manualOpen.symbol = defaultSymbols.value[0];
+        }
+      };
+
       const switchView = (next) => {
         view.value = next;
         if (next === 'desk') loadDesk();
         if (next === 'decisions') loadDecisions();
         if (next === 'positions') loadPositions();
+        if (next === 'manualOpen') {
+          ensureManualSymbol();
+          if (manualOpen.symbol) loadManualPrice();
+        }
         if (next === 'decisionDetail' && decisionDetail.id) loadDecisionDetail(decisionDetail.id);
         if (next === 'positionDetail' && positionDetail.tradeId) loadPositionDetail(positionDetail.tradeId);
         if (next === 'logs') loadLogs();
@@ -512,6 +553,25 @@
         }
       };
 
+      const loadManualPrice = async () => {
+        const symbol = (manualOpen.symbol || '').trim();
+        if (!symbol) {
+          showToast('请选择交易对', 'error');
+          return;
+        }
+        manualOpen.loadingPrice = true;
+        try {
+          const res = await fetchJSON(`/api/live/freqtrade/price?symbol=${encodeURIComponent(symbol)}`);
+          manualOpen.price.last = res.last || 0;
+          manualOpen.price.high = res.high || 0;
+          manualOpen.price.low = res.low || 0;
+        } catch (e) {
+          showToast(e.message, 'error');
+        } finally {
+          manualOpen.loadingPrice = false;
+        }
+      };
+
       const tierRows = (pos) => {
         if (!pos) return [];
         const t1 = pos.tier1 || {};
@@ -595,6 +655,47 @@
         }
       };
 
+      const submitManualOpen = async () => {
+        const symbol = (manualOpen.symbol || '').trim().toUpperCase();
+        if (!symbol) {
+          showToast('请选择交易对', 'error');
+          return;
+        }
+        if (Math.abs(manualTierSum.value - 1) > 1e-3) {
+          showToast('Tier 比例需等于 100%', 'error');
+          return;
+        }
+        manualOpen.submitting = true;
+        try {
+          const payload = {
+            symbol,
+            side: manualOpen.side,
+            leverage: Number(manualOpen.leverage) || 0,
+            position_size_usd: Number(manualOpen.position_size_usd) || 0,
+            stop_loss: Number(manualOpen.stop_loss) || 0,
+            take_profit: Number(manualOpen.take_profit) || 0,
+            tier1_target: Number(manualOpen.tier1_target) || 0,
+            tier1_ratio: Number(manualOpen.tier1_ratio) || 0,
+            tier2_target: Number(manualOpen.tier2_target) || 0,
+            tier2_ratio: Number(manualOpen.tier2_ratio) || 0,
+            tier3_target: Number(manualOpen.tier3_target) || 0,
+            tier3_ratio: Number(manualOpen.tier3_ratio) || 0,
+            reason: manualOpen.reason || '手动信号',
+          };
+          await fetchJSON('/api/live/freqtrade/manual-open', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+          });
+          showToast('已提交手动开仓');
+          loadPositions(true);
+        } catch (e) {
+          showToast(e.message, 'error');
+        } finally {
+          manualOpen.submitting = false;
+        }
+      };
+
       onMounted(() => {
         switchView(view.value);
       });
@@ -612,6 +713,7 @@
         filteredDecisionSteps,
         positionDetail,
         logs,
+        manualOpen,
         defaultSymbols,
         toast,
         loadingAny,
@@ -642,6 +744,9 @@
         tierForm,
         updateTierSettings,
         forceClosePosition,
+        manualTierSum,
+        loadManualPrice,
+        submitManualOpen,
         formatDuration,
         setStageFilter: (val) => {
           decisionFilters.stage = val;

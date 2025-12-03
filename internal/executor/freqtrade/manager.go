@@ -86,6 +86,7 @@ const (
 	priceFlushInterval       = 500 * time.Millisecond
 	pendingCheckInterval     = 2 * time.Second
 	exitConfirmTTL           = 3 * time.Minute
+	positionSummaryDelay     = 3 * time.Minute
 )
 
 // Position 缓存 freqtrade 持仓信息。
@@ -244,7 +245,6 @@ func (m *Manager) PublishPrice(symbol string, quote TierPriceQuote) {
 	select {
 	case m.priceEvents <- evt:
 	default:
-		logger.Warnf("freqtrade manager: price queue full, drop symbol=%s", symbol)
 	}
 }
 
@@ -459,6 +459,7 @@ func (m *Manager) handlePending(ctx context.Context, pe pendingExit, trMap map[i
 		fmt.Sprintf("平仓数量: %s", formatQty(actualClosed)),
 		fmt.Sprintf("剩余数量: %s", formatQty(valOrZero(orderRec.Amount))),
 	)
+	m.schedulePositionSummary(tradeID, strings.ToUpper(pe.describeKind()))
 
 	if valOrZero(orderRec.Amount) <= pendingAmountEpsilon {
 		m.markPositionClosed(tradeID, orderRec.Symbol, orderRec.Side, pe.TargetPrice, pe.Stake, "", now, valOrZero(orderRec.RealizedPnLRatio))
@@ -504,7 +505,13 @@ func (m *Manager) finalizePendingExit(ctx context.Context, pe pendingExit, trade
 	initialAmount := deriveInitialAmount(orderRec, pe)
 	currentAmount := pe.TargetAmount
 	if tradeSnapshot != nil {
-		currentAmount = tradeSnapshot.Amount
+		if tradeSnapshot.IsOpen {
+			currentAmount = tradeSnapshot.Amount
+		} else {
+			// freqtrade /trades 返回的历史记录中 amount 代表初始仓位，
+			// 已平仓时不能直接使用，否则会把数量又写回去。
+			currentAmount = 0
+		}
 	}
 	if currentAmount < 0 {
 		currentAmount = 0
@@ -763,13 +770,25 @@ func updatePnLFromSnapshot(order *database.LiveOrderRecord, tradeSnapshot *Trade
 		order.UnrealizedPnLRatio = ptrFloat(0)
 		order.UnrealizedPnLUSD = ptrFloat(0)
 	} else {
+		realizedRatio := tradeSnapshot.CloseProfit
+		realizedAbs := tradeSnapshot.CloseProfitAbs
+		unrealizedRatio := pnlRatio
+		unrealizedAbs := pnlAbs
+		if realizedRatio != 0 {
+			unrealizedRatio = pnlRatio - realizedRatio
+		}
+		if realizedAbs != 0 {
+			unrealizedAbs = pnlAbs - realizedAbs
+		}
 		if tradeSnapshot.CurrentRate > 0 {
 			order.CurrentPrice = ptrFloat(tradeSnapshot.CurrentRate)
 		} else if tradeSnapshot.CloseRate > 0 {
 			order.CurrentPrice = ptrFloat(tradeSnapshot.CloseRate)
 		}
-		order.UnrealizedPnLRatio = ptrFloat(pnlRatio)
-		order.UnrealizedPnLUSD = ptrFloat(pnlAbs)
+		order.UnrealizedPnLRatio = ptrFloat(unrealizedRatio)
+		order.UnrealizedPnLUSD = ptrFloat(unrealizedAbs)
+		order.RealizedPnLRatio = ptrFloat(realizedRatio)
+		order.RealizedPnLUSD = ptrFloat(realizedAbs)
 		order.CurrentProfitRatio = ptrFloat(pnlRatio)
 		order.CurrentProfitAbs = ptrFloat(pnlAbs)
 	}
@@ -828,6 +847,78 @@ func operationFromReason(reason string, fallback database.OperationType) databas
 		}
 		return database.OperationFailed
 	}
+}
+
+func (m *Manager) schedulePositionSummary(tradeID int, trigger string) {
+	if m == nil || m.notifier == nil {
+		return
+	}
+	go func() {
+		timer := time.NewTimer(positionSummaryDelay)
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+			m.sendPositionSummary(context.Background(), tradeID, trigger)
+		}
+	}()
+}
+
+func (m *Manager) sendPositionSummary(ctx context.Context, tradeID int, trigger string) {
+	if m == nil || m.posRepo == nil || m.notifier == nil {
+		return
+	}
+	orderRec, tierRec, ok, err := m.posRepo.GetPosition(ctx, tradeID)
+	if err != nil {
+		logger.Warnf("freqtrade summary: get position failed trade=%d err=%v", tradeID, err)
+		return
+	}
+	if !ok {
+		logger.Warnf("freqtrade summary: position missing trade=%d", tradeID)
+		return
+	}
+	realizedUSD := valOrZero(orderRec.RealizedPnLUSD)
+	realizedRatio := valOrZero(orderRec.RealizedPnLRatio)
+	unrealizedUSD := valOrZero(orderRec.UnrealizedPnLUSD)
+	unrealizedRatio := valOrZero(orderRec.UnrealizedPnLRatio)
+	totalUSD := realizedUSD + unrealizedUSD
+	totalRatio := realizedRatio + unrealizedRatio
+	remainingQty := valOrZero(orderRec.Amount)
+	remainingPct := clamp01(tierRec.RemainingRatio) * 100
+	leverage := valOrZero(orderRec.Leverage)
+
+	lines := []string{
+		fmt.Sprintf("Trade #%d %s · %s x%.2f", tradeID, strings.ToUpper(orderRec.Symbol), strings.ToUpper(orderRec.Side), leverage),
+		fmt.Sprintf("事件: %s · 延迟回顾(≈3m)", trigger),
+		fmt.Sprintf("已实现 %s (ROE %s)", formatUSD(realizedUSD), fmtPercent(realizedRatio)),
+		fmt.Sprintf("待实现 %s (ROE %s)", formatUSD(unrealizedUSD), fmtPercent(unrealizedRatio)),
+		fmt.Sprintf("合计 %s (ROE %s)", formatUSD(totalUSD), fmtPercent(totalRatio)),
+		fmt.Sprintf("剩余 %.2f%% (%s)", remainingPct, formatQty(remainingQty)),
+		fmt.Sprintf("TP %s / SL %s", formatPrice(tierRec.TakeProfit), formatPrice(tierRec.StopLoss)),
+		fmt.Sprintf("Tier1 %s (%s) %s", formatPrice(tierRec.Tier1), fmtPercent(tierRec.Tier1Ratio), markTierDone(tierRec.Tier1Done)),
+		fmt.Sprintf("Tier2 %s (%s) %s", formatPrice(tierRec.Tier2), fmtPercent(tierRec.Tier2Ratio), markTierDone(tierRec.Tier2Done)),
+		fmt.Sprintf("Tier3 %s (%s) %s", formatPrice(tierRec.Tier3), fmtPercent(tierRec.Tier3Ratio), markTierDone(tierRec.Tier3Done)),
+	}
+	m.notify("仓位回顾 📊", lines...)
+}
+
+func formatUSD(val float64) string {
+	prefix := "+"
+	if val < 0 {
+		prefix = "-"
+		val = math.Abs(val)
+	}
+	return fmt.Sprintf("%s$%.2f", prefix, val)
+}
+
+func fmtPercent(val float64) string {
+	return fmt.Sprintf("%.2f%%", val*100)
+}
+
+func markTierDone(done bool) string {
+	if done {
+		return "✅ 已触发"
+	}
+	return "… 待触发"
 }
 
 func (m *Manager) runPositionSync(ctx context.Context) {

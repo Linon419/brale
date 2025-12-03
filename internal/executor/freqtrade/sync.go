@@ -152,20 +152,32 @@ func (m *Manager) SyncOpenPositions(ctx context.Context) (int, error) {
 			if tr.CurrentRate > 0 {
 				order.CurrentPrice = ptrFloat(tr.CurrentRate)
 			}
-			// 优先使用 profit_ratio/profit_abs (浮动盈亏)，若无则回退到 close_profit (已实现盈亏，通常为 0)
-			pnlRatio := tr.ProfitRatio
-			pnlAbs := tr.ProfitAbs
-			if pnlRatio == 0 && tr.CloseProfit != 0 {
-				pnlRatio = tr.CloseProfit
+			// profit_ratio/profit_abs 表示总盈亏（已实现+未实现），close_profit 表示已实现
+			totalRatio := tr.ProfitRatio
+			totalAbs := tr.ProfitAbs
+			if totalRatio == 0 && tr.CloseProfit != 0 {
+				totalRatio = tr.CloseProfit
 			}
-			if pnlAbs == 0 && tr.CloseProfitAbs != 0 {
-				pnlAbs = tr.CloseProfitAbs
+			if totalAbs == 0 && tr.CloseProfitAbs != 0 {
+				totalAbs = tr.CloseProfitAbs
+			}
+			realizedRatio := tr.CloseProfit
+			realizedAbs := tr.CloseProfitAbs
+			unrealizedRatio := totalRatio
+			unrealizedAbs := totalAbs
+			if realizedRatio != 0 {
+				unrealizedRatio = totalRatio - realizedRatio
+			}
+			if realizedAbs != 0 {
+				unrealizedAbs = totalAbs - realizedAbs
 			}
 
-			order.CurrentProfitRatio = ptrFloat(pnlRatio)
-			order.CurrentProfitAbs = ptrFloat(pnlAbs)
-			order.UnrealizedPnLRatio = ptrFloat(pnlRatio)
-			order.UnrealizedPnLUSD = ptrFloat(pnlAbs)
+			order.CurrentProfitRatio = ptrFloat(totalRatio)
+			order.CurrentProfitAbs = ptrFloat(totalAbs)
+			order.RealizedPnLRatio = ptrFloat(realizedRatio)
+			order.RealizedPnLUSD = ptrFloat(realizedAbs)
+			order.UnrealizedPnLRatio = ptrFloat(unrealizedRatio)
+			order.UnrealizedPnLUSD = ptrFloat(unrealizedAbs)
 			syncTime := now
 			order.LastStatusSync = &syncTime
 			// 若 freqtrade 仍然持仓，则重置已平仓数量。

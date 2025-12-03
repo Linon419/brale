@@ -1,168 +1,95 @@
-# Brale 示例配置（合并 base.toml + config.toml）
-# - 复制为 configs/config.toml 后填写自己的值
-# - 不要把真实密钥提交到公共仓库
-
 [app]
-env = "dev"                              # 运行环境标签，可用于区分 dev/prod
-log_level = "info"                       # 日志级别：debug|info|warn|error
-http_addr = ":9991"                      # HTTP 服务监听地址
-log_path = "/data/logs/brale-live.log"   # 主日志文件路径（stdout 仍保留）
-llm_log_path = "/data/logs/brale-llm.log"# LLM 请求/响应日志
-llm_dump_payload = false                 # 是否把完整 LLM payload 保存到日志
+log_level = "info"                       # app.log_level：日志级别(debug/info/warn/error)
+http_addr = ":9991"                      # app.http_addr：HTTP 服务监听地址
 
 [symbols]
-provider = "default"                     # 币种列表来源 default|http
-default_list = ["ETHUSDT"]               # 当 provider=default 时监控的交易对
-
-[kline]
-max_cached = 300                         # 每个周期缓存的 K 线数
+default_list = ["ETHUSDT"]               # symbols.default_list：默认监控的交易对
 
 [market]
-active_source = "binance"                # 默认行情源
+active_source = "binance"                # market.active_source：默认行情源
 
 [[market.sources]]
-name = "binance"                         # 数据源名称
-enabled = true                           # 是否启用
-rest_base_url = "https://fapi.binance.com" # REST 基础地址
-[market.sources.proxy]
-enabled = false                          # 是否为该数据源启用代理
-rest_url = ""                            # REST 代理地址，例如 http://host.docker.internal:10080
-ws_url = ""                              # WebSocket 代理地址，可留空继承 REST
+enabled = true                           # market.sources[].enabled：是否启用该数据源
+proxy = { enabled = false, rest_url = "", ws_url = "" } # market.sources[].proxy：REST/WS 代理设置
 
 [ai]
-aggregation = "meta"                     # 多模型聚合策略
-decision_log_path = "/data/live/decisions.db" # 决策记录 SQLite
-last_decision_max_age_seconds = 3600     # 允许复用上一轮决策的最长间隔
-weights = { openai = 1.0, deepseek = 1.0, qwen = 1.0, vanchin = 1.0 } # 模型权重
-log_each_model = true                    # 是否记录各模型回答
-include_last_decision = true             # 是否把上一轮决策作为上下文
-decision_interval_seconds = 600          # 决策轮询间隔
-active_horizon = "four_hour"             # 默认持仓周期配置
-provider_preference = ["deepseek", "qwen"] # 模型使用优先级
+weights = { openai = 1.0, deepseek = 1.0, qwen = 1.0, vanchin = 1.0 } # ai.weights：模型投票权重
+decision_interval_seconds = 600          # ai.decision_interval_seconds：AI 决策轮询间隔
+active_horizon = "four_hour"             # ai.active_horizon：默认持仓周期
+provider_preference = ["deepseek", "qwen"] # ai.provider_preference：模型优先级
 
 [ai.profile_defaults]
-analysis_slice = 99                      # 默认截取的历史根数
-slice_drop_tail = 1                      # 默认丢弃的最新蜡烛数量
-
-[ai.profile_defaults.indicators.ema]
-fast = 7
-mid = 25
-slow = 99
-[ai.profile_defaults.indicators.rsi]
-period = 14
-oversold = 33
-overbought = 68
-
-[ai.holding_horizon_profiles.one_hour]
-entry_timeframes = ["5m", "15m"]         # 入场参考周期
-confirm_timeframes = ["1h"]              # 确认参考周期
-background_timeframes = ["4h"]           # 背景趋势周期
-slice_drop_tail = 1
-[ai.holding_horizon_profiles.one_hour.indicators.rsi]
-oversold = 30
-overbought = 70
+analysis_slice = 99                      # ai.profile_defaults.analysis_slice：默认截取的历史根数
+slice_drop_tail = 1                      # ai.profile_defaults.slice_drop_tail：默认丢弃的最新蜡烛数量
+indicators = { ema = { fast = 7, mid = 25, slow = 99 }, rsi = { period = 14, oversold = 33, overbought = 68 } } # ai.profile_defaults.indicators：默认 EMA/RSI 参数
 
 [ai.holding_horizon_profiles.four_hour]
-entry_timeframes = ["30m", "1h"]
-confirm_timeframes = ["4h"]
-background_timeframes = ["1d"]
-[ai.holding_horizon_profiles.four_hour.indicators.rsi]
-oversold = 35
-overbought = 65
+entry_timeframes = ["30m", "1h"]         # ai.holding_horizon_profiles.four_hour.entry_timeframes：入场参考周期
+confirm_timeframes = ["4h"]              # ai.holding_horizon_profiles.four_hour.confirm_timeframes：确认参考周期
+background_timeframes = ["1d"]           # ai.holding_horizon_profiles.four_hour.background_timeframes：背景参考周期
+indicators = { rsi = { oversold = 35, overbought = 65 } } # ai.holding_horizon_profiles.four_hour.indicators：周期特定指标
 
-[ai.holding_horizon_profiles.one_day]
-entry_timeframes = ["1h"]
-confirm_timeframes = ["4h", "1d"]
-background_timeframes = ["1w"]
-[ai.holding_horizon_profiles.one_day.indicators.rsi]
-oversold = 35
-overbought = 65
 
-[ai.holding_horizon_profiles.quant_agent]
-entry_timeframes = ["1h"]
-confirm_timeframes = ["4h", "1d"]
-background_timeframes = ["1w"]
-slice_drop_tail = 1
-[ai.holding_horizon_profiles.quant_agent.indicators.rsi]
-oversold = 35
-overbought = 65
 
 [ai.multi_agent]
-enabled = true
-indicator_template = "agent_indicator"   # 对应 prompts/agent_indicator.txt
-pattern_template = "agent_pattern"
-trend_template = "agent_trend"
-max_blocks = 4                           # 单次拆分的 symbol×interval 数
-indicator_provider = "deepseek"          # 各阶段固化模型（留空则按 provider_preference）
-pattern_provider = "qwen"
-trend_provider = "vanchin"
+indicator_provider = "deepseek"          # ai.multi_agent.indicator_provider：指标阶段默认模型
+pattern_provider = "qwen"                # ai.multi_agent.pattern_provider：形态阶段默认模型
+trend_provider = "vanchin"               # ai.multi_agent.trend_provider：趋势阶段默认模型
 
 [[ai.models]]
-id = "openai"                            # 模型 ID（自定义）
-provider = "openai"                      # factory/provider 名称
-enabled = false                          # 是否启用
-api_url = "https://api.example.com/v1"   # API base
-api_key = "YOUR_OPENAI_KEY"              # API Key
-model = "gpt-4"                          # 模型标识
-supports_vision = false                  # 是否支持图像
-expect_json = false                      # 是否期望 JSON 输出
+id = "deepseek"                          # ai.models[].id：模型唯一 ID
+provider = "deepseek"                    # ai.models[].provider：使用的 provider 名称
+enabled = true                           # ai.models[].enabled：是否启用
+api_url = "https://api.qnaigc.com/v1"    # ai.models[].api_url：模型 API 地址
+api_key = "sk-0d29772c10ae9b002c72d07137f634b0a69b943ef5f1fe2a91f2cd660c09a4c2" # ai.models[].api_key：调用凭证
+model = "deepseek-r1"                    # ai.models[].model：模型标识
+supports_vision = false                  # ai.models[].supports_vision：是否支持图像
+expect_json = false                      # ai.models[].expect_json：是否期望 JSON 输出
 
 [[ai.models]]
-id = "deepseek"
-provider = "deepseek"
-enabled = true
-api_url = "https://api.example.com/v1"
-api_key = "YOUR_DEEPSEEK_KEY"
-model = "deepseek-r1"
-supports_vision = false
-expect_json = false
+id = "qwen"                              # ai.models[].id：模型唯一 ID
+provider = "qwen"                        # ai.models[].provider：使用的 provider 名称
+enabled = true                           # ai.models[].enabled：是否启用
+api_url = "https://api.qnaigc.com/v1"    # ai.models[].api_url：模型 API 地址
+api_key = "sk-1d64fdeab304509ccea0b75215fa2c0bc5c508439f2ea345106f44202c027494" # ai.models[].api_key：调用凭证
+model = "qwen3-30b-a3b"                  # ai.models[].model：模型标识
+supports_vision = false                  # ai.models[].supports_vision：是否支持图像
+expect_json = false                      # ai.models[].expect_json：是否期望 JSON 输出
 
 [[ai.models]]
-id = "qwen"
-provider = "qwen"
-enabled = true
-api_url = "https://api.example.com/v1"
-api_key = "YOUR_QWEN_KEY"
-model = "qwen3-30b"
-supports_vision = false
-expect_json = false
+id = "vanchin"                           # ai.models[].id：模型唯一 ID
+provider = "vanchin"                     # ai.models[].provider：使用的 provider 名称
+enabled = true                           # ai.models[].enabled：是否启用
+api_url = "https://vanchin.streamlake.ai/api/gateway/v1/endpoints" # ai.models[].api_url：模型 API 地址
+api_key = "lbxRL5DoFsKnkyya4PZzYNwjSSq1DZ5tiLWb4pvTUXw" # ai.models[].api_key：调用凭证
+model = "ep-z5gybo-1762362617887467865"  # ai.models[].model：模型标识
+supports_vision = false                  # ai.models[].supports_vision：是否支持图像
+expect_json = false                      # ai.models[].expect_json：是否期望 JSON 输出
 
-[mcp]
-timeout_seconds = 120                    # 单次模型推理超时时间（秒）
+[[ai.models]]
+id = "doubao"                            # ai.models[].id：模型唯一 ID
+provider = "doubao"                      # ai.models[].provider：使用的 provider 名称
+enabled = false                          # ai.models[].enabled：是否启用
+api_url = "https://api.qnaigc.com/v1"    # ai.models[].api_url：模型 API 地址
+api_key = "sk-0bc74286d28bf38ef586bff49a85dfdec8c7353b0b2f56f7f1cf77bee2a171e4" # ai.models[].api_key：调用凭证
+model = "doubao-seed-1.6-thinking"       # ai.models[].model：模型标识
+supports_vision = false                  # ai.models[].supports_vision：是否支持图像
+expect_json = false                      # ai.models[].expect_json：是否期望 JSON 输出
 
 [prompt]
-dir = "prompts"                          # 提示词模板目录
-system_template = "prompt_default"       # 默认系统提示模板（不含 .txt）
+dir = "prompts"                          # prompt.dir：提示词模板目录
+system_template = "default"              # prompt.system_template：默认系统提示模板
 
 [notify.telegram]
-enabled = true
-bot_token = "YOUR_TELEGRAM_BOT_TOKEN"    # Telegram Bot Token
-chat_id = "YOUR_TELEGRAM_CHAT_ID"        # Telegram Chat ID
+enabled = true                           # notify.telegram.enabled：是否启用 Telegram 通知
+bot_token = "7979485253:AAGtmW6v8eumkHMoQ3JClVo9iatwEa1rJpw" # notify.telegram.bot_token：机器人 Token
+chat_id = "-1003001441406"               # notify.telegram.chat_id：接收频道/用户 ID
 
 [freqtrade]
-enabled = true
-api_url = "http://freqtrade:8080/api/v1" # freqtrade REST API
-username = "YOUR_FREQTRADE_USER"         # Basic Auth 用户名
-password = "YOUR_FREQTRADE_PASS"         # Basic Auth 密码
-api_token = ""                           # freqtrade API Token（可选）
-default_stake_usd = 100                  # 缺省下单金额（USDT）
-default_leverage = 1                     # 缺省杠杆
-timeout_seconds = 15                     # API 调用超时
-insecure_skip_verify = false             # 是否跳过 TLS 校验
-webhook_url = "http://brale:9991/api/live/freqtrade/webhook" # freqtrade webhook 回调地址
-risk_store_path = "/data/db/trade_risk.db"# Tier 状态持久化 SQLite
-min_stop_distance_pct = 0.005            # Tier1 完成前止损最小距离（比例）
-entry_slip_pct = 0.0                     # 限价下单容忍滑点比例
+username = "lauk"                        # freqtrade.username：Freqtrade Basic Auth 用户
+password = "881016"                      # freqtrade.password：Freqtrade Basic Auth 密码
+min_stop_distance_pct = 0.005            # freqtrade.min_stop_distance_pct：最小止损距离
+entry_slip_pct = 0.0002                  # freqtrade.entry_slip_pct：限价滑点容忍
 
 [advanced]
-liquidity_filter_usd_m = 15              # 最低流动性过滤（百万美元）
-min_risk_reward = 1                      # 最小风险回报比
-open_cooldown_seconds = 180              # 同方向开仓冷却时间
-max_opens_per_cycle = 3                  # 单轮最多开仓数
-tier_min_distance_pct = 0.005            # Tier1 与入场价最小距离
-
-[trading]
-mode = "static"                          # 资金模式，目前仅 static
-max_position_pct = 0.01                  # 单笔最大仓位占比
-default_position_usd = 0                 # 固定仓位金额；0 表示按占比
-default_leverage = 10                    # 模型未提供时的默认杠杆
+tier_min_distance_pct = 0.005            # advanced.tier_min_distance_pct：Tier1 与入场价最小距离
