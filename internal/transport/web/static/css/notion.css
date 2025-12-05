@@ -228,17 +228,77 @@ a:hover {
 .step-head {
     display: flex;
     justify-content: space-between;
+    align-items: flex-start;
     flex-wrap: wrap;
-    gap: 6px;
-    font-size: 0.8rem;
-    color: var(--notion-muted);
-    text-transform: uppercase;
-    letter-spacing: 0.2em;
+    gap: 8px;
     margin-bottom: 8px;
+}
+
+.step-head-left {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    align-items: center;
+}
+
+.step-head-right {
+    font-size: 0.75rem;
+    color: var(--notion-muted);
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
 }
 
 .step-head span {
     overflow-wrap: anywhere;
+}
+
+.stage-pill {
+    display: inline-flex;
+    align-items: center;
+    border-radius: 999px;
+    padding: 2px 10px;
+    font-size: 0.72rem;
+    letter-spacing: 0.2em;
+    text-transform: uppercase;
+    border: 1px solid transparent;
+}
+
+.stage-pill-provider {
+    background: #dbeafe;
+    border-color: #93c5fd;
+    color: #1e3a8a;
+}
+
+.stage-pill-final {
+    background: #ecfccb;
+    border-color: #bef264;
+    color: #3b5b0a;
+}
+
+.stage-pill-agent {
+    background: #f3e8ff;
+    border-color: #d8b4fe;
+    color: #6b21a8;
+}
+
+.stage-pill-other {
+    background: #f3f4f6;
+    border-color: #d1d5db;
+    color: #374151;
+}
+
+.stage-detail {
+    font-size: 0.7rem;
+    text-transform: uppercase;
+    letter-spacing: 0.2em;
+    color: var(--notion-muted);
+}
+
+.step-provider {
+    font-size: 0.7rem;
+    text-transform: uppercase;
+    letter-spacing: 0.2em;
+    color: #0f172a;
 }
 
 .step-label {

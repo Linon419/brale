@@ -39,7 +39,7 @@ const (
 	// defaultAIMultiBlocks 默认多 Agent 询问分块数（config: ai.multi_agent.max_blocks）
 	defaultAIMultiBlocks = 4
 	// defaultMCPTimeout 默认 MCP 请求超时秒数（config: mcp.timeout_seconds）
-	defaultMCPTimeout = 120
+	defaultMCPTimeout = 300
 	// defaultFreqtradeAPI 默认 freqtrade API 地址（config: freqtrade.api_url）
 	defaultFreqtradeAPI = "http://freqtrade:8080/api/v1"
 	// defaultFreqtradeStake 默认下单基准资金（config: freqtrade.default_stake_usd）

@@ -338,6 +338,40 @@
         });
       });
 
+      const cleanStageText = (text) => {
+        if (!text) return '';
+        return text
+          .replace(/[_-]+/g, ' ')
+          .replace(/\s+/g, ' ')
+          .trim();
+      };
+
+      const describeStage = (stageRaw) => {
+        const raw = (stageRaw || '').trim();
+        if (!raw) {
+          return { label: 'OTHER', detail: '', className: 'stage-pill-other' };
+        }
+        const lower = raw.toLowerCase();
+        if (lower === 'provider') {
+          return { label: 'PROVIDER', detail: '', className: 'stage-pill-provider' };
+        }
+        if (lower === 'final') {
+          return { label: 'FINAL', detail: 'AGGREGATE', className: 'stage-pill-final' };
+        }
+        if (lower.startsWith('agent')) {
+          const detail = cleanStageText(raw.split(':').slice(1).join(':'));
+          return { label: 'AGENT', detail, className: 'stage-pill-agent' };
+        }
+        return { label: cleanStageText(raw).toUpperCase() || 'OTHER', detail: '', className: 'stage-pill-other' };
+      };
+
+      const stageLabel = (stage) => describeStage(stage).label || 'OTHER';
+      const stageDetail = (stage) => {
+        const detail = describeStage(stage).detail;
+        return detail ? detail.toUpperCase() : '';
+      };
+      const stageBadgeClass = (stage) => describeStage(stage).className || 'stage-pill-other';
+
       const headline = computed(() => {
         switch (view.value) {
           case 'decisions':
@@ -805,6 +839,9 @@
         loadManualPrice,
         submitManualOpen,
         formatDuration,
+        stageLabel,
+        stageDetail,
+        stageBadgeClass,
         setStageFilter: (val) => {
           decisionFilters.stage = val;
         },

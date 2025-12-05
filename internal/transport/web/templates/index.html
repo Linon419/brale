@@ -258,12 +258,18 @@
                                 <div class="step-list" v-if="decisionDetail.data.trace && decisionDetail.data.trace.steps">
                                     <div class="step-card" v-for="(step, idx) in filteredDecisionSteps" :key="idx">
                                         <div class="step-head">
-                                            <span>[[ step.stage ]] · [[ step.provider_id || 'N/A' ]]</span>
-                                            <span>[[ formatDateTime(step.ts) ]]</span>
+                                            <div class="step-head-left">
+                                                <span class="stage-pill" :class="stageBadgeClass(step.stage)">[[ stageLabel(step.stage) ]]</span>
+                                                <span class="stage-detail" v-if="stageDetail(step.stage)">[[ stageDetail(step.stage) ]]</span>
+                                                <span class="step-provider">[[ step.provider_id || 'N/A' ]]</span>
+                                            </div>
+                                            <div class="step-head-right">[[ formatDateTime(step.ts) ]]</div>
                                         </div>
-                                        <div class="step-label">User</div>
+                                        <div class="step-label" v-if="(step.system_prompt || '').trim()">System Prompt</div>
+                                        <pre class="step-text" v-if="(step.system_prompt || '').trim()">[[ step.system_prompt ]]</pre>
+                                        <div class="step-label">User Prompt</div>
                                         <pre class="step-text">[[ step.user_prompt || '—' ]]</pre>
-                                        <div class="step-label">Output</div>
+                                        <div class="step-label">LLM Output</div>
                                         <pre class="step-text">[[ step.meta_summary || step.raw_output || '—' ]]</pre>
                                         <div class="step-label" v-if="step.decisions && step.decisions.length">Parsed Decisions</div>
                                         <ul v-if="step.decisions && step.decisions.length" class="decision-list">
