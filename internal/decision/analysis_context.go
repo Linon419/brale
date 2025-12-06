@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"math"
 	"strings"
-
+	"time"
 	"brale/internal/analysis/indicator"
 	"brale/internal/analysis/pattern"
 	"brale/internal/analysis/visual"
@@ -21,6 +21,7 @@ type AnalysisContext struct {
 	Symbol          string `json:"symbol"`
 	Interval        string `json:"interval"`
 	KlineJSON       string `json:"kline_json"`
+	KlineCSV        string `json:"kline_csv"`
 	IndicatorJSON   string `json:"indicator_json"`
 	PatternReport   string `json:"pattern_report"`
 	TrendReport     string `json:"trend_report"`
@@ -100,6 +101,14 @@ func BuildAnalysisContexts(input AnalysisBuildInput) []AnalysisContext {
 				logger.Warnf("analysis/json 序列化失败 %s %s: %v", sym, iv, err)
 				continue
 			}
+			csvData := ""
+			if len(shortCandles) > 0 {
+				csvData = BuildCandleCSV(shortCandles, CandleCSVOptions{
+					DateOnly:       prefersDateOnly(iv),
+					Location:       time.UTC,
+					PricePrecision: PrecisionAuto,
+				})
+			}
 			indJSON := ""
 			var (
 				rep    indicator.Report
@@ -136,6 +145,7 @@ func BuildAnalysisContexts(input AnalysisBuildInput) []AnalysisContext {
 				Symbol:          sym,
 				Interval:        iv,
 				KlineJSON:       string(rawJSON),
+				KlineCSV:        csvData,
 				IndicatorJSON:   indJSON,
 				PatternReport:   pat.PatternSummary,
 				TrendReport:     trendReport,
@@ -245,4 +255,12 @@ func roundTo(v float64, decimals int) float64 {
 	}
 	pow := math.Pow(10, float64(decimals))
 	return math.Round(v*pow) / pow
+}
+
+func prefersDateOnly(interval string) bool {
+	iv := strings.ToLower(strings.TrimSpace(interval))
+	if iv == "" {
+		return false
+	}
+	return strings.HasSuffix(iv, "d") || strings.HasSuffix(iv, "w")
 }

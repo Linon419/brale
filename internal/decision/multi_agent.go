@@ -106,25 +106,30 @@ func buildTrendAgentPrompt(ctxs []AnalysisContext, cfg brcfg.MultiAgentConfig) s
 	}
 	limit := agentBlockLimit(cfg)
 	var b strings.Builder
-	b.WriteString("# Raw Kline Windows\n")
+	b.WriteString("# Trend CSV Windows\n")
+	b.WriteString("每个数据块包含 Date/Time(UTC), Open(O), High(H), Low(L), Close(C), Volume(V), Trades 列，按行给出最近的 K 线。\n\n")
 	count := 0
 	for _, ac := range ctxs {
-		data := strings.TrimSpace(ac.KlineJSON)
+		csvData := strings.TrimSpace(ac.KlineCSV)
+		raw := strings.TrimSpace(ac.KlineJSON)
 		note := strings.TrimSpace(ac.ImageNote)
-		if data == "" && note == "" {
+		trend := strings.TrimSpace(ac.TrendReport)
+		if csvData == "" && raw == "" && note == "" && trend == "" {
 			continue
 		}
 		b.WriteString(fmt.Sprintf("## %s %s (%s)\n", ac.Symbol, ac.Interval, ac.ForecastHorizon))
-		if data != "" {
-			b.WriteString("Raw: \n")
-			b.WriteString(data)
+		if csvData != "" {
+			writeCSVDataBlock(&b, buildKlineBlockTag(ac.Interval), csvData)
+		} else if raw != "" {
+			b.WriteString("Raw:\n")
+			b.WriteString(raw)
 			b.WriteString("\n")
 		}
 		if note != "" {
 			b.WriteString("Visual: " + note + "\n")
 		}
-		if strings.TrimSpace(ac.TrendReport) != "" {
-			b.WriteString("Trend: " + strings.TrimSpace(ac.TrendReport) + "\n")
+		if trend != "" {
+			b.WriteString("Trend: " + trend + "\n")
 		}
 		b.WriteString("\n")
 		count++
@@ -157,4 +162,37 @@ func formatAgentStageTitle(stage string) string {
 		}
 		return strings.ToUpper(stage[:1]) + stage[1:] + " Agent"
 	}
+}
+
+func buildKlineBlockTag(interval string) string {
+	iv := strings.ToUpper(strings.TrimSpace(interval))
+	if iv == "" {
+		return "DATA"
+	}
+	var b strings.Builder
+	b.WriteString("DATA_")
+	for _, r := range iv {
+		if (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') {
+			b.WriteRune(r)
+		}
+	}
+	tag := b.String()
+	if len(tag) <= len("DATA_") {
+		return "DATA"
+	}
+	return tag
+}
+
+func writeCSVDataBlock(b *strings.Builder, tag, csv string) {
+	tag = strings.TrimSpace(tag)
+	if tag == "" {
+		tag = "DATA"
+	}
+	tag = strings.ToUpper(tag)
+	b.WriteString("[" + tag + "_START]\n")
+	b.WriteString(csv)
+	if !strings.HasSuffix(csv, "\n") {
+		b.WriteByte('\n')
+	}
+	b.WriteString("[" + tag + "_END]\n\n")
 }
