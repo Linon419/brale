@@ -134,9 +134,15 @@ func (b *AppBuilder) Build(ctx context.Context) (*App, error) {
 		TimeoutSeconds:     cfg.MCP.TimeoutSeconds,
 	})
 
-	tg := newTelegram(cfg.Notify)
-	if tg != nil {
-		engine.AgentNotifier = tg
+	tgClient := newTelegram(cfg.Notify)
+	var agentNotifier decision.TextNotifier
+	var freqNotifier freqexec.TextNotifier
+	if tgClient != nil {
+		agentNotifier = tgClient
+		freqNotifier = tgClient
+	}
+	if agentNotifier != nil {
+		engine.AgentNotifier = agentNotifier
 	}
 
 	decArtifacts, err := b.decisionArtifactsFn(ctx, cfg.AI, engine)
@@ -145,7 +151,7 @@ func (b *AppBuilder) Build(ctx context.Context) (*App, error) {
 	}
 	includeLastDecision := cfg.AI.IncludeLastDecision
 	orderRecorder := decArtifacts.recorder
-	freqManager, err := b.freqManagerFn(cfg.Freqtrade, cfg.AI.ActiveHorizon, decArtifacts.store, orderRecorder, tg)
+	freqManager, err := b.freqManagerFn(cfg.Freqtrade, cfg.AI.ActiveHorizon, decArtifacts.store, orderRecorder, freqNotifier)
 	if err != nil {
 		return nil, err
 	}
@@ -155,7 +161,7 @@ func (b *AppBuilder) Build(ctx context.Context) (*App, error) {
 		ks:                  ks,
 		updater:             updater,
 		engine:              engine,
-		tg:                  tg,
+		tg:                  tgClient,
 		decLogs:             decArtifacts.store,
 		orderRec:            orderRecorder,
 		lastDec:             decArtifacts.cache,
