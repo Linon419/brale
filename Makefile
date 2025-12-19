@@ -94,4 +94,9 @@ start:
 	$(DOCKER_COMPOSE) up -d brale
 
 bs:
-	$(DOCKER_COMPOSE) up brale --build
+	@echo "构建 brale 镜像..."
+	$(DOCKER_COMPOSE) build brale
+	@echo "停止正在运行的 brale..."
+	-$(DOCKER_COMPOSE) stop brale
+	@echo "重新启动 brale..."
+	$(DOCKER_COMPOSE) up -d brale

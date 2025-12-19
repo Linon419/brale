@@ -549,20 +549,13 @@ func (s *PlanScheduler) adjustTierLevelsPlan(ctx context.Context, tradeID int, p
 		}
 		updates[i] = update
 
-		// Guard: triggered/done tiers must keep original target/ratio
+		// Guard: triggered/done tiers must keep original ratio (target_price may drift)
 		if tierStates[i].Status != database.StrategyStatusWaiting {
-			target, _ := utils.AsFloat(update["target_price"])
-			if target == 0 {
-				target, _ = utils.AsFloat(update["target"])
-			}
 			ratio, _ := utils.AsFloat(update["ratio"])
 			if ratio == 0 {
 				ratio = tierStates[i].Ratio
 			}
 			const tol = 1e-9
-			if target != 0 && math.Abs(target-tierStates[i].Target) > tol {
-				return fmt.Errorf("%s 已触发段 %s 的 target_price 不可修改", alias, tierStates[i].Component)
-			}
 			if ratio != 0 && math.Abs(ratio-tierStates[i].Ratio) > tol {
 				return fmt.Errorf("%s 已触发段 %s 的 ratio 不可修改", alias, tierStates[i].Component)
 			}
