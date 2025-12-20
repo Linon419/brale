@@ -298,14 +298,14 @@ func writeKlineWindow(sb *strings.Builder, win klineWindow) {
 	sb.WriteString(header + "\n")
 	for idx := len(win.Bars) - 1; idx >= 0; idx-- {
 		bar := win.Bars[idx]
-		sb.WriteString(fmt.Sprintf("    [%s, o=%s, h=%s, l=%s, c=%s, v=%.2f]\n",
+		fmt.Fprintf(sb, "    [%s, o=%s, h=%s, l=%s, c=%s, v=%.2f]\n",
 			bar.TimeString(),
 			formatutil.Float(bar.Open, 4),
 			formatutil.Float(bar.High, 4),
 			formatutil.Float(bar.Low, 4),
 			formatutil.Float(bar.Close, 4),
 			bar.Volume,
-		))
+		)
 	}
 	if len(win.Bars) > 0 {
 		if summary := market.Candles(win.Bars).Snapshot(win.Interval, win.Trend); summary != "" {

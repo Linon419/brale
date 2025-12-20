@@ -253,10 +253,7 @@ func isStopLossEvent(mode, component, alias string) bool {
 		return true
 	}
 	alias = strings.ToLower(strings.TrimSpace(alias))
-	if strings.HasPrefix(alias, "sl_") {
-		return true
-	}
-	return false
+	return strings.HasPrefix(alias, "sl_")
 }
 
 func isTakeProfitEvent(mode, component, alias string) bool {
@@ -269,8 +266,5 @@ func isTakeProfitEvent(mode, component, alias string) bool {
 		return true
 	}
 	alias = strings.ToLower(strings.TrimSpace(alias))
-	if strings.HasPrefix(alias, "tp_") {
-		return true
-	}
-	return false
+	return strings.HasPrefix(alias, "tp_")
 }

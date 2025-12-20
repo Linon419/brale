@@ -139,10 +139,3 @@ func formatSignedPercent(v float64) string {
 	}
 	return fmt.Sprintf("%s%.2f%%", sign, v)
 }
-
-func clampAmount(v float64) float64 {
-	if v <= 0 {
-		return 0
-	}
-	return v
-}

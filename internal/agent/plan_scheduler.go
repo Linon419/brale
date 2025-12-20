@@ -244,7 +244,7 @@ func (s *PlanScheduler) pruneInactiveLocked(active map[int]struct{}, missThresho
 		s.pruneMisses = make(map[int]int)
 	}
 
-	if s.tradeIndex == nil || len(s.tradeIndex) == 0 {
+	if len(s.tradeIndex) == 0 {
 		if len(s.pruneMisses) > 0 {
 			s.pruneMisses = make(map[int]int)
 		}
@@ -409,8 +409,8 @@ func resetPendingState(rec database.StrategyInstanceRecord) string {
 func pendingTimestamp(rec database.StrategyInstanceRecord) time.Time {
 	component := strings.TrimSpace(rec.PlanComponent)
 	stateJSON := strings.TrimSpace(rec.StateJSON)
-	switch {
-	case component == "":
+	switch component {
+	case "":
 		if st, err := exit.DecodeTierPlanState(stateJSON); err == nil && st.PendingSince > 0 {
 			return time.Unix(st.PendingSince, 0)
 		}
@@ -912,31 +912,6 @@ type tierComponentInfo struct {
 	Component string
 	Index     int
 	Remaining float64
-}
-
-func waitingTierComponents(recs []database.StrategyInstanceRecord) ([]tierComponentInfo, error) {
-	if len(recs) == 0 {
-		return nil, nil
-	}
-	waiting := make([]tierComponentInfo, 0, len(recs))
-	for _, rec := range recs {
-		if !strings.Contains(rec.PlanComponent, ".tier") {
-			continue
-		}
-		if rec.Status != database.StrategyStatusWaiting {
-			continue
-		}
-		state, err := exit.DecodeTierComponentState(rec.StateJSON)
-		if err != nil {
-			return nil, fmt.Errorf("解析组件 %s 状态失败: %w", rec.PlanComponent, err)
-		}
-		waiting = append(waiting, tierComponentInfo{
-			Component: strings.TrimSpace(rec.PlanComponent),
-			Remaining: state.RemainingRatio,
-		})
-	}
-	sort.Slice(waiting, func(i, j int) bool { return waiting[i].Component < waiting[j].Component })
-	return waiting, nil
 }
 
 type tierComponentState struct {

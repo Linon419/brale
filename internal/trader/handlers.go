@@ -320,9 +320,7 @@ func (t *Trader) handlePartialClose(symbol string, p PositionClosedPayload) erro
 }
 
 func (t *Trader) handleFullClose(symbol string, p PositionClosedPayload) error {
-	if _, exists := t.state.Positions[symbol]; exists {
-		delete(t.state.Positions, symbol)
-	}
+	delete(t.state.Positions, symbol)
 	if p.TradeID != "" {
 		delete(t.state.ByTradeID, p.TradeID)
 		delete(t.state.Plans, p.TradeID)
