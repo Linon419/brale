@@ -107,6 +107,15 @@ func NewSentimentService(store KlineStore, source Source, metrics *MetricsServic
 	return svc
 }
 
+// Calculate builds a smart sentiment score from derivatives + volume signals.
+// Factors (each normalized to 0..1):
+// - OpenInterest: current OI normalized by min/max of the last 10 points on 1h history.
+// - FundingRate: funding normalized in [-0.02, 0.02] (keeps sign direction).
+// - BigWhales: Top Position long/short ratio normalized in [0.9, 2.0].
+// - BigAccounts: Top Account long/short ratio normalized in [0.9, 2.0].
+// - RetailInverse: Global Account long/short ratio normalized inversely in [0.8, 1.2].
+// - VolumeEmotion: current volume / avg(last 100 bars), normalized in [0.5, 3.0].
+// The final score is a weighted sum per interval (5m/15m/1h/4h/1d), scaled to 0..100.
 func (s *SentimentService) Calculate(ctx context.Context, symbol, interval string, candles []Candle) (SentimentData, bool) {
 	if s == nil || s.metrics == nil || s.source == nil {
 		return SentimentData{}, false

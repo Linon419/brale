@@ -10,6 +10,15 @@ type CVDMetrics struct {
 	PeakFlip   string
 }
 
+// ComputeCVD calculates a CVD snapshot from taker buy/sell volumes.
+// Output meanings:
+//   - Value: cumulative sum of (taker_buy - taker_sell) across the window.
+//   - Momentum: Value minus the value 6 bars ago (0 when insufficient bars).
+//   - Normalized: (Value - min) / (max - min) across the CVD series, 0.5 when flat.
+//   - Divergence: "bearish" if price rises while CVD falls vs 6 bars ago;
+//     "bullish" if price falls while CVD rises; otherwise "neutral".
+//   - PeakFlip: "top" if last CVD is below previous and previous is above prior;
+//     "bottom" if last is above previous and previous below prior; else "none".
 func ComputeCVD(candles []Candle) (CVDMetrics, bool) {
 	if len(candles) == 0 {
 		return CVDMetrics{}, false
