@@ -9,6 +9,7 @@ import (
 	"brale/internal/gateway/provider"
 	"brale/internal/market"
 	"brale/internal/strategy"
+	"brale/internal/types"
 )
 
 // DefaultPromptBuilder is the production prompt builder used by DecisionEngine.
@@ -60,10 +61,19 @@ func (b *DefaultPromptBuilder) Build(ctx context.Context, input Context, insight
 func (b *DefaultPromptBuilder) buildUserSummary(ctx context.Context, input Context, insights []AgentInsight) string {
 	b.refreshFearGreedOnDemand(ctx, input.Candidates, input.Directives)
 
+	ds := b.buildDerivativesSection(ctx, input.Analysis, input.Directives)
+	input.DataAgeSec = mergeDataAgeSec(input.DataAgeSec, ds.DataAgeSec)
+	liqClose := computeLiquidationClose(input.Positions)
+	if ds.LeverageCrowded && liqClose && (ds.FundingStressed || ds.PriceTrigger) {
+		input.HardFlags.LiqRiskFlag = true
+	}
+
 	sections := render.Sections{
+		Header:            b.renderHeader(input),
 		Account:           b.renderAccountOverview(input.Account, input.Market),
 		Previous:          b.renderPreviousReasoning(input.PreviousReasoning),
 		PreviousProviders: b.renderPreviousProviderOutputs(input.PreviousProviderOutputs),
+		Derivatives:       "", // provider 阶段无需在主 prompt 展示衍生品数据
 		Positions:         b.renderPositionDetails(filterPositions(input.Positions, input.Candidates)),
 		Klines:            b.renderKlineWindows(input.Analysis, input.Directives),
 		Agents:            b.renderAgentBlocks(insights),
@@ -109,4 +119,31 @@ func (b *DefaultPromptBuilder) collectVisionPayloads(ctxs []AnalysisContext) []p
 		}
 	}
 	return out
+}
+
+func mergeDataAgeSec(base map[string]int64, extra map[string]int64) map[string]int64 {
+	if len(extra) == 0 && len(base) == 0 {
+		return base
+	}
+	out := make(map[string]int64, len(base)+len(extra))
+	for k, v := range base {
+		out[k] = v
+	}
+	for k, v := range extra {
+		if v < 0 {
+			v = 0
+		}
+		out[k] = v
+	}
+	return out
+}
+
+// computeLiquidationClose is a heuristic: high leverage + deep drawdown implies接近强平。
+func computeLiquidationClose(positions []types.PositionSnapshot) bool {
+	for _, p := range positions {
+		if p.Leverage >= 10 && p.UnrealizedPnPct <= -40 {
+			return true
+		}
+	}
+	return false
 }

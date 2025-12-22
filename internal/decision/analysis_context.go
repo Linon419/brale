@@ -273,11 +273,7 @@ func computeIndicators(cfg analysisBuildConfig, sym, iv string, fullCandles []ma
 }
 
 func formatTrendReport(pat pattern.Result) string {
-	trendReport := pat.TrendSummary
-	if pat.Bias != "" {
-		trendReport = fmt.Sprintf("%s | bias=%s", pat.TrendSummary, pat.Bias)
-	}
-	return trendReport
+	return pat.TrendSummary
 }
 
 func renderComposite(ctx context.Context, sym, iv, horizon string, candles []market.Candle, history []market.Candle, rep indicator.Report, pat pattern.Result) (string, string) {

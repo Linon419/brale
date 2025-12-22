@@ -22,9 +22,11 @@ type indicatorSnapshot struct {
 }
 
 type snapshotMeta struct {
-	SeriesOrder string `json:"series_order"`
-	SampledAt   string `json:"sampled_at"`
-	Version     string `json:"version"`
+	SeriesOrder  string           `json:"series_order"`
+	SampledAt    string           `json:"sampled_at"`
+	Version      string           `json:"version"`
+	TimestampNow string           `json:"timestamp_now_ts,omitempty"`
+	DataAgeSec   map[string]int64 `json:"data_age_sec,omitempty"`
 }
 
 type snapshotMarket struct {
@@ -55,18 +57,24 @@ type emaSnapshot struct {
 }
 
 type macdSnapshot struct {
-	DIF       float64         `json:"dif"`
-	DEA       float64         `json:"dea"`
-	Histogram *seriesSnapshot `json:"histogram,omitempty"`
+	DIF             float64         `json:"dif"`
+	DEA             float64         `json:"dea"`
+	Histogram       *seriesSnapshot `json:"histogram,omitempty"`
+	Slope           *float64        `json:"slope,omitempty"`
+	NormalizedSlope *float64        `json:"normalized_slope,omitempty"`
+	SlopeState      string          `json:"slope_state,omitempty"`
 }
 
 type rsiSnapshot struct {
-	Current        float64   `json:"current"`
-	LastN          []float64 `json:"last_n,omitempty"`
-	PeriodHigh     float64   `json:"period_high"`
-	PeriodLow      float64   `json:"period_low"`
-	DistanceToHigh float64   `json:"distance_to_high"`
-	DistanceToLow  float64   `json:"distance_to_low"`
+	Current         float64   `json:"current"`
+	LastN           []float64 `json:"last_n,omitempty"`
+	PeriodHigh      float64   `json:"period_high"`
+	PeriodLow       float64   `json:"period_low"`
+	DistanceToHigh  float64   `json:"distance_to_high"`
+	DistanceToLow   float64   `json:"distance_to_low"`
+	Slope           *float64  `json:"slope,omitempty"`
+	NormalizedSlope *float64  `json:"normalized_slope,omitempty"`
+	SlopeState      string    `json:"slope_state,omitempty"`
 }
 
 type obvSnapshot struct {
@@ -86,10 +94,11 @@ type seriesSnapshot struct {
 }
 
 type atrSnapshot struct {
-	Latest  float64   `json:"latest"`
-	LastN   []float64 `json:"last_n,omitempty"`
-	RangeLo float64   `json:"range_min"`
-	RangeHi float64   `json:"range_max"`
+	Latest    float64   `json:"latest"`
+	LastN     []float64 `json:"last_n,omitempty"`
+	RangeLo   float64   `json:"range_min"`
+	RangeHi   float64   `json:"range_max"`
+	ChangePct *float64  `json:"change_pct,omitempty"`
 }
 
 func BuildIndicatorSnapshot(candles []market.Candle, rep indicator.Report) ([]byte, error) {
@@ -102,11 +111,13 @@ func BuildIndicatorSnapshot(candles []market.Candle, rep indicator.Report) ([]by
 	last := candles[len(candles)-1]
 	stamp := candleTimestamp(last)
 	price := last.Close
+	now := time.Now().UTC()
 	snapshot := indicatorSnapshot{
 		Meta: snapshotMeta{
-			SeriesOrder: "oldest_to_latest",
-			SampledAt:   stamp,
-			Version:     indicatorSnapshotVersion,
+			SeriesOrder:  "oldest_to_latest",
+			SampledAt:    stamp,
+			Version:      indicatorSnapshotVersion,
+			TimestampNow: now.Format(time.RFC3339),
 		},
 		Market: snapshotMarket{
 			Symbol:         strings.ToUpper(strings.TrimSpace(rep.Symbol)),
@@ -114,6 +125,13 @@ func BuildIndicatorSnapshot(candles []market.Candle, rep indicator.Report) ([]by
 			CurrentPrice:   roundFloat(price, 4),
 			PriceTimestamp: stamp,
 		},
+	}
+	if last.CloseTime > 0 {
+		ageSec := int64(now.Sub(time.UnixMilli(last.CloseTime)).Seconds())
+		if ageSec < 0 {
+			ageSec = 0
+		}
+		snapshot.Meta.DataAgeSec = map[string]int64{"indicator": ageSec}
 	}
 	data := snapshotData{}
 	if val, ok := rep.Values["ema_fast"]; ok {
@@ -186,11 +204,17 @@ func buildMACDSnapshot(candles []market.Candle, tail int) *macdSnapshot {
 	if len(histLast) > 0 {
 		hist = &seriesSnapshot{Last: histLast}
 	}
-	return &macdSnapshot{
+	ms := &macdSnapshot{
 		DIF:       roundFloat(mSeries[len(mSeries)-1], 4),
 		DEA:       roundFloat(sSeries[len(sSeries)-1], 4),
 		Histogram: hist,
 	}
+	if slope, norm := computeSlope(histLast); slope != nil {
+		ms.Slope = slope
+		ms.NormalizedSlope = norm
+		ms.SlopeState = indicatorSlopeState(norm)
+	}
+	return ms
 }
 
 func buildRSISnapshot(val indicator.IndicatorValue) *rsiSnapshot {
@@ -198,7 +222,7 @@ func buildRSISnapshot(val indicator.IndicatorValue) *rsiSnapshot {
 		return nil
 	}
 	maxVal, minVal := seriesBounds(val.Series)
-	return &rsiSnapshot{
+	rs := &rsiSnapshot{
 		Current:        roundFloat(val.Latest, 4),
 		LastN:          roundSeriesTail(val.Series, 3),
 		PeriodHigh:     roundFloat(maxVal, 4),
@@ -206,6 +230,12 @@ func buildRSISnapshot(val indicator.IndicatorValue) *rsiSnapshot {
 		DistanceToHigh: roundFloat(maxVal-val.Latest, 4),
 		DistanceToLow:  roundFloat(val.Latest-minVal, 4),
 	}
+	if slope, norm := computeSlope(rs.LastN); slope != nil {
+		rs.Slope = slope
+		rs.NormalizedSlope = norm
+		rs.SlopeState = indicatorSlopeState(norm)
+	}
+	return rs
 }
 
 func buildOBVSnapshot(val indicator.IndicatorValue) *obvSnapshot {
@@ -235,12 +265,16 @@ func buildATRSnapshot(val indicator.IndicatorValue) *atrSnapshot {
 		return nil
 	}
 	maxVal, minVal := seriesBounds(val.Series)
-	return &atrSnapshot{
+	as := &atrSnapshot{
 		Latest:  roundFloat(val.Latest, 4),
 		LastN:   roundSeriesTail(val.Series, 3),
 		RangeLo: roundFloat(minVal, 4),
 		RangeHi: roundFloat(maxVal, 4),
 	}
+	if change := computeChangePct(val.Series); change != nil {
+		as.ChangePct = change
+	}
+	return as
 }
 
 func roundSeriesTail(series []float64, n int) []float64 {
@@ -315,4 +349,56 @@ func candleTimestamp(c market.Candle) string {
 		return time.Now().UTC().Format(time.RFC3339)
 	}
 	return time.UnixMilli(ts).UTC().Format(time.RFC3339)
+}
+
+func computeSlope(series []float64) (*float64, *float64) {
+	if len(series) < 2 {
+		return nil, nil
+	}
+	start := 0
+	if len(series) > 5 {
+		start = len(series) - 5
+	}
+	first := series[start]
+	last := series[len(series)-1]
+	steps := float64(len(series) - start - 1)
+	if steps <= 0 {
+		return nil, nil
+	}
+	delta := last - first
+	raw := roundFloat(delta/steps, 4)
+	var norm *float64
+	if math.Abs(first) > 1e-9 {
+		v := roundFloat((delta/math.Abs(first))*100/steps, 4)
+		norm = &v
+	}
+	return &raw, norm
+}
+
+func computeChangePct(series []float64) *float64 {
+	if len(series) < 2 {
+		return nil
+	}
+	last := series[len(series)-1]
+	prev := series[len(series)-2]
+	if math.Abs(prev) <= 1e-9 {
+		return nil
+	}
+	v := roundFloat(((last-prev)/prev)*100, 4)
+	return &v
+}
+
+func indicatorSlopeState(norm *float64) string {
+	if norm == nil {
+		return ""
+	}
+	abs := math.Abs(*norm)
+	switch {
+	case abs < 0.1:
+		return "FLAT"
+	case abs < 0.4:
+		return "MODERATE"
+	default:
+		return "STEEP"
+	}
 }

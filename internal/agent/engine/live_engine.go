@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
@@ -13,12 +14,14 @@ import (
 	"brale/internal/decision"
 	"brale/internal/exitplan"
 	"brale/internal/logger"
+	"brale/internal/market"
 	"brale/internal/pkg/circuit"
 	"brale/internal/profile"
 	promptkit "brale/internal/prompt"
 	"brale/internal/scheduler"
 	"brale/internal/strategy/exit"
 
+	"github.com/google/uuid"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -425,12 +428,15 @@ func (e *LiveEngine) sense(ctx context.Context, symbols []string) (decision.Cont
 		market[symbol] = decision.MarketData{Symbol: symbol, Price: price}
 	}
 	input := decision.Context{
-		Candidates: symbols,
-		Account:    acct,
-		Positions:  positions,
-		Analysis:   analysis,
-		Market:     market,
+		RunID:        uuid.NewString(),
+		TimestampNow: time.Now().UTC(),
+		Candidates:   symbols,
+		Account:      acct,
+		Positions:    positions,
+		Analysis:     analysis,
+		Market:       market,
 	}
+	input.DataAgeSec, input.HardFlags = computeDataAgeSec(input.TimestampNow, analysis)
 	input.Directives = e.buildProfileDirectives(symbols)
 	if e.ProfileMgr != nil && e.PromptStrategy != nil {
 		activeProfiles := make(map[string]*profile.Runtime)
@@ -450,6 +456,52 @@ func (e *LiveEngine) sense(ctx context.Context, symbols []string) (decision.Cont
 	}
 
 	return input, nil
+}
+
+func computeDataAgeSec(now time.Time, ctxs []decision.AnalysisContext) (map[string]int64, decision.HardFlags) {
+	if len(ctxs) == 0 {
+		return nil, decision.HardFlags{}
+	}
+	var latest int64
+	for _, ac := range ctxs {
+		raw := strings.TrimSpace(ac.KlineJSON)
+		if raw == "" {
+			continue
+		}
+		var candles []market.Candle
+		if err := json.Unmarshal([]byte(raw), &candles); err != nil {
+			continue
+		}
+		if len(candles) == 0 {
+			continue
+		}
+		ts := candles[len(candles)-1].CloseTime
+		if ts <= 0 {
+			continue
+		}
+		if ts > latest {
+			latest = ts
+		}
+	}
+	if latest <= 0 {
+		return nil, decision.HardFlags{}
+	}
+	age := int64(now.Sub(time.UnixMilli(latest)).Seconds())
+	if age < 0 {
+		age = 0
+	}
+	dataAge := map[string]int64{
+		"indicator": age,
+		"trend":     age,
+		"pattern":   age,
+	}
+	flags := decision.HardFlags{}
+	// 简单数据陈旧判定：大于 30 分钟视为 stale
+	const staleThreshold = 1800
+	if age >= staleThreshold {
+		flags.DataStaleFlag = true
+	}
+	return dataAge, flags
 }
 
 func (e *LiveEngine) execute(ctx context.Context, traceID string, d decision.Decision) error {

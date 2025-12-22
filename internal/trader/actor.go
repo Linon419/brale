@@ -738,10 +738,7 @@ func (t *Trader) resolvePositionForClose(symbol string, tradeID int) (*exchange.
 	if symbol == "" {
 		return nil, fmt.Errorf("position symbol required")
 	}
-	if pos := t.state.Positions[symbol]; pos != nil && pos.Amount > 0 {
-		if pos.InitialAmount <= 0 {
-			pos.InitialAmount = pos.Amount
-		}
+	if pos := t.cachedPosition(symbol); pos != nil {
 		return pos, nil
 	}
 	if t.executor == nil {
@@ -750,28 +747,62 @@ func (t *Trader) resolvePositionForClose(symbol string, tradeID int) (*exchange.
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	var pos *exchange.Position
-	if tradeID > 0 {
-		if fetched, err := t.executor.GetPosition(ctx, strconv.Itoa(tradeID)); err == nil && fetched != nil && fetched.IsOpen {
-			pos = fetched
-		} else if err != nil {
-			logger.Warnf("resolvePositionForClose: get position failed trade=%d: %v", tradeID, err)
-		}
-	}
+	pos := t.fetchPositionByTradeID(ctx, tradeID)
 	if pos == nil {
-		positions, err := t.executor.ListOpenPositions(ctx)
+		found, err := t.findOpenPosition(ctx, symbol)
 		if err != nil {
-			return nil, fmt.Errorf("list open positions failed: %w", err)
+			return nil, err
 		}
-		for i := range positions {
-			if normalizeSymbol(positions[i].Symbol) == symbol && positions[i].IsOpen {
-				pos = &positions[i]
-				break
-			}
-		}
+		pos = found
 	}
 	if pos == nil {
 		return nil, fmt.Errorf("no open position found for %s", symbol)
+	}
+	t.ensurePositionCached(symbol, tradeID, pos)
+	return pos, nil
+}
+
+func (t *Trader) cachedPosition(symbol string) *exchange.Position {
+	if pos := t.state.Positions[symbol]; pos != nil && pos.Amount > 0 {
+		if pos.InitialAmount <= 0 {
+			pos.InitialAmount = pos.Amount
+		}
+		return pos
+	}
+	return nil
+}
+
+func (t *Trader) fetchPositionByTradeID(ctx context.Context, tradeID int) *exchange.Position {
+	if tradeID <= 0 {
+		return nil
+	}
+	fetched, err := t.executor.GetPosition(ctx, strconv.Itoa(tradeID))
+	if err != nil {
+		logger.Warnf("resolvePositionForClose: get position failed trade=%d: %v", tradeID, err)
+		return nil
+	}
+	if fetched != nil && fetched.IsOpen {
+		return fetched
+	}
+	return nil
+}
+
+func (t *Trader) findOpenPosition(ctx context.Context, symbol string) (*exchange.Position, error) {
+	positions, err := t.executor.ListOpenPositions(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("list open positions failed: %w", err)
+	}
+	for i := range positions {
+		if normalizeSymbol(positions[i].Symbol) == symbol && positions[i].IsOpen {
+			return &positions[i], nil
+		}
+	}
+	return nil, nil
+}
+
+func (t *Trader) ensurePositionCached(symbol string, tradeID int, pos *exchange.Position) {
+	if pos == nil {
+		return
 	}
 	pos.Symbol = normalizeSymbol(pos.Symbol)
 	if pos.InitialAmount <= 0 {
@@ -792,7 +823,6 @@ func (t *Trader) resolvePositionForClose(symbol string, tradeID int) (*exchange.
 		t.state.ByTradeID[id] = pos.Symbol
 		t.state.SymbolIndex[pos.Symbol] = id
 	}
-	return pos, nil
 }
 
 // dispatchClose Execute a close order asynchronously.

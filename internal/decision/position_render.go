@@ -54,7 +54,7 @@ func writeMarketPrices(sb *strings.Builder, market map[string]MarketData) {
 		if label == "" {
 			continue
 		}
-		sb.WriteString(fmt.Sprintf("- 实时价格 %s: %.4f (%s)\n", label, data.Price, ts))
+		fmt.Fprintf(sb, "- 实时价格 %s: %.4f (%s)\n", label, data.Price, ts)
 	}
 }
 

@@ -15,6 +15,7 @@ type AgentInsight struct {
 	Output      string `json:"output"`
 	Error       string `json:"error,omitempty"`
 	Warned      bool   `json:"warned,omitempty"`
+	InvalidVote bool   `json:"invalid_vote,omitempty"`
 	System      string `json:"system,omitempty"`
 	User        string `json:"user,omitempty"`
 	Fingerprint string `json:"fingerprint,omitempty"`
@@ -61,7 +62,7 @@ func buildIndicatorAgentPrompt(ctxs []AnalysisContext, cfg brcfg.MultiAgentConfi
 	if count == 0 {
 		return ""
 	}
-	b.WriteString("请总结动能、量价与波动率，并点名最强与最弱周期。\n")
+	b.WriteString("请总结动能、量价与波动率（引用字段名，如 rsi.last_n / macd.histogram.last_n / atr.change_pct），禁止方向词与交易建议。\n")
 	return b.String()
 }
 
@@ -99,7 +100,7 @@ func buildPatternAgentPrompt(ctxs []AnalysisContext, cfg brcfg.MultiAgentConfig)
 	if count == 0 {
 		return ""
 	}
-	b.WriteString("识别多空冲突、图形触发点与SMC叙事，并按优先级输出。\n")
+	b.WriteString("识别形态/叙事与冲突，若无显著形态请说明；每条需引用输入字段（Pattern/Visual），禁止方向用语与交易建议。\n")
 	return b.String()
 }
 
@@ -110,8 +111,9 @@ func buildTrendAgentPrompt(ctxs []AnalysisContext, cfg brcfg.MultiAgentConfig) s
 	limit := agentBlockLimit(cfg)
 	var b strings.Builder
 	b.WriteString("# Trend Structured Blocks\n")
-	b.WriteString("每个区块为 JSON：meta + structure_points(Fractal拐点) + recent_candles + global_context。\n")
-	b.WriteString("idx 为 0-based，数值越大越新；后端不输出 bullish/bearish 结论，只提供客观坐标。\n\n")
+	b.WriteString("每个区块为 JSON：meta + structure_points(Fractal拐点) + structure_candidates(含 price/type/source/age_candles/window) + recent_candles + global_context。\n")
+	b.WriteString("You must SELECT, not CREATE；支撑/阻力/失效位只能从 structure_candidates/structure_points 选择。\n")
+	b.WriteString("idx 为 0-based，数值越大越新；禁止方向词，必须引用输入字段名/索引。\n\n")
 	count := 0
 	opts := DefaultTrendCompressOptions()
 	for _, ac := range ctxs {
@@ -147,7 +149,7 @@ func buildTrendAgentPrompt(ctxs []AnalysisContext, cfg brcfg.MultiAgentConfig) s
 	if count == 0 {
 		return ""
 	}
-	b.WriteString("请基于上述客观坐标找出关键支撑/阻力、动量加速或背离。\n")
+	b.WriteString("请基于上述客观坐标找出关键支撑/阻力、动量加速或背离，必须引用字段名/索引，禁止创造新价位或方向用语。\n")
 	return b.String()
 }
 

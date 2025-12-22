@@ -28,7 +28,8 @@ func Analyze(candles []market.Candle) Result {
 		lows[i] = c.Low
 	}
 	slope, intercept := fitLine(closes)
-	bias := classifySlope(slope)
+	// bias 仅保留占位，不输出方向性词
+	bias := ""
 	trend := describeTrend(slope, intercept, closes)
 
 	signals := make([]string, 0, 4)
@@ -77,18 +78,6 @@ func fitLine(series []float64) (slope, intercept float64) {
 	slope = (n*sumXY - sumX*sumY) / denom
 	intercept = (sumY - slope*sumX) / n
 	return
-}
-
-func classifySlope(slope float64) string {
-	threshold := 0.0001
-	switch {
-	case slope > threshold:
-		return "bullish"
-	case slope < -threshold:
-		return "bearish"
-	default:
-		return "balanced"
-	}
 }
 
 func describeTrend(slope, intercept float64, closes []float64) string {

@@ -108,73 +108,16 @@ func (s *FearGreedService) refresh(ctx context.Context) error {
 	if s == nil || s.client == nil {
 		return fmt.Errorf("fear & greed service not initialized")
 	}
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.endpoint, nil)
+	payload, err := s.fetchPayload(ctx)
 	if err != nil {
 		s.setError(err)
 		return err
 	}
-	req.Header.Set("Accept", "application/json")
-	resp, err := s.client.Do(req)
+
+	points, until, err := parseFearGreedPoints(payload)
 	if err != nil {
 		s.setError(err)
 		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		err := fmt.Errorf("unexpected status %s", resp.Status)
-		s.setError(err)
-		return err
-	}
-
-	var payload fearGreedResponse
-	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
-		s.setError(err)
-		return err
-	}
-	if payload.Metadata.Error != nil {
-		err := fmt.Errorf("api error: %v", payload.Metadata.Error)
-		s.setError(err)
-		return err
-	}
-	if len(payload.Data) == 0 {
-		err := fmt.Errorf("api data empty")
-		s.setError(err)
-		return err
-	}
-
-	points := make([]FearGreedPoint, 0, len(payload.Data))
-	for _, item := range payload.Data {
-		value, err := strconv.Atoi(strings.TrimSpace(item.Value))
-		if err != nil {
-			continue
-		}
-		var ts time.Time
-		if tsRaw := strings.TrimSpace(item.Timestamp); tsRaw != "" {
-			if sec, err := strconv.ParseInt(tsRaw, 10, 64); err == nil {
-				ts = time.Unix(sec, 0).UTC()
-			}
-		}
-		points = append(points, FearGreedPoint{
-			Value:          value,
-			Classification: strings.TrimSpace(item.ValueClassification),
-			Timestamp:      ts,
-		})
-	}
-	if len(points) == 0 {
-		err := fmt.Errorf("api data invalid")
-		s.setError(err)
-		return err
-	}
-
-	var until time.Duration
-	item := payload.Data[0]
-	if raw := strings.TrimSpace(item.TimeUntilUpdate); raw != "" {
-		if secs, err := strconv.ParseInt(raw, 10, 64); err == nil && secs > 0 {
-			until = time.Duration(secs) * time.Second
-		}
 	}
 	latest := points[0]
 
@@ -194,6 +137,70 @@ func (s *FearGreedService) refresh(ctx context.Context) error {
 	}
 	s.setData(data, next)
 	return nil
+}
+
+func (s *FearGreedService) fetchPayload(ctx context.Context) (fearGreedResponse, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.endpoint, nil)
+	if err != nil {
+		return fearGreedResponse{}, err
+	}
+	req.Header.Set("Accept", "application/json")
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return fearGreedResponse{}, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fearGreedResponse{}, fmt.Errorf("unexpected status %s", resp.Status)
+	}
+
+	var payload fearGreedResponse
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return fearGreedResponse{}, err
+	}
+	if payload.Metadata.Error != nil {
+		return fearGreedResponse{}, fmt.Errorf("api error: %v", payload.Metadata.Error)
+	}
+	if len(payload.Data) == 0 {
+		return fearGreedResponse{}, fmt.Errorf("api data empty")
+	}
+	return payload, nil
+}
+
+func parseFearGreedPoints(payload fearGreedResponse) ([]FearGreedPoint, time.Duration, error) {
+	points := make([]FearGreedPoint, 0, len(payload.Data))
+	for _, item := range payload.Data {
+		value, err := strconv.Atoi(strings.TrimSpace(item.Value))
+		if err != nil {
+			continue
+		}
+		var ts time.Time
+		if tsRaw := strings.TrimSpace(item.Timestamp); tsRaw != "" {
+			if sec, err := strconv.ParseInt(tsRaw, 10, 64); err == nil {
+				ts = time.Unix(sec, 0).UTC()
+			}
+		}
+		points = append(points, FearGreedPoint{
+			Value:          value,
+			Classification: strings.TrimSpace(item.ValueClassification),
+			Timestamp:      ts,
+		})
+	}
+	if len(points) == 0 {
+		return nil, 0, fmt.Errorf("api data invalid")
+	}
+
+	var until time.Duration
+	item := payload.Data[0]
+	if raw := strings.TrimSpace(item.TimeUntilUpdate); raw != "" {
+		if secs, err := strconv.ParseInt(raw, 10, 64); err == nil && secs > 0 {
+			until = time.Duration(secs) * time.Second
+		}
+	}
+	return points, until, nil
 }
 
 func (s *FearGreedService) setError(err error) {

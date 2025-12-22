@@ -158,6 +158,13 @@ func (e *DecisionEngine) executeAgentStage(ctx context.Context, stage agentStage
 		logger.Warnf("%s agent 返回空文本 provider=%s elapsed=%s", stage.name, provider.ID(), time.Since(start).Truncate(time.Millisecond))
 		return ins
 	}
+	if containsBannedWords(trimmed) {
+		ins.Error = "命中禁词，输出作废"
+		ins.Warned = e.emitAgentWarning(stage.name, provider.ID(), ins.Error)
+		ins.InvalidVote = true
+		logger.Warnf("%s agent 输出命中禁词，已作废 provider=%s", stage.name, provider.ID())
+		return ins
+	}
 	ins.Output = trimmed
 	return ins
 }
@@ -278,6 +285,26 @@ func (e *DecisionEngine) invokeAgentProvider(ctx context.Context, p provider.Mod
 	return p.Call(ctx, payload)
 }
 
+func containsBannedWords(text string) bool {
+	if strings.TrimSpace(text) == "" {
+		return false
+	}
+	lower := strings.ToLower(text)
+	banned := []string{
+		"bullish", "bearish",
+		"买入", "卖出", "开多", "开空",
+		"止损", "止盈",
+		"entry", "exit", "long", "short",
+		"一定", "必然", "确定",
+	}
+	for _, w := range banned {
+		if strings.Contains(lower, w) {
+			return true
+		}
+	}
+	return false
+}
+
 func (e *DecisionEngine) emitAgentWarning(stage, providerID, reason string) bool {
 	reason = strings.TrimSpace(reason)
 	if reason == "" {
@@ -309,7 +336,8 @@ func (e *DecisionEngine) buildMechanicsAgentPrompt(ctx context.Context, ctxs []A
 	if !ok || pb == nil {
 		return "", time.Time{}, ""
 	}
-	return pb.buildDerivativesSection(ctx, ctxs, fullCtx.Directives)
+	sec := pb.buildDerivativesSection(ctx, ctxs, fullCtx.Directives)
+	return sec.Text, sec.LatestUpdate, sec.Fingerprint
 }
 
 func describeAgentPurpose(stage string) string {

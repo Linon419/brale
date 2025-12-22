@@ -2,6 +2,7 @@ package freqtrade
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -60,39 +61,105 @@ func (a *Adapter) OpenPosition(ctx context.Context, req exchange.OpenRequest) (*
 }
 
 func (a *Adapter) ClosePosition(ctx context.Context, req exchange.CloseRequest) error {
+	tradeID, ftRemain, err := a.resolveCloseTarget(ctx, req)
+	if err != nil {
+		return err
+	}
+	amount := clampCloseAmount(req.Amount, ftRemain)
 
-	tradeID := req.PositionID
-	if tradeID == "" && req.Symbol != "" {
-		trades, err := a.client.ListTrades(ctx)
-		if err != nil {
-			return fmt.Errorf("failed to list trades to find close target: %w", err)
-		}
-		for _, t := range trades {
-			if strings.EqualFold(a.fromFreqtradePair(t.Pair), req.Symbol) && t.IsOpen {
-				tradeID = strconv.Itoa(t.ID)
-				break
-			}
-		}
+	logger.Infof("Adapter ClosePosition: %s (TradeID: %s) amount=%.6f ftRemain=%.6f", req.Symbol, tradeID, amount, ftRemain)
+
+	if err := a.forceExitWithRetry(ctx, tradeID, req.Symbol, amount); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (a *Adapter) resolveCloseTarget(ctx context.Context, req exchange.CloseRequest) (string, float64, error) {
+	tradeID := strings.TrimSpace(req.PositionID)
+	if tradeID != "" {
+		return tradeID, a.fetchRemoteRemaining(ctx, tradeID), nil
+	}
+	if req.Symbol == "" {
+		return "", 0, fmt.Errorf("close request missing symbol")
 	}
 
+	trades, err := a.client.ListTrades(ctx)
+	if err != nil {
+		return "", 0, fmt.Errorf("failed to list trades to find close target: %w", err)
+	}
+	for _, t := range trades {
+		if strings.EqualFold(a.fromFreqtradePair(t.Pair), req.Symbol) && t.IsOpen {
+			return strconv.Itoa(t.ID), t.Amount, nil
+		}
+	}
+	return "", 0, fmt.Errorf("no active trade found for %s to close", req.Symbol)
+}
+
+func clampCloseAmount(reqAmount, ftRemain float64) float64 {
+	amount := reqAmount
+	if amount <= 0 && ftRemain > 0 {
+		amount = ftRemain
+	}
+	if ftRemain > 0 && amount > ftRemain {
+		amount = ftRemain
+	}
+	if amount < 0 {
+		amount = 0
+	}
+	return amount
+}
+
+func (a *Adapter) fetchRemoteRemaining(ctx context.Context, tradeID string) float64 {
 	if tradeID == "" {
-		return fmt.Errorf("no active trade found for %s to close", req.Symbol)
+		return 0
+	}
+	id, err := strconv.Atoi(tradeID)
+	if err != nil {
+		logger.Warnf("freqtrade fetch remain invalid tradeID=%s: %v", tradeID, err)
+		return 0
+	}
+	tr, err := a.client.GetOpenTrade(ctx, id)
+	if err != nil && !errors.Is(err, errTradeNotFound) {
+		logger.Warnf("freqtrade get open trade failed id=%s: %v", tradeID, err)
+	}
+	if tr == nil {
+		return 0
+	}
+	return tr.Amount
+}
+
+func (a *Adapter) forceExitWithRetry(ctx context.Context, tradeID, symbol string, amount float64) error {
+	payload := ForceExitPayload{TradeID: tradeID}
+	call := func(am float64) error {
+		pl := payload
+		if am > 0 {
+			pl.Amount = am
+		}
+		return a.client.ForceExit(ctx, pl)
 	}
 
-	payload := ForceExitPayload{
-		TradeID: tradeID,
-	}
-	if req.Amount > 0 {
-		payload.Amount = req.Amount
+	err := call(amount)
+	if err == nil {
+		return nil
 	}
 
-	logger.Infof("Adapter ClosePosition: %s (TradeID: %s)", req.Symbol, tradeID)
-
-	if err := a.client.ForceExit(ctx, payload); err != nil {
-		logger.Errorf("freqtrade forceexit failed (symbol=%s tradeID=%s amount=%.4f): %v", req.Symbol, tradeID, payload.Amount, err)
+	logger.Errorf("freqtrade forceexit failed (symbol=%s tradeID=%s amount=%.4f): %v", symbol, tradeID, amount, err)
+	lower := strings.ToLower(err.Error())
+	if !strings.Contains(lower, "remaining amount") {
 		return fmt.Errorf("freqtrade forceexit failed: %w", err)
 	}
 
+	freshRemain := a.fetchRemoteRemaining(ctx, tradeID)
+	if freshRemain <= 0 {
+		return fmt.Errorf("freqtrade forceexit failed: %w", err)
+	}
+
+	logger.Warnf("freqtrade retry close with remote amount %.6f (symbol=%s tradeID=%s)", freshRemain, symbol, tradeID)
+	if retryErr := call(freshRemain); retryErr != nil {
+		logger.Errorf("freqtrade forceexit retry failed (symbol=%s tradeID=%s amount=%.4f): %v", symbol, tradeID, freshRemain, retryErr)
+		return fmt.Errorf("freqtrade forceexit failed: %w", err)
+	}
 	return nil
 }
 

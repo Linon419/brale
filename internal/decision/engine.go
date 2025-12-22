@@ -2,6 +2,7 @@ package decision
 
 import (
 	"context"
+	"time"
 
 	"brale/internal/types"
 )
@@ -9,6 +10,8 @@ import (
 // Context is the full input to the LLM decision engine.
 // Built by scheduler each cycle from market data, positions, and profile configs.
 type Context struct {
+	RunID                   string                       // unique id per decision run
+	TimestampNow            time.Time                    // capture time for prompt header
 	Candidates              []string                     // Symbols to analyze this cycle
 	Market                  map[string]MarketData        // Real-time market snapshot per symbol
 	Positions               []types.PositionSnapshot     // Currently open positions
@@ -22,6 +25,8 @@ type Context struct {
 	PreviousProviderOutputs []ProviderOutputSnapshot     // Last cycle's provider outputs for the symbol
 	Insights                []AgentInsight               // Multi-agent intermediate outputs
 	Directives              map[string]ProfileDirective  // Symbol-specific trading rules
+	DataAgeSec              map[string]int64             // data age by domain (indicator/trend/pattern/mechanics)
+	HardFlags               HardFlags                    // hard stop flags computed by code
 }
 
 // MarketData is the point-in-time snapshot of a symbol's market state.
@@ -50,6 +55,12 @@ type ProfilePromptSpec struct {
 	UserPrompt           string
 	ExitConstraints      string
 	Example              string
+}
+
+// HardFlags carries system-computed guard rails (LLM 不得改判).
+type HardFlags struct {
+	LiqRiskFlag   bool `json:"liq_risk_flag,omitempty"`
+	DataStaleFlag bool `json:"data_stale_flag,omitempty"`
 }
 
 // Decider is the core decision interface.

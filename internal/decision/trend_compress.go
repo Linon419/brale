@@ -49,11 +49,12 @@ func DefaultTrendCompressOptions() TrendCompressOptions {
 }
 
 type TrendCompressedInput struct {
-	Meta            TrendCompressedMeta      `json:"meta"`
-	StructurePoints []TrendStructurePoint    `json:"structure_points"`
-	RecentCandles   []TrendRecentCandle      `json:"recent_candles"`
-	GlobalContext   TrendGlobalContext       `json:"global_context"`
-	RawCandles      []TrendRawCandleOptional `json:"raw_candles,omitempty"`
+	Meta                TrendCompressedMeta       `json:"meta"`
+	StructurePoints     []TrendStructurePoint     `json:"structure_points"`
+	StructureCandidates []TrendStructureCandidate `json:"structure_candidates,omitempty"`
+	RecentCandles       []TrendRecentCandle       `json:"recent_candles"`
+	GlobalContext       TrendGlobalContext        `json:"global_context"`
+	RawCandles          []TrendRawCandleOptional  `json:"raw_candles,omitempty"`
 }
 
 type TrendCompressedMeta struct {
@@ -80,11 +81,14 @@ type TrendRecentCandle struct {
 }
 
 type TrendGlobalContext struct {
-	TrendSlope float64  `json:"trend_slope"`
-	VolRatio   float64  `json:"vol_ratio"`
-	EMA20      *float64 `json:"ema20,omitempty"`
-	EMA50      *float64 `json:"ema50,omitempty"`
-	EMA200     *float64 `json:"ema200,omitempty"`
+	TrendSlope      float64  `json:"trend_slope"`
+	NormalizedSlope float64  `json:"normalized_slope"`
+	SlopeState      string   `json:"slope_state,omitempty"`
+	Window          int      `json:"window,omitempty"`
+	VolRatio        float64  `json:"vol_ratio"`
+	EMA20           *float64 `json:"ema20,omitempty"`
+	EMA50           *float64 `json:"ema50,omitempty"`
+	EMA200          *float64 `json:"ema200,omitempty"`
 }
 
 type TrendRawCandleOptional struct {
@@ -94,6 +98,14 @@ type TrendRawCandleOptional struct {
 	L   float64 `json:"l"`
 	C   float64 `json:"c"`
 	V   float64 `json:"v"`
+}
+
+type TrendStructureCandidate struct {
+	Price      float64 `json:"price"`
+	Type       string  `json:"type"`
+	Source     string  `json:"source"`
+	AgeCandles int     `json:"age_candles"`
+	Window     int     `json:"window,omitempty"`
 }
 
 func BuildTrendCompressedJSON(symbol, interval string, candles []market.Candle, opts TrendCompressOptions) (string, error) {
@@ -143,7 +155,10 @@ func BuildTrendCompressedInput(symbol, interval string, candles []market.Candle,
 	gc := TrendGlobalContext{
 		TrendSlope: roundFloat(linRegSlope(closes), 4),
 		VolRatio:   roundFloat(volumeRatio(volumes, opts.VolumeMAPeriod), 3),
+		Window:     n,
 	}
+	gc.NormalizedSlope = roundFloat(normalizedSlope(closes), 4)
+	gc.SlopeState = trendSlopeState(gc.NormalizedSlope)
 	if v := lastNonZero(talib.Ema(closes, opts.EMA20Period)); v > 0 {
 		v = roundFloat(v, 4)
 		gc.EMA20 = &v
@@ -158,13 +173,15 @@ func BuildTrendCompressedInput(symbol, interval string, candles []market.Candle,
 	}
 
 	structurePoints := selectStructurePoints(candles, highs, lows, rsiSeries, atrSeries, opts)
+	candidates := buildStructureCandidates(candles, highs, lows, atrSeries, gc, structurePoints, opts)
 	recentCandles := buildRecentCandles(candles, rsiSeries, opts)
 
 	return TrendCompressedInput{
-		Meta:            meta,
-		StructurePoints: structurePoints,
-		RecentCandles:   recentCandles,
-		GlobalContext:   gc,
+		Meta:                meta,
+		StructurePoints:     structurePoints,
+		StructureCandidates: candidates,
+		RecentCandles:       recentCandles,
+		GlobalContext:       gc,
 	}, nil
 }
 
@@ -400,4 +417,195 @@ func absInt(v int) int {
 		return -v
 	}
 	return v
+}
+
+func maxFloat(values []float64) float64 {
+	m := -math.MaxFloat64
+	for _, v := range values {
+		if math.IsNaN(v) || math.IsInf(v, 0) {
+			continue
+		}
+		if v > m {
+			m = v
+		}
+	}
+	if m == -math.MaxFloat64 {
+		return 0
+	}
+	return m
+}
+
+func minFloat(values []float64) float64 {
+	m := math.MaxFloat64
+	for _, v := range values {
+		if math.IsNaN(v) || math.IsInf(v, 0) {
+			continue
+		}
+		if v < m {
+			m = v
+		}
+	}
+	if m == math.MaxFloat64 {
+		return 0
+	}
+	return m
+}
+
+func normalizedSlope(series []float64) float64 {
+	if len(series) < 2 {
+		return 0
+	}
+	first := series[0]
+	last := series[len(series)-1]
+	if math.Abs(first) < 1e-9 {
+		return 0
+	}
+	return (last - first) / math.Abs(first) * 100 / float64(len(series)-1)
+}
+
+func trendSlopeState(norm float64) string {
+	abs := math.Abs(norm)
+	switch {
+	case abs < 0.1:
+		return "FLAT"
+	case abs < 0.4:
+		return "MODERATE"
+	default:
+		return "STEEP"
+	}
+}
+
+func buildStructureCandidates(candles []market.Candle, highs, lows, atr []float64, gc TrendGlobalContext, points []TrendStructurePoint, opts TrendCompressOptions) []TrendStructureCandidate {
+	n := len(candles)
+	if n == 0 {
+		return nil
+	}
+	cands := make([]TrendStructureCandidate, 0, 12)
+	atrLatest := 0.0
+	if len(atr) > 0 {
+		atrLatest = atr[len(atr)-1]
+	}
+
+	// Fractal points作为候选
+	for _, p := range points {
+		age := n - 1 - p.Idx
+		source := "fractal_low"
+		typ := "support"
+		if strings.EqualFold(p.Type, "High") {
+			source = "fractal_high"
+			typ = "resistance"
+		}
+		cands = append(cands, TrendStructureCandidate{
+			Price:      p.Price,
+			Type:       typ,
+			Source:     source,
+			AgeCandles: age,
+		})
+	}
+
+	// EMA 作为动态支撑/阻力参考
+	addEMA := func(val *float64, source string, window int) {
+		if val == nil {
+			return
+		}
+		cands = append(cands, TrendStructureCandidate{
+			Price:  roundFloat(*val, 4),
+			Type:   "ema",
+			Source: source,
+			Window: window,
+		})
+	}
+	addEMA(gc.EMA20, "ema20", opts.EMA20Period)
+	addEMA(gc.EMA50, "ema50", opts.EMA50Period)
+	addEMA(gc.EMA200, "ema200", opts.EMA200Period)
+
+	// 布林带上下轨
+	if n >= opts.VolumeMAPeriod {
+		upper, _, lower := talib.BBands(extractCloses(candles), opts.VolumeMAPeriod, 2, 2, talib.SMA)
+		if u := lastNonZero(upper); u > 0 {
+			cands = append(cands, TrendStructureCandidate{
+				Price:  roundFloat(u, 4),
+				Type:   "band_upper",
+				Source: "bollinger_upper",
+				Window: opts.VolumeMAPeriod,
+			})
+		}
+		if l := lastNonZero(lower); l > 0 {
+			cands = append(cands, TrendStructureCandidate{
+				Price:  roundFloat(l, 4),
+				Type:   "band_lower",
+				Source: "bollinger_lower",
+				Window: opts.VolumeMAPeriod,
+			})
+		}
+	}
+
+	// 近期区间高低
+	rangeWin := 30
+	if rangeWin > n {
+		rangeWin = n
+	}
+	if rangeWin > 0 {
+		hi := maxFloat(highs[n-rangeWin:])
+		lo := minFloat(lows[n-rangeWin:])
+		cands = append(cands, TrendStructureCandidate{
+			Price:  roundFloat(hi, 4),
+			Type:   "range_high",
+			Source: "range_high",
+			Window: rangeWin,
+		})
+		cands = append(cands, TrendStructureCandidate{
+			Price:  roundFloat(lo, 4),
+			Type:   "range_low",
+			Source: "range_low",
+			Window: rangeWin,
+		})
+	}
+
+	return dedupCandidates(cands, atrLatest, opts)
+}
+
+func extractCloses(candles []market.Candle) []float64 {
+	out := make([]float64, 0, len(candles))
+	for _, c := range candles {
+		out = append(out, c.Close)
+	}
+	return out
+}
+
+func dedupCandidates(in []TrendStructureCandidate, atr float64, opts TrendCompressOptions) []TrendStructureCandidate {
+	if len(in) == 0 {
+		return nil
+	}
+	threshold := atr * opts.DedupATRFactor
+	if threshold <= 0 {
+		threshold = 0
+	}
+	out := make([]TrendStructureCandidate, 0, len(in))
+	for _, c := range in {
+		merged := false
+		for i := range out {
+			if out[i].Type != c.Type {
+				continue
+			}
+			if threshold > 0 && math.Abs(out[i].Price-c.Price) <= threshold {
+				// 保留较新或来源更明确的
+				if c.AgeCandles < out[i].AgeCandles || out[i].AgeCandles == 0 {
+					out[i] = c
+				}
+				merged = true
+				break
+			}
+		}
+		if !merged {
+			out = append(out, c)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].AgeCandles != out[j].AgeCandles {
+			return out[i].AgeCandles < out[j].AgeCandles
+		}
+		return out[i].Price < out[j].Price
+	})
+	return out
 }

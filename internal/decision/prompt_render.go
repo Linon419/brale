@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"math"
 	"sort"
 	"strings"
 	"time"
@@ -14,6 +15,8 @@ import (
 	formatutil "brale/internal/pkg/format"
 	jsonutil "brale/internal/pkg/jsonutil"
 	textutil "brale/internal/pkg/text"
+
+	"github.com/shopspring/decimal"
 )
 
 func (b *DefaultPromptBuilder) renderAgentBlocks(insights []AgentInsight) string {
@@ -41,6 +44,14 @@ func (b *DefaultPromptBuilder) renderAgentBlocks(insights []AgentInsight) string
 		}
 		header := fmt.Sprintf("- [%s | 模型:%s] ", title, provider)
 		output := strings.TrimSpace(ins.Output)
+		if ins.InvalidVote {
+			status := "输出作废(命中禁词)"
+			if errTxt := strings.TrimSpace(ins.Error); errTxt != "" {
+				status = errTxt
+			}
+			sb.WriteString(header + status + "\n")
+			return
+		}
 		if output != "" {
 			sb.WriteString(header)
 			sb.WriteString(textutil.Truncate(output, 3600))
@@ -73,6 +84,301 @@ func (b *DefaultPromptBuilder) renderAgentBlocks(insights []AgentInsight) string
 	return sb.String()
 }
 
+// DerivativesSection captures mechanics data plus metadata for prompt/header.
+type DerivativesSection struct {
+	Text            string
+	LatestUpdate    time.Time
+	Fingerprint     string
+	DataAgeSec      map[string]int64
+	LeverageCrowded bool
+	FundingStressed bool
+	PriceTrigger    bool
+}
+
+type derivativesAccumulator struct {
+	sb              *strings.Builder
+	now             time.Time
+	latestUpdate    time.Time
+	fingerprint     []string
+	ages            map[string]int64
+	leverageCrowded bool
+	fundingStressed bool
+	priceTrigger    bool
+}
+
+func newDerivativesAccumulator(now time.Time) *derivativesAccumulator {
+	return &derivativesAccumulator{
+		sb:   &strings.Builder{},
+		now:  now,
+		ages: make(map[string]int64),
+	}
+}
+
+func (a *derivativesAccumulator) updateLatest(ts time.Time) {
+	if ts.IsZero() {
+		return
+	}
+	if ts.After(a.latestUpdate) {
+		a.latestUpdate = ts
+	}
+}
+
+func (a *derivativesAccumulator) addAge(key string, ts time.Time) {
+	if ts.IsZero() || key == "" {
+		return
+	}
+	a.ages[key] = int64(a.now.Sub(ts).Seconds())
+}
+
+func (a *derivativesAccumulator) addFingerprint(part string) {
+	if strings.TrimSpace(part) == "" {
+		return
+	}
+	a.fingerprint = append(a.fingerprint, part)
+}
+
+func (a *derivativesAccumulator) fingerprintHash() string {
+	if len(a.fingerprint) == 0 {
+		return ""
+	}
+	raw := strings.Join(a.fingerprint, "|")
+	sum := sha256.Sum256([]byte(raw))
+	return hex.EncodeToString(sum[:])
+}
+
+func shouldIncludeFearGreed(symbols []string, directives map[string]ProfileDirective) bool {
+	for _, sym := range symbols {
+		if dir, ok := lookupDirective(sym, directives); ok && dir.DerivativesEnabled && dir.IncludeFearGreed {
+			return true
+		}
+	}
+	return false
+}
+
+func (b *DefaultPromptBuilder) renderFearGreedSection(acc *derivativesAccumulator, fgData market.FearGreedData, fgOK bool) {
+	acc.sb.WriteString("- 恐慌与贪婪指数 (Fear & Greed):\n")
+	if !fgOK || fgData.Error != "" {
+		errMsg := fgData.Error
+		if errMsg == "" {
+			errMsg = "无数据"
+		}
+		acc.sb.WriteString(fmt.Sprintf("  - 获取失败 (%s)\n", errMsg))
+		acc.updateLatest(fgData.LastUpdate)
+		return
+	}
+	if len(fgData.History) == 0 {
+		acc.sb.WriteString("  - 无数据\n")
+		acc.updateLatest(fgData.LastUpdate)
+		return
+	}
+
+	limit := 5
+	if len(fgData.History) < limit {
+		limit = len(fgData.History)
+	}
+	var fp strings.Builder
+	fp.WriteString("fg:")
+	for i := 0; i < limit; i++ {
+		point := fgData.History[i]
+		ts := "-"
+		if !point.Timestamp.IsZero() {
+			ts = point.Timestamp.UTC().Format(time.RFC3339)
+		}
+		acc.sb.WriteString(fmt.Sprintf("  - %s: %d (%s)\n", ts, point.Value, point.Classification))
+		fmt.Fprintf(&fp, "%d:%s|", point.Value, point.Classification)
+	}
+	if fgData.TimeUntilUpdate > 0 {
+		acc.sb.WriteString(fmt.Sprintf("  - 距下次更新=%s\n", fgData.TimeUntilUpdate.Round(time.Second)))
+	}
+	acc.updateLatest(fgData.LastUpdate)
+	acc.addAge("fear_greed", fgData.LastUpdate)
+	acc.addFingerprint(fp.String())
+}
+
+func (b *DefaultPromptBuilder) renderMetricsSection(acc *derivativesAccumulator, sym string, dir ProfileDirective, metricsData market.DerivativesData, metricsOK bool) {
+	if (dir.IncludeOI || dir.IncludeFunding) && (!metricsOK || metricsData.Error != "") {
+		errMsg := metricsData.Error
+		if errMsg == "" {
+			errMsg = "无数据"
+		}
+		acc.sb.WriteString(fmt.Sprintf("  - 衍生品数据获取失败 (%s)\n", errMsg))
+		acc.updateLatest(metricsData.LastUpdate)
+		return
+	}
+	if b.Metrics == nil || (!dir.IncludeOI && !dir.IncludeFunding) {
+		return
+	}
+
+	var fp strings.Builder
+	fp.WriteString("sym=")
+	fp.WriteString(sym)
+	if dir.IncludeOI {
+		acc.sb.WriteString(fmt.Sprintf("  - OI.now: %.2f\n", metricsData.OI))
+		fp.WriteString("|oi=")
+		fp.WriteString(formatutil.Float(metricsData.OI, 4))
+		for _, tf := range b.Metrics.GetTargetTimeframes() {
+			if oldOI, ok := metricsData.OIHistory[tf]; ok && oldOI > 0 {
+				changePct := (metricsData.OI - oldOI) / oldOI * 100
+				acc.sb.WriteString(fmt.Sprintf("    - OI.%s: %.2f (%.2f%%)\n", tf, oldOI, changePct))
+				fp.WriteString("|oi_")
+				fp.WriteString(tf)
+				fp.WriteString("=")
+				fp.WriteString(formatutil.Float(oldOI, 4))
+				if changePct >= 5 {
+					acc.leverageCrowded = true
+				}
+			} else {
+				acc.sb.WriteString(fmt.Sprintf("    - OI.%s: 无数据\n", tf))
+				fp.WriteString("|oi_")
+				fp.WriteString(tf)
+				fp.WriteString("=0")
+			}
+		}
+		if !metricsData.LastUpdate.IsZero() {
+			acc.addAge("oi", metricsData.LastUpdate)
+		}
+	}
+	if dir.IncludeFunding {
+		acc.sb.WriteString(fmt.Sprintf("  - funding.rate: %.4f%%\n", metricsData.FundingRate*100))
+		fp.WriteString("|fund=")
+		fp.WriteString(formatutil.Float(metricsData.FundingRate, 8))
+		if math.Abs(metricsData.FundingRate) >= 0.0001 {
+			acc.fundingStressed = true
+			acc.leverageCrowded = true
+		}
+		if !metricsData.LastUpdate.IsZero() {
+			acc.addAge("funding", metricsData.LastUpdate)
+		}
+	}
+	acc.updateLatest(metricsData.LastUpdate)
+	if fp.Len() > 0 {
+		acc.addFingerprint(fp.String())
+	}
+}
+
+func (b *DefaultPromptBuilder) renderIntervalDerivatives(acc *derivativesAccumulator, ctx context.Context, sym, iv string, candles []market.Candle) {
+	acc.sb.WriteString(fmt.Sprintf("  - %s:\n", iv))
+	if len(candles) == 0 {
+		acc.sb.WriteString("    - CVD: 无数据\n")
+		acc.sb.WriteString("    - 情绪评分: 无数据\n")
+		return
+	}
+
+	if last := candles[len(candles)-1]; last.CloseTime > 0 {
+		ts := time.UnixMilli(last.CloseTime)
+		acc.updateLatest(ts)
+		acc.addAge("cvd", ts)
+	}
+
+	var fp strings.Builder
+	hasData := false
+	fp.WriteString("iv=")
+	fp.WriteString(iv)
+
+	if cvd, ok := market.ComputeCVD(candles); ok {
+		acc.sb.WriteString(fmt.Sprintf("    - cvd.value: %s\n", cvd.Value.StringFixed(2)))
+		acc.sb.WriteString(fmt.Sprintf("      - cvd.mom: %s\n", cvd.Momentum.StringFixed(2)))
+		acc.sb.WriteString(fmt.Sprintf("      - cvd.norm: %s\n", cvd.Normalized.StringFixed(6)))
+		acc.sb.WriteString(fmt.Sprintf("      - cvd.divergence: %s\n", strings.ToLower(cvd.Divergence)))
+		acc.sb.WriteString(fmt.Sprintf("      - cvd.peak_flip: %s\n", strings.ToLower(cvd.PeakFlip)))
+		hasData = true
+		fp.WriteString("|cvd=")
+		fp.WriteString(cvd.Value.StringFixed(2))
+		fp.WriteString("|mom=")
+		fp.WriteString(cvd.Momentum.StringFixed(2))
+		fp.WriteString("|norm=")
+		fp.WriteString(cvd.Normalized.StringFixed(6))
+		fp.WriteString("|div=")
+		fp.WriteString(strings.ToLower(cvd.Divergence))
+		fp.WriteString("|peak=")
+		fp.WriteString(strings.ToLower(cvd.PeakFlip))
+		if cvd.Normalized.GreaterThan(decimal.NewFromFloat(0.85)) || cvd.Normalized.LessThan(decimal.NewFromFloat(0.15)) {
+			acc.priceTrigger = true
+		}
+	} else {
+		acc.sb.WriteString("    - CVD: 无数据\n")
+	}
+
+	if b.Sentiment != nil {
+		if sent, ok := b.Sentiment.Calculate(ctx, sym, iv, candles); ok {
+			acc.sb.WriteString(fmt.Sprintf("    - 情绪评分: %d/100\n", sent.Score))
+			hasData = true
+			fp.WriteString("|sent=")
+			fp.WriteString(fmt.Sprintf("%d", sent.Score))
+		} else {
+			acc.sb.WriteString("    - 情绪评分: 无数据\n")
+		}
+	}
+	if hasData {
+		acc.addFingerprint(fp.String())
+	}
+}
+
+func (b *DefaultPromptBuilder) renderSymbolDerivatives(acc *derivativesAccumulator, ctx context.Context, sym string, dir ProfileDirective, intervals []string) {
+	acc.sb.WriteString(fmt.Sprintf("- %s:\n", sym))
+
+	var metricsData market.DerivativesData
+	metricsOK := false
+	if b.Metrics != nil {
+		metricsData, metricsOK = b.Metrics.Get(sym)
+	}
+	b.renderMetricsSection(acc, sym, dir, metricsData, metricsOK)
+
+	if len(intervals) == 0 {
+		return
+	}
+	for _, iv := range intervals {
+		var candles []market.Candle
+		if b.Store != nil {
+			if stored, err := b.Store.Get(ctx, sym, iv); err == nil {
+				candles = stored
+			}
+		}
+		b.renderIntervalDerivatives(acc, ctx, sym, iv, candles)
+	}
+}
+
+// buildDerivativesSection renders derivatives block and returns metadata for fingerprint/flags.
+func (b *DefaultPromptBuilder) buildDerivativesSection(ctx context.Context, ctxs []AnalysisContext, directives map[string]ProfileDirective) DerivativesSection {
+	if len(ctxs) == 0 || len(directives) == 0 {
+		return DerivativesSection{}
+	}
+	if b.Metrics == nil && b.FearGreed == nil && b.Store == nil && b.Sentiment == nil {
+		return DerivativesSection{}
+	}
+	symbols := uniqueSymbols(ctxs)
+	if len(symbols) == 0 {
+		return DerivativesSection{}
+	}
+	intervalsBySymbol := groupIntervalsBySymbol(ctxs, buildIntervalRank(b.Intervals))
+
+	acc := newDerivativesAccumulator(time.Now().UTC())
+	acc.sb.WriteString("\n## 市场衍生品数据 (Market Derivatives Data)\n")
+
+	if b.FearGreed != nil && shouldIncludeFearGreed(symbols, directives) {
+		if fgData, fgOK := b.FearGreed.Get(); fgOK || fgData.Error != "" {
+			b.renderFearGreedSection(acc, fgData, fgOK)
+		}
+	}
+
+	for _, sym := range symbols {
+		dir, ok := lookupDirective(sym, directives)
+		if !ok || !dir.DerivativesEnabled {
+			continue
+		}
+		b.renderSymbolDerivatives(acc, ctx, sym, dir, intervalsBySymbol[sym])
+	}
+
+	return DerivativesSection{
+		Text:            acc.sb.String(),
+		LatestUpdate:    acc.latestUpdate,
+		Fingerprint:     acc.fingerprintHash(),
+		DataAgeSec:      acc.ages,
+		LeverageCrowded: acc.leverageCrowded,
+		FundingStressed: acc.fundingStressed,
+		PriceTrigger:    acc.priceTrigger,
+	}
+}
 func (b *DefaultPromptBuilder) renderPreviousReasoning(reasonMap map[string]string) string {
 	if len(reasonMap) == 0 {
 		return ""
@@ -156,202 +462,6 @@ func formatProviderOutputSummary(out ProviderOutputSnapshot) string {
 
 func (b *DefaultPromptBuilder) renderOutputConstraints(input Context) string {
 	return renderOutputConstraints(input.ProfilePrompts, "只可以返回和示例一致格式的json数据，并且只可以有单个action\n reasoning在100字以内。示例:")
-}
-
-func (b *DefaultPromptBuilder) buildDerivativesSection(ctx context.Context, ctxs []AnalysisContext, directives map[string]ProfileDirective) (string, time.Time, string) {
-	if len(ctxs) == 0 || len(directives) == 0 {
-		return "", time.Time{}, ""
-	}
-	if b.Metrics == nil && b.FearGreed == nil && b.Store == nil && b.Sentiment == nil {
-		return "", time.Time{}, ""
-	}
-	symbols := uniqueSymbols(ctxs)
-	if len(symbols) == 0 {
-		return "", time.Time{}, ""
-	}
-	intervalsBySymbol := groupIntervalsBySymbol(ctxs, buildIntervalRank(b.Intervals))
-
-	var sb strings.Builder
-	sb.WriteString("\n## 市场衍生品数据 (Market Derivatives Data)\n")
-	var fgData market.FearGreedData
-	fgOK := false
-	if b.FearGreed != nil {
-		fgData, fgOK = b.FearGreed.Get()
-	}
-	wantFearGreed := false
-	latestUpdate := time.Time{}
-	var fingerprintParts []string
-	for _, sym := range symbols {
-		dir, ok := lookupDirective(sym, directives)
-		if !ok || !dir.DerivativesEnabled || !dir.IncludeFearGreed {
-			continue
-		}
-		wantFearGreed = true
-		break
-	}
-	if wantFearGreed {
-		sb.WriteString("- 恐慌与贪婪指数 (Fear & Greed):\n")
-		if !fgOK || fgData.Error != "" {
-			errMsg := fgData.Error
-			if errMsg == "" {
-				errMsg = "无数据"
-			}
-			sb.WriteString(fmt.Sprintf("  - 获取失败 (%s)\n", errMsg))
-		} else if len(fgData.History) == 0 {
-			sb.WriteString("  - 无数据\n")
-		} else {
-			limit := 5
-			if len(fgData.History) < limit {
-				limit = len(fgData.History)
-			}
-			for i := 0; i < limit; i++ {
-				point := fgData.History[i]
-				ts := "-"
-				if !point.Timestamp.IsZero() {
-					ts = point.Timestamp.UTC().Format(time.RFC3339)
-				}
-				sb.WriteString(fmt.Sprintf("  - %s: %d (%s)\n", ts, point.Value, point.Classification))
-			}
-			if fgData.TimeUntilUpdate > 0 {
-				sb.WriteString(fmt.Sprintf("  - 距下次更新=%s\n", fgData.TimeUntilUpdate.Round(time.Second)))
-			}
-			if fgData.LastUpdate.After(latestUpdate) {
-				latestUpdate = fgData.LastUpdate
-			}
-			var fp strings.Builder
-			fp.WriteString("fg:")
-			for i := 0; i < limit; i++ {
-				point := fgData.History[i]
-				fmt.Fprintf(&fp, "%d:%s|", point.Value, point.Classification)
-			}
-			fingerprintParts = append(fingerprintParts, fp.String())
-		}
-	}
-
-	for _, sym := range symbols {
-		dir, ok := lookupDirective(sym, directives)
-		if !ok || !dir.DerivativesEnabled {
-			continue
-		}
-		sb.WriteString(fmt.Sprintf("- %s:\n", sym))
-
-		var metricsData market.DerivativesData
-		metricsOK := false
-		if b.Metrics != nil {
-			metricsData, metricsOK = b.Metrics.Get(sym)
-		}
-		if (dir.IncludeOI || dir.IncludeFunding) && (!metricsOK || metricsData.Error != "") {
-			errMsg := metricsData.Error
-			if errMsg == "" {
-				errMsg = "无数据"
-			}
-			sb.WriteString(fmt.Sprintf("  - 衍生品数据获取失败 (%s)\n", errMsg))
-		} else if b.Metrics != nil && (dir.IncludeOI || dir.IncludeFunding) {
-			var fp strings.Builder
-			fp.WriteString("sym=")
-			fp.WriteString(sym)
-			if dir.IncludeOI {
-				sb.WriteString(fmt.Sprintf("  - 最新未平仓量 (OI): %.2f\n", metricsData.OI))
-				fp.WriteString("|oi=")
-				fp.WriteString(formatutil.Float(metricsData.OI, 4))
-				for _, tf := range b.Metrics.GetTargetTimeframes() {
-					if oldOI, ok := metricsData.OIHistory[tf]; ok && oldOI > 0 {
-						changePct := (metricsData.OI - oldOI) / oldOI * 100
-						sb.WriteString(fmt.Sprintf("    - OI %s前: %.2f (%.2f%%)\n", tf, oldOI, changePct))
-						fp.WriteString("|oi_")
-						fp.WriteString(tf)
-						fp.WriteString("=")
-						fp.WriteString(formatutil.Float(oldOI, 4))
-					} else {
-						sb.WriteString(fmt.Sprintf("    - OI %s前: 无数据\n", tf))
-						fp.WriteString("|oi_")
-						fp.WriteString(tf)
-						fp.WriteString("=0")
-					}
-				}
-			}
-			if dir.IncludeFunding {
-				sb.WriteString(fmt.Sprintf("  - 资金费率 (Funding Rate): %.4f%%\n", metricsData.FundingRate*100))
-				fp.WriteString("|fund=")
-				fp.WriteString(formatutil.Float(metricsData.FundingRate, 8))
-			}
-			if metricsData.LastUpdate.After(latestUpdate) {
-				latestUpdate = metricsData.LastUpdate
-			}
-			if fp.Len() > 0 {
-				fingerprintParts = append(fingerprintParts, fp.String())
-			}
-		}
-
-		intervals := intervalsBySymbol[sym]
-		if len(intervals) == 0 {
-			continue
-		}
-		for _, iv := range intervals {
-			sb.WriteString(fmt.Sprintf("  - %s:\n", iv))
-			var candles []market.Candle
-			if b.Store != nil {
-				stored, err := b.Store.Get(ctx, sym, iv)
-				if err == nil {
-					candles = stored
-				}
-			}
-			if len(candles) == 0 {
-				sb.WriteString("    - CVD: 无数据\n")
-				sb.WriteString("    - 情绪评分: 无数据\n")
-				continue
-			}
-			if last := candles[len(candles)-1]; last.CloseTime > 0 {
-				ts := time.UnixMilli(last.CloseTime)
-				if ts.After(latestUpdate) {
-					latestUpdate = ts
-				}
-			}
-
-			var fp strings.Builder
-			hasData := false
-			fp.WriteString("iv=")
-			fp.WriteString(iv)
-
-			if cvd, ok := market.ComputeCVD(candles); ok {
-				sb.WriteString(fmt.Sprintf("    - CVD: %s\n", cvd.Value.StringFixed(2)))
-				sb.WriteString(fmt.Sprintf("      - CVD_MOM: %s\n", cvd.Momentum.StringFixed(2)))
-				sb.WriteString(fmt.Sprintf("      - CVD_NORM: %s\n", cvd.Normalized.StringFixed(6)))
-				hasData = true
-				fp.WriteString("|cvd=")
-				fp.WriteString(cvd.Value.StringFixed(2))
-				fp.WriteString("|mom=")
-				fp.WriteString(cvd.Momentum.StringFixed(2))
-				fp.WriteString("|norm=")
-				fp.WriteString(cvd.Normalized.StringFixed(6))
-			} else {
-				sb.WriteString("    - CVD: 无数据\n")
-			}
-
-			if b.Sentiment != nil {
-				if sent, ok := b.Sentiment.Calculate(ctx, sym, iv, candles); ok {
-					sb.WriteString(fmt.Sprintf("    - 情绪评分: %d/100\n", sent.Score))
-					sb.WriteString("      - 注：情绪评分为粗背景(0-100)，不可单独作为方向依据。\n")
-					hasData = true
-					fp.WriteString("|sent=")
-					fp.WriteString(fmt.Sprintf("%d", sent.Score))
-				} else {
-					sb.WriteString("    - 情绪评分: 无数据\n")
-				}
-			}
-			if hasData {
-				fingerprintParts = append(fingerprintParts, fp.String())
-			}
-		}
-	}
-	sb.WriteString("请结合这些衍生品数据评估市场情绪和资金动向。\n")
-	fingerprint := ""
-	if len(fingerprintParts) > 0 {
-		raw := strings.Join(fingerprintParts, "|")
-		sum := sha256.Sum256([]byte(raw))
-		fingerprint = hex.EncodeToString(sum[:])
-	}
-	return sb.String(), latestUpdate, fingerprint
 }
 
 func uniqueSymbols(ctxs []AnalysisContext) []string {
@@ -577,4 +687,37 @@ func logStructuredBlocksDebug(debug bool, ctxs []AnalysisContext) {
 	}
 	b.WriteString("--- End Structured Debug ---")
 	logger.Debugf("%s", b.String())
+}
+
+func (b *DefaultPromptBuilder) renderHeader(input Context) string {
+	var sb strings.Builder
+	sb.WriteString("\n## 元信息（不可截断）\n")
+	runID := strings.TrimSpace(input.RunID)
+	if runID == "" {
+		runID = "unknown"
+	}
+	ts := input.TimestampNow
+	if ts.IsZero() {
+		ts = time.Now().UTC()
+	}
+	sb.WriteString(fmt.Sprintf("_meta.run_id: %s\n", runID))
+	sb.WriteString(fmt.Sprintf("_meta.timestamp_now_ts: %s\n", ts.Format(time.RFC3339)))
+	if len(input.DataAgeSec) > 0 {
+		keys := make([]string, 0, len(input.DataAgeSec))
+		for k := range input.DataAgeSec {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			age := input.DataAgeSec[k]
+			if age < 0 {
+				age = 0
+			}
+			sb.WriteString(fmt.Sprintf("_meta.data_age_sec.%s: %d\n", k, age))
+		}
+	}
+	sb.WriteString(fmt.Sprintf("hard_flags.liq_risk_flag: %v\n", input.HardFlags.LiqRiskFlag))
+	sb.WriteString(fmt.Sprintf("hard_flags.data_stale_flag: %v\n", input.HardFlags.DataStaleFlag))
+	sb.WriteString("\n")
+	return sb.String()
 }

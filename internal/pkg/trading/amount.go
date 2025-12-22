@@ -18,6 +18,16 @@ func CalcCloseAmount(currentAmount, initialAmount, ratio float64, isInitialRatio
 		base = initialAmount
 	}
 
-	target := base * ratio
+	target := ceilToDecimals(base*ratio, 2)
 	return math.Min(target, currentAmount)
+}
+
+// ceilToDecimals rounds a number up to the given decimal places.
+// Using ceiling helps counter exchanges that truncate amounts downward, reducing tiny leftovers.
+func ceilToDecimals(v float64, decimals int) float64 {
+	if decimals <= 0 {
+		return math.Ceil(v)
+	}
+	factor := math.Pow10(decimals)
+	return math.Ceil(v*factor) / factor
 }

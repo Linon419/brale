@@ -12,6 +12,7 @@ type TemplateLoader interface {
 }
 
 type Sections struct {
+	Header            string
 	Account           string
 	Previous          string
 	PreviousProviders string
@@ -23,7 +24,7 @@ type Sections struct {
 }
 
 const defaultTemplate = `# 决策输入（Multi-Agent 汇总）
-{{if .Account}}{{.Account}}{{end}}{{if .Previous}}{{.Previous}}{{end}}{{if .Derivatives}}{{.Derivatives}}{{end}}{{if .PreviousProviders}}{{.PreviousProviders}}{{end}}{{if .Klines}}{{.Klines}}{{end}}{{if .Positions}}{{.Positions}}{{end}}{{if .Agents}}{{.Agents}}{{end}}
+{{if .Header}}{{.Header}}{{end}}{{if .Account}}{{.Account}}{{end}}{{if .Previous}}{{.Previous}}{{end}}{{if .Derivatives}}{{.Derivatives}}{{end}}{{if .PreviousProviders}}{{.PreviousProviders}}{{end}}{{if .Klines}}{{.Klines}}{{end}}{{if .Positions}}{{.Positions}}{{end}}{{if .Agents}}{{.Agents}}{{end}}
 {{.Guidelines}}`
 
 var defaultSummaryTemplate = template.Must(template.New("user_summary_default").Parse(defaultTemplate))
@@ -51,6 +52,9 @@ func RenderSummary(loader TemplateLoader, sections Sections) string {
 func fallbackSummary(sections Sections) string {
 	var b strings.Builder
 	b.WriteString("# 决策输入（Multi-Agent 汇总）\n")
+	if s := strings.TrimSpace(sections.Header); s != "" {
+		b.WriteString(s)
+	}
 	if s := strings.TrimSpace(sections.Account); s != "" {
 		b.WriteString(s)
 	}

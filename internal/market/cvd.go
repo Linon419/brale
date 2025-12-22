@@ -66,9 +66,9 @@ func ComputeCVD(candles []Candle) (CVDMetrics, bool) {
 
 	divergence := "neutral"
 	if priceNow.GreaterThan(pricePrev) && last.LessThan(cvdPrev) {
-		divergence = "bearish"
+		divergence = "down"
 	} else if priceNow.LessThan(pricePrev) && last.GreaterThan(cvdPrev) {
-		divergence = "bullish"
+		divergence = "up"
 	}
 
 	peakFlip := "none"
@@ -77,9 +77,9 @@ func ComputeCVD(candles []Candle) (CVDMetrics, bool) {
 		b := cvd[len(cvd)-2]
 		c := cvd[len(cvd)-3]
 		if a.LessThan(b) && b.GreaterThan(c) {
-			peakFlip = "top"
+			peakFlip = "local_top"
 		} else if a.GreaterThan(b) && b.LessThan(c) {
-			peakFlip = "bottom"
+			peakFlip = "local_bottom"
 		}
 	}
 

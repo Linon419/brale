@@ -271,10 +271,6 @@ func buildIntervalSummary(interval string, pat pattern.Result, rep indicator.Rep
 	if trend == "" {
 		trend = "无趋势描述"
 	}
-	bias := pat.Bias
-	if bias != "" {
-		trend = fmt.Sprintf("%s | bias=%s", trend, bias)
-	}
 	rsi := rep.Values["rsi"].Latest
 	macd := rep.Values["macd"].State
 	info.Summary = fmt.Sprintf("%s / %s", summary, trend)

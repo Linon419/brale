@@ -126,13 +126,7 @@ func ComputeAll(candles []market.Candle, cfg Settings) (Report, error) {
 	signalSeries := sanitizeSeries(signal)
 	histSeries := sanitizeSeries(hist)
 	macdNote := fmt.Sprintf("signal=%.4f hist=%.4f", lastValid(signalSeries), lastValid(histSeries))
-	macdState := "flat"
-	switch {
-	case lastValid(histSeries) > 0:
-		macdState = "bullish"
-	case lastValid(histSeries) < 0:
-		macdState = "bearish"
-	}
+	macdState := polarityState(lastValid(histSeries))
 	rep.Values["macd"] = IndicatorValue{
 		Latest: lastValid(macdSeries),
 		Series: histSeries,
