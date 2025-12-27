@@ -3,9 +3,11 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.brale
+      args:
+        INSTALL_HEADLESS: "true"
     environment:
       BRALE_CONFIG: /app/configs/config.yaml
-      FREQTRADE_API_URL: http://freqtrade:8080/api/v1
+      FREQTRADE_API_URL: http://freqtrade:8755/api/v1
       #HTTP_PROXY: http://host.docker.internal:10080
       #HTTPS_PROXY: http://host.docker.internal:10080
       #NO_PROXY: localhost,127.0.0.1,brale,freqtrade
@@ -46,7 +48,7 @@ services:
       - "--db-url"
       - "sqlite:////freqtrade/user_data/tradesv3.sqlite"
       - "--config"
-      - "/freqtrade/user_data/config.json"
+      - "/freqtrade/user_data/freqtrade-config.json"
       - "--strategy"
       - "BraleSharedStrategy"
     ports:
