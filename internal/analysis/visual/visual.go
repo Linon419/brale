@@ -66,11 +66,13 @@ const (
 	colorVolume        = "#a78bfa"
 	colorDIF           = "#22d3ee"
 	colorDEA           = "#fb7185"
+	colorWTHybrid      = "#f59e0b"
 
 	chartWidthPx   = 1600
 	klineHeightPx  = 600
 	volumeHeightPx = 260
 	macdHeightPx   = 260
+	wtmfiHeightPx  = 260
 )
 
 func RenderComposite(input CompositeInput) (ImageResult, error) {
@@ -92,7 +94,7 @@ func RenderComposite(input CompositeInput) (ImageResult, error) {
 	if err != nil {
 		return ImageResult{}, err
 	}
-	blockHeight := klineHeightPx + volumeHeightPx + macdHeightPx
+	blockHeight := klineHeightPx + volumeHeightPx + macdHeightPx + wtmfiHeightPx
 	height := len(input.Intervals) * blockHeight
 	if height < 520 {
 		height = 520
@@ -245,8 +247,12 @@ func buildCompositeHTML(input CompositeInput) ([]byte, string, error) {
 
 		volume := buildVolumeChart(interval, xAxis, candles)
 		macdChart := buildMACDChart(interval, xAxis, candles, history)
+		wtmfiChart := buildWTMFIChart(interval, xAxis, candles)
 
 		page.AddCharts(kline, volume, macdChart)
+		if wtmfiChart != nil {
+			page.AddCharts(wtmfiChart)
+		}
 	}
 
 	if len(page.Charts) == 0 {
@@ -420,6 +426,42 @@ func buildMACDChart(interval string, xAxis []string, candles []market.Candle, hi
 	return bar
 }
 
+func buildWTMFIChart(interval string, xAxis []string, candles []market.Candle) *charts.Line {
+	if len(candles) == 0 {
+		return nil
+	}
+	hybrid := calcWTMFIHybridSeries(candles)
+	overbought := wtmfiOverbought
+	oversold := wtmfiOversold
+
+	line := charts.NewLine()
+	line.SetGlobalOptions(
+		charts.WithInitializationOpts(opts.Initialization{
+			Theme:           types.ThemeWesteros,
+			Width:           fmt.Sprintf("%dpx", chartWidthPx),
+			Height:          fmt.Sprintf("%dpx", wtmfiHeightPx),
+			BackgroundColor: colorBackground,
+		}),
+		charts.WithTitleOpts(opts.Title{Title: fmt.Sprintf("WT+MFI %s", interval), Left: "left", TitleStyle: &opts.TextStyle{Color: colorTextPrimary}}),
+		charts.WithLegendOpts(opts.Legend{Show: opts.Bool(true), TextStyle: &opts.TextStyle{Color: colorTextSecondary}}),
+		charts.WithTooltipOpts(opts.Tooltip{Show: opts.Bool(true), Trigger: "axis"}),
+		charts.WithXAxisOpts(opts.XAxis{AxisLabel: &opts.AxisLabel{Show: opts.Bool(false)}}),
+		charts.WithYAxisOpts(opts.YAxis{
+			AxisLabel: &opts.AxisLabel{Show: opts.Bool(true), Color: colorTextSecondary},
+			SplitLine: &opts.SplitLine{Show: opts.Bool(true), LineStyle: &opts.LineStyle{Color: colorTextSecondary, Opacity: opts.Float(0.15)}},
+		}),
+	)
+	line.SetSeriesOptions(
+		charts.WithLineChartOpts(opts.LineChart{ShowSymbol: opts.Bool(false)}),
+	)
+	line.SetXAxis(xAxis)
+	line.AddSeries("WT+MFI", toLineData(hybrid, len(candles)), charts.WithLineStyleOpts(opts.LineStyle{Color: colorWTHybrid, Width: 2}))
+	line.AddSeries("Overbought", constantLineData(overbought, len(candles)), charts.WithLineStyleOpts(opts.LineStyle{Color: colorTextSecondary, Type: "dashed", Width: 1}))
+	line.AddSeries("Oversold", constantLineData(oversold, len(candles)), charts.WithLineStyleOpts(opts.LineStyle{Color: colorTextSecondary, Type: "dashed", Width: 1}))
+	line.AddSeries("Zero", constantLineData(0, len(candles)), charts.WithLineStyleOpts(opts.LineStyle{Color: colorTextSecondary, Type: "dotted", Width: 1}))
+	return line
+}
+
 func toLineData(series []float64, length int) []opts.LineData {
 	line := make([]opts.LineData, length)
 	offset := length - len(series)
@@ -461,6 +503,120 @@ func calcMACDSeries(candles []market.Candle) (dif, dea, hist []float64) {
 	}
 	dif, dea, hist = talib.Macd(closes, 12, 26, 9)
 	return dif, dea, hist
+}
+
+const (
+	wtmfiChannelLen = 10
+	wtmfiAvgLen     = 8
+	wtmfiSmoothLen  = 5
+	wtmfiMFILen     = 10
+	wtmfiWeight     = 0.3
+	wtmfiMFIScale   = 1.5
+	wtmfiOverbought = 50.0
+	wtmfiOversold   = -50.0
+)
+
+func calcWTMFIHybridSeries(candles []market.Candle) []float64 {
+	if len(candles) == 0 {
+		return nil
+	}
+	n := len(candles)
+	src := make([]float64, n)
+	highs := make([]float64, n)
+	lows := make([]float64, n)
+	closes := make([]float64, n)
+	volumes := make([]float64, n)
+	for i, c := range candles {
+		highs[i] = c.High
+		lows[i] = c.Low
+		closes[i] = c.Close
+		volumes[i] = c.Volume
+		src[i] = (c.High + c.Low + c.Close) / 3
+	}
+
+	esa := talib.Ema(src, wtmfiChannelLen)
+	absDiff := make([]float64, n)
+	for i := range src {
+		absDiff[i] = math.Abs(src[i] - esa[i])
+	}
+	d := talib.Ema(absDiff, wtmfiChannelLen)
+	ci := make([]float64, n)
+	for i := range src {
+		denom := 0.015 * d[i]
+		if denom == 0 {
+			ci[i] = 0
+			continue
+		}
+		ci[i] = (src[i] - esa[i]) / denom
+	}
+	wt1 := talib.Ema(ci, wtmfiAvgLen)
+	wt2 := almaSeries(wt1, wtmfiSmoothLen, 0.85, 6)
+	mfiSeries := talib.Mfi(highs, lows, closes, volumes, wtmfiMFILen)
+	hybrid := make([]float64, n)
+	for i := range hybrid {
+		mfiVal := (mfiSeries[i] - 50) * wtmfiMFIScale
+		hybrid[i] = wtmfiWeight*wt2[i] + (1-wtmfiWeight)*mfiVal
+	}
+
+	required := maxInt(wtmfiChannelLen, wtmfiAvgLen, wtmfiSmoothLen, wtmfiMFILen) + 1
+	if required > n {
+		required = n
+	}
+	for i := 0; i < required; i++ {
+		hybrid[i] = math.NaN()
+	}
+	return hybrid
+}
+
+func almaSeries(values []float64, length int, offset, sigma float64) []float64 {
+	out := make([]float64, len(values))
+	if length <= 0 || len(values) == 0 {
+		return out
+	}
+	m := offset * float64(length-1)
+	s := float64(length) / sigma
+	denom := 2 * s * s
+	for i := range values {
+		if i+1 < length {
+			out[i] = 0
+			continue
+		}
+		sum := 0.0
+		wSum := 0.0
+		for j := 0; j < length; j++ {
+			idx := i - length + 1 + j
+			w := math.Exp(-((float64(j) - m) * (float64(j) - m)) / denom)
+			sum += w * values[idx]
+			wSum += w
+		}
+		if wSum == 0 {
+			out[i] = 0
+		} else {
+			out[i] = sum / wSum
+		}
+	}
+	return out
+}
+
+func constantLineData(value float64, length int) []opts.LineData {
+	data := make([]opts.LineData, length)
+	for i := range data {
+		data[i] = opts.LineData{Value: round(value, 4)}
+	}
+	return data
+}
+
+func maxInt(values ...int) int {
+	if len(values) == 0 {
+		return 0
+	}
+	maxVal := values[0]
+	for _, v := range values[1:] {
+		if v > maxVal {
+			maxVal = v
+		}
+	}
+	return maxVal
 }
 
 func round(val float64, decimals int) float64 {
