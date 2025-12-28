@@ -30,6 +30,8 @@ func (f *Factory) Build(cfg loader.MiddlewareConfig, profile loader.ProfileDefin
 		return f.buildRSI(cfg, profile)
 	case "macd_trend":
 		return f.buildMACD(cfg, profile)
+	case "wt_mfi_hybrid":
+		return f.buildWTMFIHybrid(cfg, profile)
 	default:
 		return nil, fmt.Errorf("unknown middleware: %s", cfg.Name)
 	}
@@ -167,6 +169,88 @@ func (f *Factory) buildMACD(cfg loader.MiddlewareConfig, profile loader.ProfileD
 	return mw, nil
 }
 
+func (f *Factory) buildWTMFIHybrid(cfg loader.MiddlewareConfig, profile loader.ProfileDefinition) (pipeline.Middleware, error) {
+	interval := stringFromCfg(cfg.Params, "interval")
+	if interval == "" {
+		ints := profile.IntervalsLower()
+		if len(ints) > 0 {
+			interval = ints[0]
+		}
+	}
+	if interval == "" {
+		return nil, fmt.Errorf("wt_mfi_hybrid 缂哄皯 interval")
+	}
+
+	channelLen := intFromCfg(cfg.Params, "len")
+	if channelLen <= 0 {
+		channelLen = intFromCfg(cfg.Params, "channel_len")
+	}
+	avgLen := intFromCfg(cfg.Params, "avg_len")
+	smoothLen := intFromCfg(cfg.Params, "smooth_len")
+	mfiLen := intFromCfg(cfg.Params, "mfi_len")
+	wtWeight := floatFromCfg(cfg.Params, "wt_weight")
+	mfiScale := floatFromCfg(cfg.Params, "mfi_scale")
+	overbought := floatFromCfg(cfg.Params, "overbought")
+	oversold := floatFromCfg(cfg.Params, "oversold")
+	volLen := intFromCfg(cfg.Params, "vol_len")
+	volTrigger := floatFromCfg(cfg.Params, "vol_trigger")
+	useRealtimeDiv := boolFromCfg(cfg.Params, "use_realtime_div", true)
+	realtimeLookback := intFromCfg(cfg.Params, "realtime_lookback")
+	realtimeTriggerFlip := boolFromCfg(cfg.Params, "realtime_trigger_on_flip", true)
+	searchLimit := intFromCfg(cfg.Params, "search_limit")
+	minDivInterval := intFromCfg(cfg.Params, "min_div_interval")
+	divMinAbsOscStart := floatFromCfg(cfg.Params, "div_min_abs_osc_start")
+	divMinAbsOscEnd := floatFromCfg(cfg.Params, "div_min_abs_osc_end")
+	divMinOscGap := floatFromCfg(cfg.Params, "div_min_osc_gap")
+	divMinPriceGapATR := floatFromCfg(cfg.Params, "div_min_price_gap_atr")
+	useATRFilter := boolFromCfg(cfg.Params, "use_atr_filter", true)
+	atrLen := intFromCfg(cfg.Params, "atr_len")
+	atrDivMult := floatFromCfg(cfg.Params, "atr_div_mult")
+	useADXFilter := boolFromCfg(cfg.Params, "use_adx_filter_div", true)
+	adxLen := intFromCfg(cfg.Params, "adx_len")
+	adxLimit := floatFromCfg(cfg.Params, "adx_limit")
+	requireCandleConf := boolFromCfg(cfg.Params, "require_candle_conf", true)
+	lbLeft := intFromCfg(cfg.Params, "lb_left")
+	lbRight := intFromCfg(cfg.Params, "lb_right")
+
+	mw := middlewares.NewWTMFIHybrid(middlewares.WTMFIHybridConfig{
+		Name:                  cfg.Name,
+		Stage:                 cfg.Stage,
+		Critical:              cfg.Critical,
+		Timeout:               time.Duration(cfg.TimeoutSeconds) * time.Second,
+		Interval:              interval,
+		ChannelLen:            channelLen,
+		AvgLen:                avgLen,
+		SmoothLen:             smoothLen,
+		MFILen:                mfiLen,
+		WTWeight:              wtWeight,
+		MFIScale:              mfiScale,
+		Overbought:            overbought,
+		Oversold:              oversold,
+		VolLen:                volLen,
+		VolTrigger:            volTrigger,
+		UseRealtimeDiv:        useRealtimeDiv,
+		RealtimeLookback:      realtimeLookback,
+		RealtimeTriggerOnFlip: realtimeTriggerFlip,
+		SearchLimit:           searchLimit,
+		MinDivInterval:        minDivInterval,
+		DivMinAbsOscStart:     divMinAbsOscStart,
+		DivMinAbsOscEnd:       divMinAbsOscEnd,
+		DivMinOscGap:          divMinOscGap,
+		DivMinPriceGapATR:     divMinPriceGapATR,
+		UseATRFilter:          useATRFilter,
+		ATRLen:                atrLen,
+		ATRDivMult:            atrDivMult,
+		UseADXFilter:          useADXFilter,
+		ADXLen:                adxLen,
+		ADXLimit:              adxLimit,
+		RequireCandleConfirm:  requireCandleConf,
+		LBLeft:                lbLeft,
+		LBRight:               lbRight,
+	})
+	return mw, nil
+}
+
 func sliceFromCfg(params map[string]interface{}, key string) []string {
 	if params == nil {
 		return nil
@@ -259,6 +343,32 @@ func floatFromCfg(params map[string]interface{}, key string) float64 {
 		if err != nil {
 			logger.Warnf("middleware param %s invalid float: %v", key, err)
 			return 0
+		}
+		return val
+	}
+}
+
+func boolFromCfg(params map[string]interface{}, key string, fallback bool) bool {
+	if params == nil {
+		return fallback
+	}
+	raw, ok := params[key]
+	if !ok {
+		return fallback
+	}
+	switch v := raw.(type) {
+	case bool:
+		return v
+	case string:
+		val, err := strconv.ParseBool(strings.TrimSpace(v))
+		if err != nil {
+			return fallback
+		}
+		return val
+	default:
+		val, err := strconv.ParseBool(strings.TrimSpace(fmt.Sprintf("%v", v)))
+		if err != nil {
+			return fallback
 		}
 		return val
 	}

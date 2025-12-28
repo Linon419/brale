@@ -32,6 +32,10 @@ func buildFreqManager(cfg brcfg.FreqtradeConfig, horizon string, logStore *datab
 }
 
 func buildLiveHTTPServer(cfg brcfg.AppConfig, logs *database.DecisionLogStore, freqHandler livehttp.FreqtradeWebhookHandler, defaultSymbols []string, symbolDetails map[string]livehttp.SymbolDetail) (*livehttp.Server, error) {
+	return buildLiveHTTPServerFull(cfg, logs, freqHandler, defaultSymbols, symbolDetails, "", "", nil)
+}
+
+func buildLiveHTTPServerFull(cfg brcfg.AppConfig, logs *database.DecisionLogStore, freqHandler livehttp.FreqtradeWebhookHandler, defaultSymbols []string, symbolDetails map[string]livehttp.SymbolDetail, profilesPath, promptsDir string, availableCombos []string) (*livehttp.Server, error) {
 	if logs == nil && freqHandler == nil {
 		return nil, nil
 	}
@@ -49,6 +53,9 @@ func buildLiveHTTPServer(cfg brcfg.AppConfig, logs *database.DecisionLogStore, f
 		DefaultSymbols:   defaultSymbols,
 		SymbolDetails:    symbolDetails,
 		LogPaths:         logPaths,
+		ProfilesPath:     profilesPath,
+		PromptsDir:       promptsDir,
+		AvailableCombos:  availableCombos,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("初始化 live HTTP 失败: %w", err)

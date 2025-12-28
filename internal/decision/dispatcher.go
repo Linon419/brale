@@ -120,7 +120,7 @@ func (d *Dispatcher) callProvider(parent context.Context, p provider.ModelProvid
 		ExpectJSON: p.ExpectsJSON(),
 	}
 	if visionEnabled && len(baseImages) > 0 {
-		payload.Images = cloneImages(baseImages)
+		payload.Images = normalizeImagePayloads(baseImages)
 	}
 
 	purpose := fmt.Sprintf("final decision (images=%d)", len(payload.Images))

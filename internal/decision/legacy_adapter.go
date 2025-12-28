@@ -369,7 +369,7 @@ func (e *DecisionEngine) callProvider(parent context.Context, p provider.ModelPr
 		ExpectJSON: p.ExpectsJSON(),
 	}
 	if visionEnabled && len(baseImages) > 0 {
-		payload.Images = CloneSlice(baseImages)
+		payload.Images = normalizeImagePayloads(baseImages)
 	}
 	purpose := fmt.Sprintf("final decision (images=%d)", len(payload.Images))
 	logAIInput("main", p.ID(), purpose, payload.System, payload.User, summarizeImagePayloads(payload.Images))

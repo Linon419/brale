@@ -55,6 +55,8 @@ ai:
     # models：模型列表；id 需要全局唯一，并在 provider_preference / multi_agent.*_provider 中引用
     # supports_vision：是否支持图片输入（如接入带视觉的模型）
     # expect_json：是否强制要求模型输出 JSON（用于某些严格解析场景）
+    # provider="anthropic" 使用 Anthropic /v1/messages API（api_url 留空默认 https://api.anthropic.com/v1）
+    # provider="gemini" 使用 Google generateContent API（默认拼 /v1beta/models/{model}:generateContent）
     - id: "deepseek"
       provider: "deepseek"        # 提供方类型（影响 client 实现）
       enabled: false              # 是否启用该模型

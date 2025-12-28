@@ -20,6 +20,13 @@ type ProfileDefinition struct {
 	Targets    []string `mapstructure:"targets"`
 	Intervals  []string `mapstructure:"intervals"`
 
+	// 动态 targets API 配置
+	TargetsAPIURL            string `mapstructure:"targets_api_url"`
+	TargetsAPIOverride       bool   `mapstructure:"targets_api_override"`
+	TargetsAPIQuote          string `mapstructure:"targets_api_quote"`
+	TargetsAPITimeoutSeconds int    `mapstructure:"targets_api_timeout_seconds"`
+	TargetsAPIRefreshSeconds int    `mapstructure:"targets_api_refresh_seconds"`
+
 	DecisionIntervalMultiple int                `mapstructure:"decision_interval_multiple"`
 	AnalysisSlice            int                `mapstructure:"analysis_slice"`
 	SliceDropTail            int                `mapstructure:"slice_drop_tail"`
@@ -423,7 +430,7 @@ func cloneSnapshot(src ProfileSnapshot) ProfileSnapshot {
 
 func isAgentMiddleware(name string) bool {
 	switch strings.ToLower(strings.TrimSpace(name)) {
-	case "ema_trend", "rsi_extreme", "macd_trend":
+	case "ema_trend", "rsi_extreme", "macd_trend", "wt_mfi_hybrid":
 		return true
 	default:
 		return false

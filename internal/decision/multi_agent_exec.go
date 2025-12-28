@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	brcfg "brale/internal/config"
@@ -13,6 +14,29 @@ import (
 
 	"golang.org/x/sync/errgroup"
 )
+
+// agentWarningThrottler 用于节流 Multi-Agent 警告，避免短时间内刷屏
+type agentWarningThrottler struct {
+	mu       sync.Mutex
+	lastSent map[string]time.Time
+	interval time.Duration
+}
+
+var globalWarningThrottler = &agentWarningThrottler{
+	lastSent: make(map[string]time.Time),
+	interval: 5 * time.Minute, // 同类型警告 5 分钟内只发送一次
+}
+
+func (t *agentWarningThrottler) shouldSend(key string) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	now := time.Now()
+	if last, ok := t.lastSent[key]; ok && now.Sub(last) < t.interval {
+		return false
+	}
+	t.lastSent[key] = now
+	return true
+}
 
 // MarketMechanicsAgent execution rules:
 // 1) Consume only the derivatives block (OI/Funding/Fear&Greed).
@@ -350,6 +374,13 @@ func (e *DecisionEngine) emitAgentWarning(stage, providerID, reason string) bool
 		msg = fmt.Sprintf("[Multi-Agent 警告] %s(%s) 无输出: %s", title, providerID, reason)
 	}
 	logger.Warnf("%s", msg)
+
+	// 使用节流器避免短时间内重复发送相同类型的警告到 Telegram
+	throttleKey := fmt.Sprintf("%s:%s", stage, providerID)
+	if !globalWarningThrottler.shouldSend(throttleKey) {
+		return false
+	}
+
 	n := e.AgentNotifier
 	if n == nil {
 		return false

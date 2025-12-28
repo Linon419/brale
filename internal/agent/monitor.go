@@ -18,6 +18,11 @@ type PriceObserver interface {
 	NotifyPrice(symbol string, price float64)
 }
 
+// SymbolProvider 提供动态 symbols 列表
+type SymbolProvider interface {
+	GetAllTargets() []string
+}
+
 type MonitorParams struct {
 	Updater        *market.WSUpdater
 	KlineStore     market.KlineStore
@@ -28,6 +33,7 @@ type MonitorParams struct {
 	Telegram       *notifier.Telegram
 	ExecManager    ports.ExecutionManager
 	Observer       PriceObserver
+	SymbolProvider SymbolProvider // 动态 symbols 提供者
 }
 
 type PriceMonitor struct {
@@ -40,6 +46,7 @@ type PriceMonitor struct {
 	tg             *notifier.Telegram
 	execManager    ports.ExecutionManager
 	observer       PriceObserver
+	symbolProvider SymbolProvider
 
 	priceCache   map[string]cachedQuote
 	priceCacheMu sync.RWMutex
@@ -76,9 +83,26 @@ func NewPriceMonitor(p MonitorParams) *PriceMonitor {
 		tg:             p.Telegram,
 		execManager:    p.ExecManager,
 		observer:       p.Observer,
+		symbolProvider: p.SymbolProvider,
 		priceCache:     make(map[string]cachedQuote),
 		lastPrice:      make(map[string]lastPriceEntry),
 	}
+}
+
+// resolveSymbols 获取当前的 symbols 列表（优先动态，fallback 静态）
+func (m *PriceMonitor) resolveSymbols() []string {
+	if m == nil {
+		return nil
+	}
+	// 优先使用动态 symbols
+	if m.symbolProvider != nil {
+		targets := m.symbolProvider.GetAllTargets()
+		if len(targets) > 0 {
+			return targets
+		}
+	}
+	// fallback 到静态配置
+	return m.symbols
 }
 
 func (m *PriceMonitor) Start(ctx context.Context) {
@@ -96,7 +120,12 @@ func (m *PriceMonitor) Start(ctx context.Context) {
 			if !firstWSConnected {
 				firstWSConnected = true
 				msg := "*Brale 启动成功* ✅\nWS 已连接并开始订阅"
-				if summary := strings.TrimSpace(m.horizonSummary); summary != "" {
+				// 使用动态 symbols 生成摘要
+				symbols := m.resolveSymbols()
+				if len(symbols) > 0 {
+					summary := m.buildDynamicSummary(symbols)
+					msg += "\n```text\n" + summary + "\n```"
+				} else if summary := strings.TrimSpace(m.horizonSummary); summary != "" {
 					msg += "\n```text\n" + summary + "\n```"
 				}
 				if warmup := strings.TrimSpace(m.warmupSummary); warmup != "" {
@@ -121,12 +150,39 @@ func (m *PriceMonitor) Start(ctx context.Context) {
 			_ = m.tg.SendText(msg)
 		}
 		go func() {
-			if err := m.updater.Start(ctx, m.symbols, m.intervals); err != nil {
+			symbols := m.resolveSymbols()
+			if err := m.updater.Start(ctx, symbols, m.intervals); err != nil {
 				logger.Errorf("启动行情订阅失败: %v", err)
 			}
 		}()
 	}
 	m.startTradePriceStream(ctx)
+}
+
+// buildDynamicSummary 生成动态币种摘要
+func (m *PriceMonitor) buildDynamicSummary(symbols []string) string {
+	if len(symbols) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString(fmt.Sprintf("监控币种数：%d\n", len(symbols)))
+	b.WriteString("- 符号：")
+	for i, sym := range symbols {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		b.WriteString(sym)
+	}
+	if len(m.intervals) > 0 {
+		b.WriteString("\n- 订阅周期：")
+		for i, iv := range m.intervals {
+			if i > 0 {
+				b.WriteString(", ")
+			}
+			b.WriteString(iv)
+		}
+	}
+	return b.String()
 }
 
 func (m *PriceMonitor) Close() {
@@ -186,7 +242,8 @@ func (m *PriceMonitor) startTradePriceStream(ctx context.Context) {
 			}
 		},
 	}
-	stream, err := m.updater.Source.SubscribeTrades(ctx, m.symbols, opts)
+	symbols := m.resolveSymbols()
+	stream, err := m.updater.Source.SubscribeTrades(ctx, symbols, opts)
 	if err != nil {
 		logger.Warnf("订阅实时成交价失败: %v", err)
 		return

@@ -188,7 +188,7 @@ func collectMiddlewareNeeds(name string, def cfgloader.ProfileDefinition, interv
 			if err := collectKlineFetcherNeeds(mw, ints, intervalSet, lookbacks); err != nil {
 				return fmt.Errorf("middleware %s: %w", mw.Name, err)
 			}
-		case "ema_trend", "rsi_extreme", "macd_trend":
+		case "ema_trend", "rsi_extreme", "macd_trend", "wt_mfi_hybrid":
 			if err := collectIndicatorNeeds(mw, intervalSet, lookbacks); err != nil {
 				return fmt.Errorf("middleware %s: %w", mw.Name, err)
 			}
@@ -253,6 +253,10 @@ func collectIndicatorNeeds(mw cfgloader.MiddlewareConfig, intervalSet map[string
 	case "macd_trend":
 		if maputil.Int(mw.Params, "fast") <= 0 || maputil.Int(mw.Params, "slow") <= 0 || maputil.Int(mw.Params, "signal") <= 0 {
 			return fmt.Errorf("macd_trend 需设置 fast/slow/signal")
+		}
+	case "wt_mfi_hybrid":
+		if maputil.Float(mw.Params, "overbought") == 0 || maputil.Float(mw.Params, "oversold") == 0 {
+			return fmt.Errorf("wt_mfi_hybrid 需设置 overbought/oversold")
 		}
 	}
 	return nil

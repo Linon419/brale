@@ -7,8 +7,12 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strings"
+	"sync"
 	"time"
+
+	"brale/internal/logger"
 )
 
 type SymbolProvider interface {
@@ -104,4 +108,243 @@ func (p *HTTPSymbolProvider) List(ctx context.Context) ([]string, error) {
 		return nil, fmt.Errorf("parsing response: %w", err)
 	}
 	return NormalizeSymbols(obj.Symbols)
+}
+
+// OTCAPIResponse 定义 OTC API 的响应结构
+type OTCAPIResponse struct {
+	Success bool          `json:"success"`
+	Date    string        `json:"date"`
+	Count   int           `json:"count"`
+	Items   []OTCCoinItem `json:"items"`
+}
+
+// OTCCoinItem 定义单个币种信息
+type OTCCoinItem struct {
+	Symbol        string  `json:"symbol"`
+	Name          string  `json:"name"`
+	OTCIndex      float64 `json:"otc_index"`
+	PeriodQuality string  `json:"period_quality"`
+}
+
+// DynamicTargetsProvider 动态从 API 获取交易币种，支持自动刷新和 fallback
+type DynamicTargetsProvider struct {
+	apiURL         string
+	quote          string
+	timeout        time.Duration
+	refreshSeconds int
+	fallback       []string // 静态配置的备选列表
+	override       bool     // true 时 API 结果覆盖 fallback
+
+	mu          sync.RWMutex
+	targets     []string
+	lastFetched time.Time
+	lastErr     error
+}
+
+// DynamicTargetsConfig 配置
+type DynamicTargetsConfig struct {
+	APIURL         string
+	Quote          string
+	TimeoutSeconds int
+	RefreshSeconds int
+	Fallback       []string
+	Override       bool
+}
+
+// NewDynamicTargetsProvider 创建 DynamicTargetsProvider
+func NewDynamicTargetsProvider(cfg DynamicTargetsConfig) *DynamicTargetsProvider {
+	timeout := time.Duration(cfg.TimeoutSeconds) * time.Second
+	if timeout <= 0 {
+		timeout = 10 * time.Second
+	}
+	refreshSeconds := cfg.RefreshSeconds
+	if refreshSeconds <= 0 {
+		refreshSeconds = 3600 // 默认 1 小时刷新一次
+	}
+	quote := strings.ToUpper(strings.TrimSpace(cfg.Quote))
+	if quote == "" {
+		quote = "USDT"
+	}
+
+	fallback := normalizeSymbolsWithQuote(cfg.Fallback, quote)
+
+	return &DynamicTargetsProvider{
+		apiURL:         strings.TrimSpace(cfg.APIURL),
+		quote:          quote,
+		timeout:        timeout,
+		refreshSeconds: refreshSeconds,
+		fallback:       fallback,
+		override:       cfg.Override,
+		targets:        fallback, // 初始使用 fallback
+	}
+}
+
+// Name 实现 SymbolProvider 接口
+func (p *DynamicTargetsProvider) Name() string { return "dynamic" }
+
+// List 实现 SymbolProvider 接口
+func (p *DynamicTargetsProvider) List(ctx context.Context) ([]string, error) {
+	// 尝试刷新（如果需要）
+	_ = p.Refresh(ctx)
+	return p.Targets(), nil
+}
+
+// Targets 返回当前的交易对列表
+func (p *DynamicTargetsProvider) Targets() []string {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	out := make([]string, len(p.targets))
+	copy(out, p.targets)
+	return out
+}
+
+// Refresh 从 API 刷新币种列表
+func (p *DynamicTargetsProvider) Refresh(ctx context.Context) error {
+	if p.apiURL == "" {
+		return nil // 没有配置 API，使用静态列表
+	}
+
+	p.mu.RLock()
+	lastFetched := p.lastFetched
+	p.mu.RUnlock()
+
+	// 检查是否需要刷新
+	if !lastFetched.IsZero() && time.Since(lastFetched) < time.Duration(p.refreshSeconds)*time.Second {
+		return nil
+	}
+
+	symbols, err := p.fetchFromAPI(ctx)
+	if err != nil {
+		p.mu.Lock()
+		p.lastErr = err
+		p.mu.Unlock()
+		logger.Warnf("DynamicTargetsProvider: API 获取失败，使用 fallback: %v", err)
+		return err
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if p.override {
+		// 覆盖模式：直接使用 API 结果
+		p.targets = symbols
+	} else {
+		// 合并模式：API 结果 + fallback 去重
+		p.targets = mergeAndDedup(symbols, p.fallback)
+	}
+	p.lastFetched = time.Now()
+	p.lastErr = nil
+
+	logger.Infof("DynamicTargetsProvider: 更新币种列表成功，共 %d 个: %v", len(p.targets), p.targets)
+	return nil
+}
+
+// fetchFromAPI 从 OTC API 获取数据
+func (p *DynamicTargetsProvider) fetchFromAPI(ctx context.Context) ([]string, error) {
+	reqCtx, cancel := context.WithTimeout(ctx, p.timeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, p.apiURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("create request failed: %w", err)
+	}
+
+	client := &http.Client{Timeout: p.timeout}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("API request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("API returned status %d", resp.StatusCode)
+	}
+
+	var apiResp OTCAPIResponse
+	if err := json.NewDecoder(resp.Body).Decode(&apiResp); err != nil {
+		return nil, fmt.Errorf("decode response failed: %w", err)
+	}
+
+	if !apiResp.Success {
+		return nil, fmt.Errorf("API returned success=false")
+	}
+
+	symbols := make([]string, 0, len(apiResp.Items))
+	for _, item := range apiResp.Items {
+		sym := strings.ToUpper(strings.TrimSpace(item.Symbol))
+		if sym == "" {
+			continue
+		}
+		// 添加 quote 后缀，例如 BTC -> BTC/USDT
+		symbols = append(symbols, fmt.Sprintf("%s/%s", sym, p.quote))
+	}
+
+	return symbols, nil
+}
+
+// StartAutoRefresh 启动后台自动刷新
+func (p *DynamicTargetsProvider) StartAutoRefresh(ctx context.Context) {
+	if p.apiURL == "" {
+		return
+	}
+
+	// 立即执行一次刷新
+	if err := p.Refresh(ctx); err != nil {
+		logger.Warnf("DynamicTargetsProvider: 初始刷新失败: %v", err)
+	}
+
+	// 后台定时刷新
+	go func() {
+		ticker := time.NewTicker(time.Duration(p.refreshSeconds) * time.Second)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if err := p.Refresh(ctx); err != nil {
+					logger.Warnf("DynamicTargetsProvider: 定时刷新失败: %v", err)
+				}
+			}
+		}
+	}()
+}
+
+// normalizeSymbolsWithQuote 规范化币种列表
+func normalizeSymbolsWithQuote(symbols []string, quote string) []string {
+	if len(symbols) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(symbols))
+	for _, sym := range symbols {
+		s := strings.ToUpper(strings.TrimSpace(sym))
+		if s == "" {
+			continue
+		}
+		// 如果没有包含 /，添加 quote
+		if !strings.Contains(s, "/") {
+			s = fmt.Sprintf("%s/%s", s, quote)
+		}
+		out = append(out, s)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// mergeAndDedup 合并并去重
+func mergeAndDedup(a, b []string) []string {
+	seen := make(map[string]struct{})
+	for _, s := range a {
+		seen[s] = struct{}{}
+	}
+	for _, s := range b {
+		seen[s] = struct{}{}
+	}
+	out := make([]string, 0, len(seen))
+	for s := range seen {
+		out = append(out, s)
+	}
+	sort.Strings(out)
+	return out
 }

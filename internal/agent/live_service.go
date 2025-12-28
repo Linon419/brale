@@ -115,6 +115,7 @@ func NewLiveService(p LiveServiceParams) *LiveService {
 			Telegram:       p.Telegram,
 			ExecManager:    p.ExecManager,
 			Observer:       planScheduler,
+			SymbolProvider: p.ProfileManager,
 		})
 	}
 
@@ -183,6 +184,12 @@ func (s *LiveService) Run(ctx context.Context) error {
 	if s.metrics != nil {
 		go s.metrics.Start(ctx)
 	}
+
+	// 启动动态 targets 刷新
+	if s.profileMgr != nil {
+		s.profileMgr.StartDynamicTargets(ctx)
+	}
+
 	s.prewarmDerivatives(ctx)
 	if s.planScheduler != nil {
 		s.planScheduler.Start(ctx)

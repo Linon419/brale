@@ -13,6 +13,7 @@ import (
 
 	"brale/internal/gateway/database"
 	"brale/internal/logger"
+	profilehttp "brale/internal/transport/http/profile"
 	webassets "brale/internal/transport/web"
 
 	"github.com/gin-gonic/gin"
@@ -30,6 +31,9 @@ type ServerConfig struct {
 	DefaultSymbols   []string
 	SymbolDetails    map[string]SymbolDetail
 	LogPaths         map[string]string
+	ProfilesPath     string   // Path to profiles.yaml
+	PromptsDir       string   // Path to prompts directory
+	AvailableCombos  []string // Available exit plan combos
 }
 
 func NewServer(cfg ServerConfig) (*Server, error) {
@@ -60,6 +64,13 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	})
 	liveRouter := NewRouter(cfg.Logs, cfg.FreqtradeHandler, cfg.LogPaths)
 	liveRouter.Register(router.Group("/api/live"))
+
+	// Register profile API if path is configured
+	if cfg.ProfilesPath != "" {
+		profileRouter := profilehttp.NewRouter(cfg.ProfilesPath, cfg.PromptsDir, cfg.AvailableCombos)
+		profileRouter.Register(router.Group("/api/profiles"))
+		logger.Infof("✓ Profile API 已启用")
+	}
 
 	return &Server{addr: cfg.Addr, router: router}, nil
 }

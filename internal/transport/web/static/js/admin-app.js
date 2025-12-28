@@ -601,6 +601,34 @@
         loading: false,
         error: '',
       });
+
+      // Profiles state
+      const profiles = reactive({
+        items: [],
+        loading: false,
+        error: '',
+        availablePrompts: [],
+        availableCombos: [],
+      });
+      const profileEdit = reactive({
+        visible: false,
+        isNew: false,
+        name: '',
+        saving: false,
+        error: '',
+        targetsText: '',
+        form: {
+          name: '',
+          context_tag: '',
+          targets: [],
+          decision_interval_multiple: 1,
+          prompts: { user: '', system_by_model: {} },
+          exit_plans: { combos: [] },
+          derivatives: { enabled: true, include_oi: true, include_funding: true },
+          default: false,
+        },
+      });
+
       const decisionDetail = reactive({ id: init.decisionId || null, data: null, loading: false, error: '' });
       const decisionFilters = reactive({ stage: 'provider', provider: '' });
       const positionDetail = reactive({
@@ -1258,6 +1286,141 @@
         };
       };
 
+      // Profile management functions
+      const loadProfiles = async () => {
+        profiles.loading = true;
+        profiles.error = '';
+        try {
+          const PM = window.ProfileManager;
+          const [items, prompts, combos] = await Promise.all([
+            PM.fetchProfiles(),
+            PM.fetchPrompts(),
+            PM.fetchCombos(),
+          ]);
+          profiles.items = items;
+          profiles.availablePrompts = prompts;
+          profiles.availableCombos = combos;
+        } catch (e) {
+          profiles.error = e.message;
+          showToast(e.message, 'error');
+        } finally {
+          profiles.loading = false;
+        }
+      };
+
+      const profileComboLabel = (key) => {
+        return window.ProfileManager ? window.ProfileManager.comboLabel(key) : key;
+      };
+
+      const openCreateProfile = () => {
+        profileEdit.isNew = true;
+        profileEdit.name = '';
+        profileEdit.error = '';
+        profileEdit.targetsText = '';
+        profileEdit.form = {
+          name: '',
+          context_tag: '',
+          targets: [],
+          decision_interval_multiple: 1,
+          prompts: { user: '', system_by_model: {} },
+          exit_plans: { combos: [] },
+          derivatives: { enabled: true, include_oi: true, include_funding: true },
+          default: false,
+        };
+        profileEdit.visible = true;
+      };
+
+      const openEditProfile = async (name) => {
+        profileEdit.isNew = false;
+        profileEdit.name = name;
+        profileEdit.error = '';
+        profileEdit.saving = false;
+        try {
+          const p = await window.ProfileManager.fetchProfile(name);
+          profileEdit.targetsText = (p.targets || []).join('\n');
+          profileEdit.form = {
+            name: p.name,
+            context_tag: p.context_tag || '',
+            targets: p.targets || [],
+            decision_interval_multiple: p.decision_interval_multiple || 1,
+            prompts: {
+              user: p.prompts?.user || '',
+              system_by_model: p.prompts?.system_by_model || {},
+            },
+            exit_plans: {
+              combos: p.exit_plans?.combos || [],
+            },
+            derivatives: {
+              enabled: p.derivatives?.enabled ?? true,
+              include_oi: p.derivatives?.include_oi ?? true,
+              include_funding: p.derivatives?.include_funding ?? true,
+            },
+            default: p.default || false,
+          };
+          profileEdit.visible = true;
+        } catch (e) {
+          showToast(e.message, 'error');
+        }
+      };
+
+      const closeProfileEdit = () => {
+        profileEdit.visible = false;
+      };
+
+      const toggleProfileCombo = (combo) => {
+        const idx = profileEdit.form.exit_plans.combos.indexOf(combo);
+        if (idx >= 0) {
+          profileEdit.form.exit_plans.combos.splice(idx, 1);
+        } else {
+          profileEdit.form.exit_plans.combos.push(combo);
+        }
+      };
+
+      const saveProfile = async () => {
+        profileEdit.error = '';
+        profileEdit.saving = true;
+        try {
+          const PM = window.ProfileManager;
+          const targets = PM.parseTargets(profileEdit.targetsText);
+          const payload = {
+            ...profileEdit.form,
+            targets,
+          };
+          if (profileEdit.isNew) {
+            if (!payload.name || !payload.name.trim()) {
+              throw new Error('Profile 名称不能为空');
+            }
+            await PM.createProfile(payload);
+            showToast('Profile 已创建');
+          } else {
+            await PM.updateProfile(profileEdit.name, payload);
+            showToast('Profile 已更新');
+          }
+          profileEdit.visible = false;
+          loadProfiles();
+        } catch (e) {
+          profileEdit.error = e.message;
+        } finally {
+          profileEdit.saving = false;
+        }
+      };
+
+      const deleteProfile = async () => {
+        if (!confirm(`确定要删除 Profile "${profileEdit.name}" 吗？此操作不可恢复。`)) return;
+        profileEdit.saving = true;
+        profileEdit.error = '';
+        try {
+          await window.ProfileManager.deleteProfile(profileEdit.name);
+          showToast('Profile 已删除');
+          profileEdit.visible = false;
+          loadProfiles();
+        } catch (e) {
+          profileEdit.error = e.message;
+        } finally {
+          profileEdit.saving = false;
+        }
+      };
+
       const loadProviderOutputs = async (force = false) => {
         if (!force && decisions.providers.length && view.value !== 'decisions') return;
         decisions.providersLoading = true;
@@ -1305,6 +1468,7 @@
         view.value = next;
         if (isMobile.value) navCollapsed.value = true;
         if (next === 'desk') loadDesk();
+        if (next === 'profiles') loadProfiles();
         if (next === 'decisions') {
           loadDecisions();
           loadProviderOutputs();
@@ -2863,6 +3027,17 @@
         strategyCards,
         enabledSymbols,
         decisions,
+        // Profile management
+        profiles,
+        profileEdit,
+        loadProfiles,
+        profileComboLabel,
+        openCreateProfile,
+        openEditProfile,
+        closeProfileEdit,
+        toggleProfileCombo,
+        saveProfile,
+        deleteProfile,
         positions,
         decisionDetail,
         decisionFilters,

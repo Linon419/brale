@@ -100,9 +100,13 @@ func (e *LiveEngine) Run(ctx context.Context) error {
 
 	logger.Infof("LiveEngine: Starting per-symbol aligned loops symbols=%d offset=%s run_immediately=%v", len(symbols), offset, runImmediately)
 
+	// 为每个币种添加递增偏移，避免所有币种同时触发导致 API 限流
+	symbolStagger := 3 * time.Second // 每个币种间隔 3 秒
+
 	group, gctx := errgroup.WithContext(ctx)
-	for _, sym := range symbols {
+	for i, sym := range symbols {
 		sym := sym
+		symbolOffset := offset + time.Duration(i)*symbolStagger // 递增偏移
 		group.Go(func() error {
 			align, interval, multiple, ok := e.symbolSchedule(sym)
 			if !ok {
@@ -111,7 +115,7 @@ func (e *LiveEngine) Run(ctx context.Context) error {
 				return gctx.Err()
 			}
 			cb := circuit.NewCircuitBreaker("LiveEngine."+sym, 5, 2*time.Minute)
-			sched := scheduler.NewAlignedOnceScheduler(gctx, align, interval, offset)
+			sched := scheduler.NewAlignedOnceScheduler(gctx, align, interval, symbolOffset)
 			sched.Name = fmt.Sprintf("%s x%d", sym, multiple)
 			sched.RunImmediately = runImmediately
 			sched.Start(func() {
@@ -140,6 +144,15 @@ func (e *LiveEngine) resolveCandidates() []string {
 	if e == nil {
 		return nil
 	}
+	// 优先从 ProfileMgr 获取动态 targets
+	if e.ProfileMgr != nil {
+		targets := e.ProfileMgr.GetAllTargets()
+		if len(targets) > 0 {
+			sort.Strings(targets)
+			return targets
+		}
+	}
+	// 如果 ProfileMgr 没有返回，使用静态 Candidates 作为 fallback
 	if len(e.Candidates) > 0 {
 		out := make([]string, 0, len(e.Candidates))
 		for _, sym := range e.Candidates {
@@ -152,30 +165,7 @@ func (e *LiveEngine) resolveCandidates() []string {
 		sort.Strings(out)
 		return out
 	}
-	if e.ProfileMgr == nil {
-		return nil
-	}
-	set := make(map[string]struct{})
-	for _, rt := range e.ProfileMgr.Profiles() {
-		if rt == nil {
-			continue
-		}
-		for _, sym := range rt.Definition.TargetsUpper() {
-			if sym == "" {
-				continue
-			}
-			set[sym] = struct{}{}
-		}
-	}
-	if len(set) == 0 {
-		return nil
-	}
-	out := make([]string, 0, len(set))
-	for sym := range set {
-		out = append(out, sym)
-	}
-	sort.Strings(out)
-	return out
+	return nil
 }
 
 func (e *LiveEngine) symbolSchedule(symbol string) (align time.Duration, interval time.Duration, multiple int, ok bool) {

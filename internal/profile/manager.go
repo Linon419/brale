@@ -1,10 +1,12 @@
 package profile
 
 import (
+	"context"
 	"strings"
 	"sync"
 	"text/template"
 
+	"brale/internal/coins"
 	"brale/internal/config/loader"
 	"brale/internal/logger"
 	"brale/internal/pipeline"
@@ -26,6 +28,7 @@ type Runtime struct {
 	Derivatives          loader.DerivativesConfig
 	AgentEnabled         bool
 	KlineWindowsEnabled  bool
+	TargetsProvider      *coins.DynamicTargetsProvider // 动态 targets provider
 }
 
 type Manager struct {
@@ -46,6 +49,47 @@ func NewManager(ld *loader.ProfileLoader, factory MiddlewareFactory, promptLoade
 		})
 	}
 	return mgr
+}
+
+// StartDynamicTargets 启动所有 profile 的动态 targets 刷新
+func (m *Manager) StartDynamicTargets(ctx context.Context) {
+	m.mu.RLock()
+	profiles := make([]*Runtime, 0, len(m.profiles))
+	for _, rt := range m.profiles {
+		profiles = append(profiles, rt)
+	}
+	m.mu.RUnlock()
+
+	for _, rt := range profiles {
+		if rt.TargetsProvider != nil {
+			rt.TargetsProvider.StartAutoRefresh(ctx)
+		}
+	}
+}
+
+// GetAllTargets 获取所有 profile 的动态 targets 合集
+func (m *Manager) GetAllTargets() []string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	seen := make(map[string]struct{})
+	for _, rt := range m.profiles {
+		var targets []string
+		if rt.TargetsProvider != nil {
+			targets = rt.TargetsProvider.Targets()
+		} else {
+			targets = rt.Definition.TargetsUpper()
+		}
+		for _, sym := range targets {
+			seen[sym] = struct{}{}
+		}
+	}
+
+	out := make([]string, 0, len(seen))
+	for sym := range seen {
+		out = append(out, sym)
+	}
+	return out
 }
 
 func (m *Manager) Resolve(symbol string) (*Runtime, bool) {
@@ -98,6 +142,25 @@ func (m *Manager) rebuild(snapshot loader.ProfileSnapshot) {
 				logger.Warnf("profile %s user prompt 模板解析失败: %v", def.Name, err)
 			}
 		}
+
+		// 创建动态 targets provider
+		var targetsProvider *coins.DynamicTargetsProvider
+		apiURL := strings.TrimSpace(def.TargetsAPIURL)
+		if apiURL != "" {
+			targetsProvider = coins.NewDynamicTargetsProvider(coins.DynamicTargetsConfig{
+				APIURL:         def.TargetsAPIURL,
+				Quote:          def.TargetsAPIQuote,
+				TimeoutSeconds: def.TargetsAPITimeoutSeconds,
+				RefreshSeconds: def.TargetsAPIRefreshSeconds,
+				Fallback:       def.Targets,
+				Override:       def.TargetsAPIOverride,
+			})
+			logger.Infof("✓ profile %s 启用动态 targets API: %s (override=%v, refresh=%ds)",
+				def.Name, def.TargetsAPIURL, def.TargetsAPIOverride, def.TargetsAPIRefreshSeconds)
+		} else {
+			logger.Infof("profile %s 使用静态 targets 列表 (%d 个)", def.Name, len(def.Targets))
+		}
+
 		rt := &Runtime{
 			Definition:           def,
 			Pipeline:             pipeline.New(name, mws...),
@@ -110,12 +173,19 @@ func (m *Manager) rebuild(snapshot loader.ProfileSnapshot) {
 			Derivatives:          def.Derivatives,
 			AgentEnabled:         def.AgentEnabled(),
 			KlineWindowsEnabled:  def.KlineWindowsEnabled(),
+			TargetsProvider:      targetsProvider,
 		}
 		newProfiles[name] = rt
 		if def.Default {
 			defaultRt = rt
 		}
-		for _, sym := range def.TargetsUpper() {
+
+		// 获取 targets 列表（静态或动态）
+		targets := def.TargetsUpper()
+		if targetsProvider != nil {
+			targets = targetsProvider.Targets()
+		}
+		for _, sym := range targets {
 			newIndex[sym] = rt
 		}
 	}

@@ -88,6 +88,30 @@ func summarizeImagePayloads(imgs []provider.ImagePayload) []string {
 	return out
 }
 
+func normalizeImagePayloads(imgs []provider.ImagePayload) []provider.ImagePayload {
+	if len(imgs) == 0 {
+		return nil
+	}
+	out := make([]provider.ImagePayload, 0, len(imgs))
+	for _, img := range imgs {
+		data := strings.TrimSpace(img.DataURI)
+		if data == "" {
+			continue
+		}
+		lower := strings.ToLower(data)
+		switch {
+		case strings.HasPrefix(lower, "data:"):
+			img.DataURI = data
+		case strings.HasPrefix(lower, "http://"), strings.HasPrefix(lower, "https://"):
+			img.DataURI = data
+		default:
+			img.DataURI = "data:image/png;base64," + data
+		}
+		out = append(out, img)
+	}
+	return out
+}
+
 func logAIInput(kind, providerID, purpose, systemPrompt, userPrompt string, imageNotes []string) {
 	if strings.TrimSpace(kind) == "" {
 		kind = "unknown"

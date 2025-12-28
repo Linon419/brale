@@ -31,6 +31,7 @@
                                 </div>
                 <div class="top-nav-links" :class="{'open': !navCollapsed || !isMobile}">
                     <button class="nav-item" :class="{active: view==='desk'}" @click="switchView('desk')">Desk · 总览</button>
+                    <button class="nav-item" :class="{active: view==='profiles'}" @click="switchView('profiles')">Profiles · 策略</button>
                     <button class="nav-item" :class="{active: view==='decisions'}" @click="switchView('decisions')">Blue Book · 决策</button>
                     <button class="nav-item" :class="{active: view==='positions'}" @click="switchView('positions')">Red Book · 仓位</button>
                     <button class="nav-item" :class="{active: view==='manualOpen'}" @click="switchView('manualOpen')">Manual · 手动开仓</button>
@@ -199,6 +200,142 @@
                         </div>
                     </div>
                 </section>
+
+                <!-- Profiles View -->
+                <section v-if="view==='profiles'" class="stack">
+                    <div class="notion-block">
+                        <div class="block-header">
+                            <div>
+                                <p class="notion-section-title">Profiles Management</p>
+                                <h2>策略配置管理</h2>
+                                <p class="muted">编辑 profiles.yaml 中的配置，修改后自动热加载</p>
+                            </div>
+                            <div class="actions">
+                                <button class="pill-btn" @click="loadProfiles" :disabled="profiles.loading">刷新</button>
+                                <button class="pill-btn primary" @click="openCreateProfile">新建 Profile</button>
+                            </div>
+                        </div>
+                        <div v-if="profiles.loading" class="block-skeleton">加载 Profiles...</div>
+                        <div v-else-if="profiles.error" class="callout error">[[ profiles.error ]]</div>
+                        <div v-else class="provider-grid">
+                            <div class="provider-card runtime-card" v-for="p in profiles.items" :key="p.name" @click="openEditProfile(p.name)">
+                                <div class="provider-card-header">
+                                    <div>
+                                        <p class="provider-name">[[ p.name ]]</p>
+                                        <p class="provider-time muted">[[ p.context_tag || 'No tag' ]]</p>
+                                    </div>
+                                    <span class="badge badge-neutral" v-if="p.default">Default</span>
+                                </div>
+                                <div class="runtime-section compact">
+                                    <div class="runtime-section-title">币种 ([[ p.targets ? p.targets.length : 0 ]])</div>
+                                    <div class="filter-tags compact">
+                                        <span class="tag" v-for="sym in (p.targets || []).slice(0, 8)" :key="sym">[[ sym ]]</span>
+                                        <span class="tag muted" v-if="p.targets && p.targets.length > 8">+[[ p.targets.length - 8 ]]</span>
+                                    </div>
+                                </div>
+                                <div class="runtime-section compact">
+                                    <div class="runtime-section-title">周期</div>
+                                    <div class="filter-tags compact">
+                                        <span class="tag" v-for="iv in (p.intervals || [])" :key="iv">[[ iv ]]</span>
+                                    </div>
+                                </div>
+                                <div class="runtime-section compact">
+                                    <div class="runtime-section-title">止盈止损</div>
+                                    <div class="runtime-combos">
+                                        <span class="runtime-pill primary" v-for="combo in (p.exit_plans?.combos || [])" :key="combo">[[ profileComboLabel(combo) ]]</span>
+                                        <span v-if="!p.exit_plans?.combos?.length" class="muted">未配置</span>
+                                    </div>
+                                </div>
+                                <div class="runtime-section compact">
+                                    <div class="runtime-section-title">Prompts</div>
+                                    <div class="runtime-prompts compact">
+                                        <div class="runtime-chip">
+                                            <p class="runtime-chip-label">User</p>
+                                            <p class="runtime-chip-value">[[ p.prompts?.user || '未配置' ]]</p>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                            <p v-if="!profiles.items.length" class="muted italic">暂无 Profile 配置。</p>
+                        </div>
+                    </div>
+                </section>
+
+                <!-- Profile Edit Modal -->
+                <div v-if="profileEdit.visible" class="image-modal" @click.self="closeProfileEdit">
+                    <div class="image-modal-content" style="max-width: 600px; max-height: 90vh; overflow-y: auto;">
+                        <h3 style="margin-bottom: 16px;">[[ profileEdit.isNew ? '新建 Profile' : '编辑 Profile: ' + profileEdit.name ]]</h3>
+
+                        <div v-if="profileEdit.error" class="callout error mb-3">[[ profileEdit.error ]]</div>
+
+                        <div class="form-group" v-if="profileEdit.isNew">
+                            <label class="form-label">Profile 名称</label>
+                            <input class="form-input" v-model="profileEdit.form.name" placeholder="例如: btc_aggressive">
+                        </div>
+
+                        <div class="form-group">
+                            <label class="form-label">显示名称 (Context Tag)</label>
+                            <input class="form-input" v-model="profileEdit.form.context_tag" placeholder="例如: BTC 激进策略">
+                        </div>
+
+                        <div class="form-group">
+                            <label class="form-label">币种列表 (每行一个或逗号分隔)</label>
+                            <textarea class="form-textarea" v-model="profileEdit.targetsText" rows="4" placeholder="BTC/USDT&#10;ETH/USDT&#10;SOL/USDT"></textarea>
+                        </div>
+
+                        <div class="form-group">
+                            <label class="form-label">决策频率倍数</label>
+                            <input type="number" class="form-input" v-model.number="profileEdit.form.decision_interval_multiple" min="1" max="10">
+                        </div>
+
+                        <div class="form-group">
+                            <label class="form-label">User Prompt 文件</label>
+                            <select class="form-select" v-model="profileEdit.form.prompts.user">
+                                <option value="">-- 选择 --</option>
+                                <option v-for="file in profiles.availablePrompts" :key="file" :value="file">[[ file ]]</option>
+                            </select>
+                        </div>
+
+                        <div class="form-group">
+                            <label class="form-label">止盈止损组合</label>
+                            <div class="filter-tags">
+                                <button
+                                    class="tag"
+                                    v-for="combo in profiles.availableCombos"
+                                    :key="combo"
+                                    :class="{active: profileEdit.form.exit_plans.combos.includes(combo)}"
+                                    @click="toggleProfileCombo(combo)">
+                                    [[ profileComboLabel(combo) ]]
+                                </button>
+                            </div>
+                        </div>
+
+                        <div class="form-group">
+                            <label class="form-label">
+                                <input type="checkbox" v-model="profileEdit.form.derivatives.enabled"> 启用衍生品数据
+                            </label>
+                            <div v-if="profileEdit.form.derivatives.enabled" style="margin-left: 20px; margin-top: 8px;">
+                                <label><input type="checkbox" v-model="profileEdit.form.derivatives.include_oi"> Open Interest</label>
+                                <label style="margin-left: 16px;"><input type="checkbox" v-model="profileEdit.form.derivatives.include_funding"> Funding Rate</label>
+                            </div>
+                        </div>
+
+                        <div class="form-group">
+                            <label class="form-label">
+                                <input type="checkbox" v-model="profileEdit.form.default"> 设为默认 Profile
+                            </label>
+                        </div>
+
+                        <div class="image-modal-actions">
+                            <button class="pill-btn danger" v-if="!profileEdit.isNew" @click="deleteProfile" :disabled="profileEdit.saving">删除</button>
+                            <div style="flex: 1;"></div>
+                            <button class="pill-btn" @click="closeProfileEdit">取消</button>
+                            <button class="pill-btn primary" @click="saveProfile" :disabled="profileEdit.saving">
+                                [[ profileEdit.saving ? '保存中...' : '保存' ]]
+                            </button>
+                        </div>
+                    </div>
+                </div>
 
                 <section v-if="view==='decisions'" class="stack">
                     <div class="notion-block">
@@ -1187,6 +1324,7 @@
         symbolDetails: {{ toJSON .SymbolDetails }},
         };
     </script>
+    <script src="/static/js/profile-manager.js"></script>
     <script src="/static/js/admin-app.js"></script>
 </body>
 

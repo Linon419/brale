@@ -22,9 +22,7 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
-      - type: bind
-        source: ${BRALE_DATA_ROOT:-./data/brale_data}
-        target: /data
+      - brale_data:/data
       - type: bind
         source: ./configs
         target: /app/configs
@@ -52,14 +50,14 @@ services:
       - "--strategy"
       - "BraleSharedStrategy"
     ports:
-      - "8080:8080"
+      - "8755:8755"
     dns:
       - 114.114.114.114
       - 8.8.8.8
     extra_hosts:
       - "host.docker.internal:host-gateway"
     healthcheck:
-      test: ["CMD", "curl", "-sf", "http://localhost:8080/api/v1/ping"]
+      test: ["CMD", "curl", "-sf", "http://localhost:8755/api/v1/ping"]
       interval: 10s
       timeout: 5s
       retries: 3
@@ -68,3 +66,6 @@ services:
       - type: bind
         source: ${FREQTRADE_USERDATA_ROOT:-./data/freqtrade_data}
         target: /freqtrade/user_data
+
+volumes:
+  brale_data:

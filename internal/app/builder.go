@@ -203,7 +203,29 @@ func (b *AppBuilder) Build(ctx context.Context) (*App, error) {
 	if freqManager != nil {
 		freqHandler = liveSvc
 	}
-	liveHTTPServe, err := b.liveHTTPFn(cfg.App, decArtifacts.store, freqHandler, profiles.symbols, convertSymbolDetails(symbolDetails))
+
+	// Collect available exit plan combos from all profiles
+	var availableCombos []string
+	comboSet := make(map[string]struct{})
+	for _, def := range profiles.snapshot.Profiles {
+		for _, combo := range def.ExitPlanCombos() {
+			if _, ok := comboSet[combo]; !ok {
+				comboSet[combo] = struct{}{}
+				availableCombos = append(availableCombos, combo)
+			}
+		}
+	}
+
+	liveHTTPServe, err := buildLiveHTTPServerFull(
+		cfg.App,
+		decArtifacts.store,
+		freqHandler,
+		profiles.symbols,
+		convertSymbolDetails(symbolDetails),
+		cfg.AI.ProfilesPath,
+		cfg.Prompt.Dir,
+		availableCombos,
+	)
 	if err != nil {
 		return nil, err
 	}
