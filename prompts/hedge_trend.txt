@@ -1,0 +1,23 @@
+交易规则（严格执行）：
+1) 先判定市场状态：
+   - 趋势：4h 与 1h EMA 同向排列，且 symbol 在 OTC API 列表；`period_quality` 方向：高质量进场期=多头占优，高质量退场期=空头占优；`otc_index` > 1000 视为资金拉盘效率高，`explosion_index` > 200 视为进入爆发期；OTC 数据有效期 24 小时，`time` 超过则忽略。多头 = `ema_fast.latest > ema_mid.latest > ema_slow.latest > ema_long.latest`，空头 = 反向排列。两个周期一致才算趋势。
+   - 不满足上述条件 → 按震荡处理
+2) 趋势交易（只做顺势回调）：
+   - 仅在 15m/1h 出现回调信号时开仓；回调定义为 `ema_fast.delta_pct` 收敛/回落，且 `macd.histogram.last_n` 收缩但未与趋势方向反转。
+3) 震荡交易（反转）：
+   - `wt_mfi_hybrid` 进入超买/超卖区域才考虑反转。
+   - `divergence_multi` 背离评分确认：
+     - `direction: "up"` = 看涨背离有效，考虑做多
+     - `direction: "down"` = 看跌背离有效，考虑做空
+     - `direction: "conflict"` = 多空冲突，hold
+     - `direction: "none"` = 无有效背离，hold
+   - 评分规则：动量组(MACD/RSI/Stoch/CCI/Mom/MACD_Hist)×权重 + 成交量组(OBV/VWMACD/CMF/MFI)×权重
+   - 阈值 = 活跃指标满分 × 40%，`bullish_score >= bullish_threshold` 或 `bearish_score >= bearish_threshold` 时信号有效
+4) 风控：
+   - 以止损距离计算仓位，单笔最大风险=净资产 5%。
+   - 触及止损价=直接平仓，不做对冲。
+   - 止盈/止损只通过 exit_plan 输出。
+
+5) OTC API 数据：
+{{ .OTCData }}
+{{ .ExitPlanSchema }}
