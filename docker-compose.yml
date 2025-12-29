@@ -36,9 +36,9 @@ services:
     image: freqtradeorg/freqtrade:stable
     # 更适合中国宝宝体制的配置
     #environment:
-      #HTTP_PROXY: http://host.docker.internal:10080
-      #HTTPS_PROXY: http://host.docker.internal:10080
-      #NO_PROXY: localhost,127.0.0.1,brale,freqtrade
+    #HTTP_PROXY: http://host.docker.internal:10080
+    #HTTPS_PROXY: http://host.docker.internal:10080
+    #NO_PROXY: localhost,127.0.0.1,brale,freqtrade
     command:
       - "trade"
       - "--logfile"
@@ -57,7 +57,7 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     healthcheck:
-      test: ["CMD", "curl", "-sf", "http://localhost:8755/api/v1/ping"]
+      test: [ "CMD", "curl", "-sf", "http://localhost:8755/api/v1/ping" ]
       interval: 10s
       timeout: 5s
       retries: 3
@@ -66,6 +66,30 @@ services:
       - type: bind
         source: ${FREQTRADE_USERDATA_ROOT:-./data/freqtrade_data}
         target: /freqtrade/user_data
+
+#  pair_sync:
+#    image: python:3.11-slim
+#    command: [ "python", "/app/scripts/sync_pair_whitelist.py" ]
+#    environment:
+#      BRALE_PROFILES_API: "http://brale:9991/api/profiles"
+#      FREQTRADE_API_URL: "http://freqtrade:8755/api/v1"
+#      FREQTRADE_CONFIG: "/freqtrade/user_data/freqtrade-config.json"
+#      SYNC_INTERVAL: "900"
+#      FREQTRADE_RELOAD: "true"
+#    depends_on:
+#      brale:
+#        condition: service_started
+#      freqtrade:
+#        condition: service_healthy
+#    restart: unless-stopped
+#    volumes:
+#      - type: bind
+#        source: ./scripts
+#        target: /app/scripts
+#        read_only: true
+#      - type: bind
+#        source: ${FREQTRADE_USERDATA_ROOT:-./data/freqtrade_data}
+#        target: /freqtrade/user_data
 
 volumes:
   brale_data:

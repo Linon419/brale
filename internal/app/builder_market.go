@@ -240,8 +240,8 @@ func collectIndicatorNeeds(mw cfgloader.MiddlewareConfig, intervalSet map[string
 
 	switch strings.ToLower(strings.TrimSpace(mw.Name)) {
 	case "ema_trend":
-		if maputil.Int(mw.Params, "fast") <= 0 || maputil.Int(mw.Params, "mid") <= 0 || maputil.Int(mw.Params, "slow") <= 0 {
-			return fmt.Errorf("ema_trend 需设置 fast/mid/slow")
+		if maputil.Int(mw.Params, "fast") <= 0 || maputil.Int(mw.Params, "mid") <= 0 || maputil.Int(mw.Params, "slow") <= 0 || maputil.Int(mw.Params, "long") <= 0 {
+			return fmt.Errorf("ema_trend 需设置 fast/mid/slow/long")
 		}
 	case "rsi_extreme":
 		if maputil.Int(mw.Params, "period") <= 0 {

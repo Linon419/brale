@@ -25,3 +25,4 @@ dist/
 *.o
 *.out
 *.test
+.ace-tool/

@@ -51,6 +51,7 @@ type CompositeInput struct {
 	Candles    map[string][]market.Candle
 	History    map[string][]market.Candle
 	Indicators map[string]indicator.Report
+	WTMFIByInterval map[string]indicator.WTMFISettings
 	Patterns   map[string]pattern.Result
 }
 
@@ -63,6 +64,7 @@ const (
 	colorEmaFast       = "#3b82f6"
 	colorEmaMid        = "#fbbf24"
 	colorEmaSlow       = "#f472b6"
+	colorEmaLong       = "#22c55e"
 	colorVolume        = "#a78bfa"
 	colorDIF           = "#22d3ee"
 	colorDEA           = "#fb7185"
@@ -245,9 +247,20 @@ func buildCompositeHTML(input CompositeInput) ([]byte, string, error) {
 		emaLine.SetXAxis(xAxis)
 		kline.Overlap(emaLine)
 
+		divergenceCharts := buildDivergenceScatter(xAxis, candles)
+		for _, divChart := range divergenceCharts {
+			kline.Overlap(divChart)
+		}
+
 		volume := buildVolumeChart(interval, xAxis, candles)
 		macdChart := buildMACDChart(interval, xAxis, candles, history)
-		wtmfiChart := buildWTMFIChart(interval, xAxis, candles)
+		wtmfiSettings := indicator.WTMFISettings{}
+		if input.WTMFIByInterval != nil {
+			if cfg, ok := input.WTMFIByInterval[strings.ToLower(interval)]; ok {
+				wtmfiSettings = cfg
+			}
+		}
+		wtmfiChart := buildWTMFIChart(interval, xAxis, candles, wtmfiSettings)
 
 		page.AddCharts(kline, volume, macdChart)
 		if wtmfiChart != nil {
@@ -308,12 +321,15 @@ func buildEMALine(interval string, candles []market.Candle, rep indicator.Report
 	fast := rep.Values["ema_fast"]
 	mid := rep.Values["ema_mid"]
 	slow := rep.Values["ema_slow"]
+	long := rep.Values["ema_long"]
 	emaFast := toLineData(fast.Series, len(candles))
 	emaMid := toLineData(mid.Series, len(candles))
 	emaSlow := toLineData(slow.Series, len(candles))
+	emaLong := toLineData(long.Series, len(candles))
 	line.AddSeries(emaLegendLabel(fast.Note, "EMA Fast"), emaFast, charts.WithLineStyleOpts(opts.LineStyle{Color: colorEmaFast, Width: 2}))
 	line.AddSeries(emaLegendLabel(mid.Note, "EMA Mid"), emaMid, charts.WithLineStyleOpts(opts.LineStyle{Color: colorEmaMid, Width: 2}))
 	line.AddSeries(emaLegendLabel(slow.Note, "EMA Slow"), emaSlow, charts.WithLineStyleOpts(opts.LineStyle{Color: colorEmaSlow, Width: 2}))
+	line.AddSeries(emaLegendLabel(long.Note, "EMA Long"), emaLong, charts.WithLineStyleOpts(opts.LineStyle{Color: colorEmaLong, Width: 2}))
 	return line
 }
 
@@ -426,13 +442,14 @@ func buildMACDChart(interval string, xAxis []string, candles []market.Candle, hi
 	return bar
 }
 
-func buildWTMFIChart(interval string, xAxis []string, candles []market.Candle) *charts.Line {
+func buildWTMFIChart(interval string, xAxis []string, candles []market.Candle, settings indicator.WTMFISettings) *charts.Line {
 	if len(candles) == 0 {
 		return nil
 	}
-	hybrid := calcWTMFIHybridSeries(candles)
-	overbought := wtmfiOverbought
-	oversold := wtmfiOversold
+	settings = indicator.NormalizeWTMFISettings(settings)
+	hybrid := indicator.WTMFIPostProcess(indicator.ComputeWTMFIHybridSeries(candles, settings), settings.SmoothLen)
+	overbought := settings.Overbought
+	oversold := settings.Oversold
 
 	line := charts.NewLine()
 	line.SetGlobalOptions(
@@ -460,6 +477,82 @@ func buildWTMFIChart(interval string, xAxis []string, candles []market.Candle) *
 	line.AddSeries("Oversold", constantLineData(oversold, len(candles)), charts.WithLineStyleOpts(opts.LineStyle{Color: colorTextSecondary, Type: "dashed", Width: 1}))
 	line.AddSeries("Zero", constantLineData(0, len(candles)), charts.WithLineStyleOpts(opts.LineStyle{Color: colorTextSecondary, Type: "dotted", Width: 1}))
 	return line
+}
+
+func buildDivergenceScatter(xAxis []string, candles []market.Candle) []*charts.Scatter {
+	if len(candles) == 0 {
+		return nil
+	}
+	signals := indicator.ComputeMultiDivSignals(candles)
+	if len(signals) == 0 {
+		return nil
+	}
+	posIdx := make(map[int]struct{})
+	negIdx := make(map[int]struct{})
+	for _, sig := range signals {
+		idx := len(candles) - 1 - sig.Distance
+		if idx < 0 || idx >= len(candles) {
+			continue
+		}
+		switch {
+		case strings.HasPrefix(sig.Type, "positive"):
+			posIdx[idx] = struct{}{}
+		case strings.HasPrefix(sig.Type, "negative"):
+			negIdx[idx] = struct{}{}
+		}
+	}
+	if len(posIdx) == 0 && len(negIdx) == 0 {
+		return nil
+	}
+
+	minPrice, maxPrice := priceBounds(candles)
+	pad := (maxPrice - minPrice) * 0.01
+	if pad <= 0 {
+		pad = math.Max(1, math.Abs(maxPrice)*0.005)
+	}
+
+	posData := make([]opts.ScatterData, len(candles))
+	negData := make([]opts.ScatterData, len(candles))
+	for idx := range posIdx {
+		val := candles[idx].Low - pad
+		posData[idx] = opts.ScatterData{Value: round(val, 4), Name: "div+"}
+	}
+	for idx := range negIdx {
+		val := candles[idx].High + pad
+		negData[idx] = opts.ScatterData{Value: round(val, 4), Name: "div-", SymbolRotate: 180}
+	}
+
+	var out []*charts.Scatter
+	if hasScatterData(posData) {
+		sc := charts.NewScatter()
+		sc.SetXAxis(xAxis)
+		sc.SetSeriesOptions(
+			charts.WithScatterChartOpts(opts.ScatterChart{Symbol: "triangle", SymbolSize: 10}),
+			charts.WithItemStyleOpts(opts.ItemStyle{Color: colorBull}),
+		)
+		sc.AddSeries("Div+", posData)
+		out = append(out, sc)
+	}
+	if hasScatterData(negData) {
+		sc := charts.NewScatter()
+		sc.SetXAxis(xAxis)
+		sc.SetSeriesOptions(
+			charts.WithScatterChartOpts(opts.ScatterChart{Symbol: "triangle", SymbolSize: 10}),
+			charts.WithItemStyleOpts(opts.ItemStyle{Color: colorBear}),
+		)
+		sc.AddSeries("Div-", negData)
+		out = append(out, sc)
+	}
+	return out
+}
+
+func hasScatterData(data []opts.ScatterData) bool {
+	for _, item := range data {
+		if item.Value != nil {
+			return true
+		}
+	}
+	return false
 }
 
 func toLineData(series []float64, length int) []opts.LineData {
@@ -503,69 +596,6 @@ func calcMACDSeries(candles []market.Candle) (dif, dea, hist []float64) {
 	}
 	dif, dea, hist = talib.Macd(closes, 12, 26, 9)
 	return dif, dea, hist
-}
-
-const (
-	wtmfiChannelLen = 10
-	wtmfiAvgLen     = 8
-	wtmfiSmoothLen  = 5
-	wtmfiMFILen     = 10
-	wtmfiWeight     = 0.3
-	wtmfiMFIScale   = 1.5
-	wtmfiOverbought = 50.0
-	wtmfiOversold   = -50.0
-)
-
-func calcWTMFIHybridSeries(candles []market.Candle) []float64 {
-	if len(candles) == 0 {
-		return nil
-	}
-	n := len(candles)
-	src := make([]float64, n)
-	highs := make([]float64, n)
-	lows := make([]float64, n)
-	closes := make([]float64, n)
-	volumes := make([]float64, n)
-	for i, c := range candles {
-		highs[i] = c.High
-		lows[i] = c.Low
-		closes[i] = c.Close
-		volumes[i] = c.Volume
-		src[i] = (c.High + c.Low + c.Close) / 3
-	}
-
-	esa := talib.Ema(src, wtmfiChannelLen)
-	absDiff := make([]float64, n)
-	for i := range src {
-		absDiff[i] = math.Abs(src[i] - esa[i])
-	}
-	d := talib.Ema(absDiff, wtmfiChannelLen)
-	ci := make([]float64, n)
-	for i := range src {
-		denom := 0.015 * d[i]
-		if denom == 0 {
-			ci[i] = 0
-			continue
-		}
-		ci[i] = (src[i] - esa[i]) / denom
-	}
-	wt1 := talib.Ema(ci, wtmfiAvgLen)
-	wt2 := almaSeries(wt1, wtmfiSmoothLen, 0.85, 6)
-	mfiSeries := talib.Mfi(highs, lows, closes, volumes, wtmfiMFILen)
-	hybrid := make([]float64, n)
-	for i := range hybrid {
-		mfiVal := (mfiSeries[i] - 50) * wtmfiMFIScale
-		hybrid[i] = wtmfiWeight*wt2[i] + (1-wtmfiWeight)*mfiVal
-	}
-
-	required := maxInt(wtmfiChannelLen, wtmfiAvgLen, wtmfiSmoothLen, wtmfiMFILen) + 1
-	if required > n {
-		required = n
-	}
-	for i := 0; i < required; i++ {
-		hybrid[i] = math.NaN()
-	}
-	return hybrid
 }
 
 func almaSeries(values []float64, length int, offset, sigma float64) []float64 {

@@ -22,6 +22,7 @@ type EMATrendConfig struct {
 	Fast     int
 	Mid      int
 	Slow     int
+	Long     int
 }
 
 type EMATrendMiddleware struct {
@@ -30,6 +31,7 @@ type EMATrendMiddleware struct {
 	fast     int
 	mid      int
 	slow     int
+	long     int
 }
 
 func NewEMATrend(cfg EMATrendConfig) *EMATrendMiddleware {
@@ -44,6 +46,7 @@ func NewEMATrend(cfg EMATrendConfig) *EMATrendMiddleware {
 		fast:     cfg.Fast,
 		mid:      cfg.Mid,
 		slow:     cfg.Slow,
+		long:     cfg.Long,
 	}
 }
 
@@ -57,6 +60,7 @@ func (m *EMATrendMiddleware) GetConfig() EMATrendConfig {
 		Fast:     m.fast,
 		Mid:      m.mid,
 		Slow:     m.slow,
+		Long:     m.long,
 	}
 }
 
@@ -75,7 +79,8 @@ func (m *EMATrendMiddleware) Handle(ctx context.Context, ac *pipeline.AnalysisCo
 	fast := strategy.EMA(closes, m.fast)
 	mid := strategy.EMA(closes, m.mid)
 	slow := strategy.EMA(closes, m.slow)
-	trend := strategy.ClassifyTrend(fast, mid, slow)
+	long := strategy.EMA(closes, m.long)
+	trend := strategy.ClassifyTrend4(fast, mid, slow, long)
 	trendLabel := map[string]string{
 		"UP":    "上升",
 		"DOWN":  "下行",
@@ -86,23 +91,26 @@ func (m *EMATrendMiddleware) Handle(ctx context.Context, ac *pipeline.AnalysisCo
 	}
 	spreadFastMid := fast - mid
 	spreadMidSlow := mid - slow
-	desc := fmt.Sprintf("周期 %s 的 EMA(%d/%d/%d) 原始数值：fast=%.4f、mid=%.4f、slow=%.4f",
-		strings.ToUpper(interval), m.fast, m.mid, m.slow, fast, mid, slow)
+	spreadSlowLong := slow - long
+	desc := fmt.Sprintf("周期 %s 的 EMA(%d/%d/%d/%d) 原始数值：fast=%.4f、mid=%.4f、slow=%.4f、long=%.4f",
+		strings.ToUpper(interval), m.fast, m.mid, m.slow, m.long, fast, mid, slow, long)
 	ac.AddFeature(pipeline.Feature{
 		Key:         "ema_trend",
 		Label:       fmt.Sprintf("%s EMA", strings.ToUpper(interval)),
-		Value:       fast - slow,
+		Value:       fast - long,
 		Description: formatFeature(ac.Symbol, desc),
 		Metadata: map[string]any{
 			"interval":        interval,
 			"ema_fast":        fast,
 			"ema_mid":         mid,
 			"ema_slow":        slow,
+			"ema_long":        long,
 			"spread_fast_mid": spreadFastMid,
 			"spread_mid_slow": spreadMidSlow,
+			"spread_slow_long": spreadSlowLong,
 			"trend":           trend,
 			"trend_label":     trendLabel,
-			"pivots":          emaPivots(candles, m.fast, m.mid, m.slow),
+			"pivots":          emaPivots(candles, m.fast, m.mid, m.slow, m.long),
 		},
 	})
 	return nil
@@ -114,36 +122,41 @@ type emaPivot struct {
 	Val  float64 `json:"value"`
 }
 
-func emaPivots(candles []market.Candle, fastPeriod, midPeriod, slowPeriod int) []emaPivot {
+func emaPivots(candles []market.Candle, fastPeriod, midPeriod, slowPeriod, longPeriod int) []emaPivot {
 	if len(candles) == 0 {
 		return nil
 	}
-	if !sufficientEmaHistory(candles, fastPeriod, midPeriod, slowPeriod) {
+	if !sufficientEmaHistory(candles, fastPeriod, midPeriod, slowPeriod, longPeriod) {
 		return nil
 	}
 	closes := closes(candles)
 	fastArr := talib.Ema(closes, fastPeriod)
 	midArr := talib.Ema(closes, midPeriod)
 	slowArr := talib.Ema(closes, slowPeriod)
+	longArr := talib.Ema(closes, longPeriod)
 	pivots := make([]emaPivot, 0, 4)
 
-	// We cap pivot count to avoid flooding the prompt (fast-mid up to 8; mid-slow up to 12).
+	// We cap pivot count to avoid flooding the prompt (fast-mid up to 8; mid-slow up to 12; slow-long up to 16).
 	appendFastMidPivots(candles, fastArr, midArr, &pivots)
 	appendMidSlowPivots(candles, midArr, slowArr, &pivots)
+	appendSlowLongPivots(candles, slowArr, longArr, &pivots)
 	return pivots
 }
 
-func sufficientEmaHistory(candles []market.Candle, fastPeriod, midPeriod, slowPeriod int) bool {
-	maxPeriod := max3(fastPeriod, midPeriod, slowPeriod)
+func sufficientEmaHistory(candles []market.Candle, fastPeriod, midPeriod, slowPeriod, longPeriod int) bool {
+	maxPeriod := max4(fastPeriod, midPeriod, slowPeriod, longPeriod)
 	return maxPeriod > 0 && len(candles) >= maxPeriod
 }
 
-func max3(a, b, c int) int {
+func max4(a, b, c, d int) int {
 	if a < b {
 		a = b
 	}
 	if a < c {
-		return c
+		a = c
+	}
+	if a < d {
+		return d
 	}
 	return a
 }
@@ -170,6 +183,19 @@ func appendMidSlowPivots(candles []market.Candle, midArr, slowArr []float64, piv
 		prev := midArr[i-1] - slowArr[i-1]
 		if (cur >= 0 && prev < 0) || (cur <= 0 && prev > 0) {
 			appendPivot(candles, i, "mid-slow crossover", midArr[i], pivots)
+		}
+	}
+}
+
+func appendSlowLongPivots(candles []market.Candle, slowArr, longArr []float64, pivots *[]emaPivot) {
+	if len(longArr) < len(candles) || pivots == nil {
+		return
+	}
+	for i := len(longArr) - 1; i > 1 && len(*pivots) < 16; i-- {
+		cur := slowArr[i] - longArr[i]
+		prev := slowArr[i-1] - longArr[i-1]
+		if (cur >= 0 && prev < 0) || (cur <= 0 && prev > 0) {
+			appendPivot(candles, i, "slow-long crossover", slowArr[i], pivots)
 		}
 	}
 }

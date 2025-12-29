@@ -14,18 +14,31 @@ type Settings struct {
 	Interval string
 	EMA      EMASettings
 	RSI      RSISettings
+	WTMFI    WTMFISettings
 }
 
 type EMASettings struct {
 	Fast int `json:"fast,omitempty"`
 	Mid  int `json:"mid,omitempty"`
 	Slow int `json:"slow,omitempty"`
+	Long int `json:"long,omitempty"`
 }
 
 type RSISettings struct {
 	Period     int     `json:"period,omitempty"`
 	Oversold   float64 `json:"oversold,omitempty"`
 	Overbought float64 `json:"overbought,omitempty"`
+}
+
+type WTMFISettings struct {
+	ChannelLen int     `json:"channel_len,omitempty"`
+	AvgLen     int     `json:"avg_len,omitempty"`
+	SmoothLen  int     `json:"smooth_len,omitempty"`
+	MFILen     int     `json:"mfi_len,omitempty"`
+	WTWeight   float64 `json:"wt_weight,omitempty"`
+	MFIScale   float64 `json:"mfi_scale,omitempty"`
+	Overbought float64 `json:"overbought,omitempty"`
+	Oversold   float64 `json:"oversold,omitempty"`
 }
 
 type IndicatorValue struct {
@@ -68,14 +81,18 @@ func ComputeAll(candles []market.Candle, cfg Settings) (Report, error) {
 		cfg.EMA.Fast = 21
 	}
 	if cfg.EMA.Mid <= 0 {
-		cfg.EMA.Mid = 50
+		cfg.EMA.Mid = 55
 	}
 	if cfg.EMA.Slow <= 0 {
-		cfg.EMA.Slow = 200
+		cfg.EMA.Slow = 100
+	}
+	if cfg.EMA.Long <= 0 {
+		cfg.EMA.Long = 200
 	}
 	emaFast := trimEMALeadingZeros(sanitizeSeries(talib.Ema(closes, cfg.EMA.Fast)))
 	emaMid := trimEMALeadingZeros(sanitizeSeries(talib.Ema(closes, cfg.EMA.Mid)))
 	emaSlow := trimEMALeadingZeros(sanitizeSeries(talib.Ema(closes, cfg.EMA.Slow)))
+	emaLong := trimEMALeadingZeros(sanitizeSeries(talib.Ema(closes, cfg.EMA.Long)))
 	lastClose := closes[len(closes)-1]
 	rep.Values["ema_fast"] = IndicatorValue{
 		Latest: lastValid(emaFast),
@@ -94,6 +111,12 @@ func ComputeAll(candles []market.Candle, cfg Settings) (Report, error) {
 		Series: emaSlow,
 		State:  relativeState(lastClose, lastValid(emaSlow)),
 		Note:   fmt.Sprintf("EMA%d vs price", cfg.EMA.Slow),
+	}
+	rep.Values["ema_long"] = IndicatorValue{
+		Latest: lastValid(emaLong),
+		Series: emaLong,
+		State:  relativeState(lastClose, lastValid(emaLong)),
+		Note:   fmt.Sprintf("EMA%d vs price", cfg.EMA.Long),
 	}
 
 	if cfg.RSI.Period <= 0 {
@@ -177,6 +200,33 @@ func ComputeAll(candles []market.Candle, cfg Settings) (Report, error) {
 		Note:   "volume thrust",
 	}
 
+	wtmfiSettings := NormalizeWTMFISettings(cfg.WTMFI)
+	wtmfiSeries := sanitizeSeries(WTMFIPostProcess(calcWTMFIHybridSeries(highs, lows, closes, volumes, wtmfiSettings), wtmfiSettings.SmoothLen))
+	if len(wtmfiSeries) > 0 {
+		wtmfiVal := lastValid(wtmfiSeries)
+		wtmfiState := "neutral"
+		switch {
+		case wtmfiVal >= wtmfiSettings.Overbought:
+			wtmfiState = "overbought"
+		case wtmfiVal <= wtmfiSettings.Oversold:
+			wtmfiState = "oversold"
+		}
+		rep.Values["wt_mfi_hybrid"] = IndicatorValue{
+			Latest: wtmfiVal,
+			Series: wtmfiSeries,
+			State:  wtmfiState,
+			Note: fmt.Sprintf(
+				"len=%d/%d/%d mfi=%d wt=%.2f scale=%.2f",
+				wtmfiSettings.ChannelLen,
+				wtmfiSettings.AvgLen,
+				wtmfiSettings.SmoothLen,
+				wtmfiSettings.MFILen,
+				wtmfiSettings.WTWeight,
+				wtmfiSettings.MFIScale,
+			),
+		}
+	}
+
 	return rep, nil
 }
 
@@ -200,6 +250,233 @@ func ComputeATRSeries(candles []market.Candle, period int) ([]float64, error) {
 		return nil, fmt.Errorf("atr series empty")
 	}
 	return series, nil
+}
+
+const (
+	wtmfiChannelLen = 10
+	wtmfiAvgLen     = 8
+	wtmfiSmoothLen  = 5
+	wtmfiMFILen     = 10
+	wtmfiWeight     = 0.3
+	wtmfiMFIScale   = 1.5
+	wtmfiOverbought = 50.0
+	wtmfiOversold   = -50.0
+
+	wtmfiPostMult          = 1.2
+	wtmfiPostUseSigmoid    = false
+	wtmfiPostSigmoidGain   = 2.2
+	wtmfiPostOscMax        = 60.0
+	wtmfiPostOscMin        = -60.0
+	wtmfiPostStepSize      = 6.6
+	wtmfiPostQuantize      = true
+	wtmfiPostStepMethod    = "ROUND"
+)
+
+func NormalizeWTMFISettings(in WTMFISettings) WTMFISettings {
+	out := in
+	if out.ChannelLen <= 0 {
+		out.ChannelLen = wtmfiChannelLen
+	}
+	if out.AvgLen <= 0 {
+		out.AvgLen = wtmfiAvgLen
+	}
+	if out.SmoothLen <= 0 {
+		out.SmoothLen = wtmfiSmoothLen
+	}
+	if out.MFILen <= 0 {
+		out.MFILen = wtmfiMFILen
+	}
+	if out.WTWeight <= 0 {
+		out.WTWeight = wtmfiWeight
+	}
+	if out.MFIScale <= 0 {
+		out.MFIScale = wtmfiMFIScale
+	}
+	if out.Overbought == 0 {
+		out.Overbought = wtmfiOverbought
+	}
+	if out.Oversold == 0 {
+		out.Oversold = wtmfiOversold
+	}
+	return out
+}
+
+func ComputeWTMFIHybridSeries(candles []market.Candle, settings WTMFISettings) []float64 {
+	if len(candles) == 0 {
+		return nil
+	}
+	highs := make([]float64, len(candles))
+	lows := make([]float64, len(candles))
+	closes := make([]float64, len(candles))
+	volumes := make([]float64, len(candles))
+	for i, c := range candles {
+		highs[i] = c.High
+		lows[i] = c.Low
+		closes[i] = c.Close
+		volumes[i] = c.Volume
+	}
+	return calcWTMFIHybridSeries(highs, lows, closes, volumes, settings)
+}
+
+func calcWTMFIHybridSeries(highs, lows, closes, volumes []float64, settings WTMFISettings) []float64 {
+	if len(closes) == 0 {
+		return nil
+	}
+	settings = NormalizeWTMFISettings(settings)
+	n := len(closes)
+	src := make([]float64, n)
+	for i := range closes {
+		src[i] = (highs[i] + lows[i] + closes[i]) / 3
+	}
+
+	esa := talib.Ema(src, settings.ChannelLen)
+	absDiff := make([]float64, n)
+	for i := range src {
+		absDiff[i] = math.Abs(src[i] - esa[i])
+	}
+	d := talib.Ema(absDiff, settings.ChannelLen)
+	ci := make([]float64, n)
+	for i := range src {
+		denom := 0.015 * d[i]
+		if denom == 0 {
+			ci[i] = 0
+			continue
+		}
+		ci[i] = (src[i] - esa[i]) / denom
+	}
+	wt1 := talib.Ema(ci, settings.AvgLen)
+	wt2 := almaSeries(wt1, settings.SmoothLen, 0.85, 6)
+	mfiSeries := talib.Mfi(highs, lows, closes, volumes, settings.MFILen)
+	hybrid := make([]float64, n)
+	for i := range hybrid {
+		mfiVal := (mfiSeries[i] - 50) * settings.MFIScale
+		hybrid[i] = settings.WTWeight*wt2[i] + (1-settings.WTWeight)*mfiVal
+	}
+
+	required := maxInt(settings.ChannelLen, settings.AvgLen, settings.SmoothLen, settings.MFILen) + 1
+	if required > n {
+		required = n
+	}
+	for i := 0; i < required; i++ {
+		hybrid[i] = math.NaN()
+	}
+	return hybrid
+}
+
+func WTMFIPostProcess(series []float64, smoothLen int) []float64 {
+	if len(series) == 0 {
+		return nil
+	}
+	if smoothLen <= 0 {
+		smoothLen = wtmfiSmoothLen
+	}
+	processed := make([]float64, len(series))
+	for i, v := range series {
+		if math.IsNaN(v) || math.IsInf(v, 0) {
+			processed[i] = math.NaN()
+			continue
+		}
+		val := v * wtmfiPostMult
+		if wtmfiPostUseSigmoid {
+			val = wtmfiSigmoid(val, wtmfiPostSigmoidGain)
+		}
+		processed[i] = val
+	}
+
+	smoothed := almaSeries(processed, smoothLen, 0.85, 6)
+	out := make([]float64, len(series))
+	for i, v := range smoothed {
+		if i < smoothLen-1 || math.IsNaN(v) || math.IsInf(v, 0) || math.IsNaN(processed[i]) {
+			out[i] = math.NaN()
+			continue
+		}
+		val := clamp(v, wtmfiPostOscMin, wtmfiPostOscMax)
+		if wtmfiPostQuantize && wtmfiPostStepSize > 0 {
+			val = quantizeStep(val, wtmfiPostStepSize, wtmfiPostStepMethod)
+			val = clamp(val, wtmfiPostOscMin, wtmfiPostOscMax)
+		}
+		out[i] = val
+	}
+	return out
+}
+
+func almaSeries(values []float64, length int, offset, sigma float64) []float64 {
+	out := make([]float64, len(values))
+	if length <= 0 || len(values) == 0 {
+		return out
+	}
+	m := offset * float64(length-1)
+	s := float64(length) / sigma
+	denom := 2 * s * s
+	for i := range values {
+		if i+1 < length {
+			out[i] = 0
+			continue
+		}
+		sum := 0.0
+		wSum := 0.0
+		for j := 0; j < length; j++ {
+			idx := i - length + 1 + j
+			w := math.Exp(-((float64(j) - m) * (float64(j) - m)) / denom)
+			sum += w * values[idx]
+			wSum += w
+		}
+		if wSum == 0 {
+			out[i] = 0
+		} else {
+			out[i] = sum / wSum
+		}
+	}
+	return out
+}
+
+func wtmfiSigmoid(val, gain float64) float64 {
+	scaled := val / 100.0
+	sig := 2.0/(1.0+math.Exp(-gain*scaled)) - 1.0
+	return sig * 100.0
+}
+
+func clamp(val, minVal, maxVal float64) float64 {
+	if val < minVal {
+		return minVal
+	}
+	if val > maxVal {
+		return maxVal
+	}
+	return val
+}
+
+func quantizeStep(val, step float64, method string) float64 {
+	if step <= 0 {
+		return val
+	}
+	scaled := val / step
+	absScaled := math.Abs(scaled)
+	var steps float64
+	switch method {
+	case "FLOOR":
+		steps = math.Floor(absScaled)
+	default:
+		steps = math.Round(absScaled)
+	}
+	quantized := steps * step
+	if scaled < 0 {
+		quantized = -quantized
+	}
+	return quantized
+}
+
+func maxInt(values ...int) int {
+	if len(values) == 0 {
+		return 0
+	}
+	maxVal := values[0]
+	for _, v := range values[1:] {
+		if v > maxVal {
+			maxVal = v
+		}
+	}
+	return maxVal
 }
 
 func sanitizeSeries(src []float64) []float64 {

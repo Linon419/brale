@@ -51,6 +51,7 @@ type profilePromptData struct {
 	MiddlewareFeatures string
 	Features           string
 	ExitPlanSchema     string
+	OTCData            string
 }
 
 func (s *StandardStrategy) buildProfilePromptBundle(active map[string]*profile.Runtime, featureLines map[string][]string) decision.PromptBundle {
@@ -74,6 +75,7 @@ func (s *StandardStrategy) buildProfilePromptBundle(active map[string]*profile.R
 				ContextTag:         rt.Definition.ContextTag,
 				Targets:            append([]string(nil), rt.Definition.Targets...),
 				MiddlewareFeatures: strings.Join(featureLines[name], "\n"),
+				OTCData:            formatOTCData(rt),
 			}
 			data.Features = data.MiddlewareFeatures
 			dir := s.resolveProfileExitDirective(rt)
@@ -278,6 +280,54 @@ func uniqueComboKeys(runtimes []*profile.Runtime) []string {
 	}
 	sort.Strings(keys)
 	return keys
+}
+
+func formatOTCData(rt *profile.Runtime) string {
+	if rt == nil || rt.TargetsProvider == nil {
+		return "OTC API: unavailable"
+	}
+	items := rt.TargetsProvider.OTCItems()
+	if len(items) == 0 {
+		return "OTC API: empty"
+	}
+	targets := rt.TargetsProvider.Targets()
+	if len(targets) == 0 {
+		targets = rt.Definition.TargetsUpper()
+	}
+	targetSet := make(map[string]struct{}, len(targets))
+	for _, sym := range targets {
+		targetSet[strings.ToUpper(strings.TrimSpace(sym))] = struct{}{}
+	}
+
+	lines := make([]string, 0, len(items))
+	for _, item := range items {
+		symbol := strings.ToUpper(strings.TrimSpace(item.Symbol))
+		if symbol == "" {
+			continue
+		}
+		if len(targetSet) > 0 {
+			if _, ok := targetSet[symbol]; !ok {
+				continue
+			}
+		}
+		prev := "null"
+		if item.PreviousExplosionIndex != nil {
+			prev = fmt.Sprintf("%.2f", *item.PreviousExplosionIndex)
+		}
+		period := strings.TrimSpace(item.PeriodQuality)
+		timestamp := strings.TrimSpace(item.Time)
+		if timestamp == "" {
+			timestamp = "-"
+		}
+		line := fmt.Sprintf("- %s: otc_index=%.2f explosion_index=%.2f previous_explosion_index=%s period_quality=%q time=%s",
+			symbol, item.OTCIndex, item.ExplosionIndex, prev, period, timestamp)
+		lines = append(lines, line)
+	}
+	if len(lines) == 0 {
+		return "OTC API: empty"
+	}
+	sort.Strings(lines)
+	return "OTC API snapshot:\n" + strings.Join(lines, "\n")
 }
 
 func formatExitPlanConstraints(prompts []promptkit.ExitPlanPrompt) string {

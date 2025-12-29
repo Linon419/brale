@@ -45,3 +45,14 @@ func ClassifyTrend(fast, mid, slow float64) string {
 		return "MIXED"
 	}
 }
+
+func ClassifyTrend4(fast, mid, slow, long float64) string {
+	switch {
+	case fast >= mid && mid >= slow && slow >= long:
+		return "UP"
+	case fast <= mid && mid <= slow && slow <= long:
+		return "DOWN"
+	default:
+		return "MIXED"
+	}
+}

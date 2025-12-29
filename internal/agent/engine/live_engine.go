@@ -375,6 +375,24 @@ func (e *LiveEngine) applyTradingDefaults(d *decision.Decision) {
 			d.PositionSizeUSD = size
 		}
 	}
+	e.applyLeverageCap(d)
+}
+
+func (e *LiveEngine) applyLeverageCap(d *decision.Decision) {
+	if e == nil || d == nil || e.ProfileMgr == nil {
+		return
+	}
+	rt, ok := e.ProfileMgr.Resolve(d.Symbol)
+	if !ok || rt == nil {
+		return
+	}
+	cfg := rt.Definition.Leverage
+	if !cfg.Enabled || cfg.Max <= 0 {
+		return
+	}
+	if d.Leverage > cfg.Max {
+		d.Leverage = cfg.Max
+	}
 }
 
 func (e *LiveEngine) handleUpdateExitPlan(ctx context.Context, traceID string, d decision.Decision) error {

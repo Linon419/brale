@@ -7,10 +7,12 @@ import (
 	"sync"
 	"time"
 
+	"brale/internal/analysis/indicator"
 	"brale/internal/agent/interfaces"
 	"brale/internal/config"
 	"brale/internal/decision"
 	"brale/internal/market"
+	"brale/internal/pkg/maputil"
 	"brale/internal/profile"
 	"brale/internal/store"
 )
@@ -89,6 +91,8 @@ func (s *Service) GetAnalysisContexts(ctx context.Context, symbols []string) ([]
 			intervals = []string{"1h"}
 		}
 
+		emaByInterval := collectEMAByInterval(rt)
+		wtmfiByInterval := collectWTMFIByInterval(rt)
 		input := decision.AnalysisBuildInput{
 			Context:           ctx,
 			Exporter:          exporter,
@@ -99,6 +103,8 @@ func (s *Service) GetAnalysisContexts(ctx context.Context, symbols []string) ([]
 			SliceDrop:         rt.SliceDropTail,
 			HorizonName:       s.horizonName,
 			IndicatorLookback: rt.IndicatorBars,
+			EMAByInterval:     emaByInterval,
+			WTMFIByInterval:   wtmfiByInterval,
 			WithImages:        s.visionReady,
 			DisableIndicators: !rt.AgentEnabled,
 			RequireATR:        profileNeedsATR(rt),
@@ -106,6 +112,84 @@ func (s *Service) GetAnalysisContexts(ctx context.Context, symbols []string) ([]
 		out = append(out, decision.BuildAnalysisContexts(input)...)
 	}
 	return out, nil
+}
+
+func collectEMAByInterval(rt *profile.Runtime) map[string]indicator.EMASettings {
+	if rt == nil {
+		return nil
+	}
+	middlewares := rt.Definition.Middlewares
+	if len(middlewares) == 0 {
+		return nil
+	}
+	out := make(map[string]indicator.EMASettings)
+	for _, mw := range middlewares {
+		if strings.ToLower(strings.TrimSpace(mw.Name)) != "ema_trend" {
+			continue
+		}
+		interval := strings.ToLower(strings.TrimSpace(maputil.String(mw.Params, "interval")))
+		if interval == "" {
+			continue
+		}
+		settings := indicator.EMASettings{
+			Fast: maputil.Int(mw.Params, "fast"),
+			Mid:  maputil.Int(mw.Params, "mid"),
+			Slow: maputil.Int(mw.Params, "slow"),
+			Long: maputil.Int(mw.Params, "long"),
+		}
+		if settings.Fast <= 0 || settings.Mid <= 0 || settings.Slow <= 0 || settings.Long <= 0 {
+			continue
+		}
+		out[interval] = settings
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func collectWTMFIByInterval(rt *profile.Runtime) map[string]indicator.WTMFISettings {
+	if rt == nil {
+		return nil
+	}
+	middlewares := rt.Definition.Middlewares
+	if len(middlewares) == 0 {
+		return nil
+	}
+	out := make(map[string]indicator.WTMFISettings)
+	for _, mw := range middlewares {
+		if strings.ToLower(strings.TrimSpace(mw.Name)) != "wt_mfi_hybrid" {
+			continue
+		}
+		interval := strings.ToLower(strings.TrimSpace(maputil.String(mw.Params, "interval")))
+		if interval == "" {
+			continue
+		}
+		channelLen := maputil.Int(mw.Params, "len")
+		if channelLen <= 0 {
+			channelLen = maputil.Int(mw.Params, "channel_len")
+		}
+		settings := indicator.WTMFISettings{
+			ChannelLen: channelLen,
+			AvgLen:     maputil.Int(mw.Params, "avg_len"),
+			SmoothLen:  maputil.Int(mw.Params, "smooth_len"),
+			MFILen:     maputil.Int(mw.Params, "mfi_len"),
+			WTWeight:   maputil.Float(mw.Params, "wt_weight"),
+			MFIScale:   maputil.Float(mw.Params, "mfi_scale"),
+			Overbought: maputil.Float(mw.Params, "overbought"),
+			Oversold:   maputil.Float(mw.Params, "oversold"),
+		}
+		if settings.ChannelLen <= 0 && settings.AvgLen <= 0 && settings.SmoothLen <= 0 &&
+			settings.MFILen <= 0 && settings.WTWeight <= 0 && settings.MFIScale <= 0 &&
+			settings.Overbought == 0 && settings.Oversold == 0 {
+			continue
+		}
+		out[interval] = settings
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 func (s *Service) LatestPrice(ctx context.Context, symbol string) float64 {

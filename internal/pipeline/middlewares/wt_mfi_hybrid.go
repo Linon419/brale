@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"brale/internal/analysis/indicator"
 	"brale/internal/market"
 	"brale/internal/pipeline"
 
@@ -223,12 +224,14 @@ func (m *WTMFIHybridMiddleware) Handle(ctx context.Context, ac *pipeline.Analysi
 		hybrid[i] = m.wtWeight*wt2[i] + (1-m.wtWeight)*mfiVal
 	}
 
+	osc := indicator.WTMFIPostProcess(hybrid, m.smoothLen)
+
 	volZ := volumeZScore(volumes, m.volLen)
 	atr := talib.Atr(highs, lows, closes, m.atrLen)
 	adx := talib.Adx(highs, lows, closes, m.adxLen)
 
 	divBull, divBear := detectDivergences(divergenceInput{
-		osc:                  hybrid,
+		osc:                  osc,
 		opens:                opens,
 		highs:                highs,
 		lows:                 lows,
@@ -256,8 +259,8 @@ func (m *WTMFIHybridMiddleware) Handle(ctx context.Context, ac *pipeline.Analysi
 		volTrigger:           m.volTrigger,
 	})
 
-	idx := len(hybrid) - 1
-	latest := hybrid[idx]
+	idx := len(osc) - 1
+	latest := osc[idx]
 	status := "NEUTRAL"
 	if latest >= m.overbought {
 		status = "OVERBOUGHT"
@@ -287,7 +290,7 @@ func (m *WTMFIHybridMiddleware) Handle(ctx context.Context, ac *pipeline.Analysi
 			"status":       status,
 			"latest_value": latest,
 			"latest_time":  candleTimeUTC(candles, idx),
-			"series_tail":  seriesTail(hybrid, 5),
+			"series_tail":  seriesTail(osc, 5),
 			"volume_zscore": func() float64 {
 				if len(volZ) == 0 {
 					return 0

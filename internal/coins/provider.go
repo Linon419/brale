@@ -123,7 +123,21 @@ type OTCCoinItem struct {
 	Symbol        string  `json:"symbol"`
 	Name          string  `json:"name"`
 	OTCIndex      float64 `json:"otc_index"`
+	ExplosionIndex float64 `json:"explosion_index"`
+	PreviousExplosionIndex *float64 `json:"previous_explosion_index"`
 	PeriodQuality string  `json:"period_quality"`
+	Time          string  `json:"time"`
+}
+
+// OTCTargetItem stores normalized OTC API data for prompt rendering.
+type OTCTargetItem struct {
+	Symbol                 string
+	Name                   string
+	OTCIndex               float64
+	ExplosionIndex         float64
+	PreviousExplosionIndex *float64
+	PeriodQuality          string
+	Time                   string
 }
 
 // DynamicTargetsProvider 动态从 API 获取交易币种，支持自动刷新和 fallback
@@ -137,6 +151,7 @@ type DynamicTargetsProvider struct {
 
 	mu          sync.RWMutex
 	targets     []string
+	otcItems    []OTCTargetItem
 	lastFetched time.Time
 	lastErr     error
 }
@@ -198,6 +213,15 @@ func (p *DynamicTargetsProvider) Targets() []string {
 	return out
 }
 
+// OTCItems returns the last OTC API item snapshot (normalized with quote symbols).
+func (p *DynamicTargetsProvider) OTCItems() []OTCTargetItem {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	out := make([]OTCTargetItem, len(p.otcItems))
+	copy(out, p.otcItems)
+	return out
+}
+
 // Refresh 从 API 刷新币种列表
 func (p *DynamicTargetsProvider) Refresh(ctx context.Context) error {
 	if p.apiURL == "" {
@@ -213,7 +237,7 @@ func (p *DynamicTargetsProvider) Refresh(ctx context.Context) error {
 		return nil
 	}
 
-	symbols, err := p.fetchFromAPI(ctx)
+	symbols, items, err := p.fetchFromAPI(ctx)
 	if err != nil {
 		p.mu.Lock()
 		p.lastErr = err
@@ -232,6 +256,7 @@ func (p *DynamicTargetsProvider) Refresh(ctx context.Context) error {
 		// 合并模式：API 结果 + fallback 去重
 		p.targets = mergeAndDedup(symbols, p.fallback)
 	}
+	p.otcItems = items
 	p.lastFetched = time.Now()
 	p.lastErr = nil
 
@@ -240,46 +265,72 @@ func (p *DynamicTargetsProvider) Refresh(ctx context.Context) error {
 }
 
 // fetchFromAPI 从 OTC API 获取数据
-func (p *DynamicTargetsProvider) fetchFromAPI(ctx context.Context) ([]string, error) {
+func (p *DynamicTargetsProvider) fetchFromAPI(ctx context.Context) ([]string, []OTCTargetItem, error) {
 	reqCtx, cancel := context.WithTimeout(ctx, p.timeout)
 	defer cancel()
 
 	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, p.apiURL, nil)
 	if err != nil {
-		return nil, fmt.Errorf("create request failed: %w", err)
+		return nil, nil, fmt.Errorf("create request failed: %w", err)
 	}
 
 	client := &http.Client{Timeout: p.timeout}
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("API request failed: %w", err)
+		return nil, nil, fmt.Errorf("API request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("API returned status %d", resp.StatusCode)
+		return nil, nil, fmt.Errorf("API returned status %d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, nil, fmt.Errorf("read response failed: %w", err)
 	}
 
 	var apiResp OTCAPIResponse
-	if err := json.NewDecoder(resp.Body).Decode(&apiResp); err != nil {
-		return nil, fmt.Errorf("decode response failed: %w", err)
-	}
-
-	if !apiResp.Success {
-		return nil, fmt.Errorf("API returned success=false")
-	}
-
-	symbols := make([]string, 0, len(apiResp.Items))
-	for _, item := range apiResp.Items {
-		sym := strings.ToUpper(strings.TrimSpace(item.Symbol))
-		if sym == "" {
-			continue
+	if err := json.Unmarshal(body, &apiResp); err == nil && (len(apiResp.Items) > 0 || apiResp.Success) {
+		if !apiResp.Success {
+			return nil, nil, fmt.Errorf("API returned success=false")
 		}
-		// 添加 quote 后缀，例如 BTC -> BTC/USDT
-		symbols = append(symbols, fmt.Sprintf("%s/%s", sym, p.quote))
+		symbols := make([]string, 0, len(apiResp.Items))
+		items := make([]OTCTargetItem, 0, len(apiResp.Items))
+		for _, item := range apiResp.Items {
+			sym := strings.ToUpper(strings.TrimSpace(item.Symbol))
+			if sym == "" {
+				continue
+			}
+			full := fmt.Sprintf("%s/%s", sym, p.quote)
+			symbols = append(symbols, full)
+			items = append(items, OTCTargetItem{
+				Symbol:                 full,
+				Name:                   item.Name,
+				OTCIndex:               item.OTCIndex,
+				ExplosionIndex:         item.ExplosionIndex,
+				PreviousExplosionIndex: item.PreviousExplosionIndex,
+				PeriodQuality:          item.PeriodQuality,
+				Time:                   item.Time,
+			})
+		}
+		return symbols, items, nil
 	}
 
-	return symbols, nil
+	var arr []string
+	if err := json.Unmarshal(body, &arr); err == nil {
+		symbols, err := NormalizeSymbols(arr)
+		return symbols, nil, err
+	}
+
+	var obj struct {
+		Symbols []string `json:"symbols"`
+	}
+	if err := json.Unmarshal(body, &obj); err != nil {
+		return nil, nil, fmt.Errorf("parsing response: %w", err)
+	}
+	symbols, err := NormalizeSymbols(obj.Symbols)
+	return symbols, nil, err
 }
 
 // StartAutoRefresh 启动后台自动刷新

@@ -59,6 +59,7 @@ type ProfileResponse struct {
 	Middlewares              []MiddlewareInfo    `json:"middlewares"`
 	Prompts                  PromptsInfo         `json:"prompts"`
 	Derivatives              DerivativesInfo     `json:"derivatives"`
+	Leverage                 LeverageInfo        `json:"leverage,omitempty"`
 	ExitPlans                ExitPlansInfo       `json:"exit_plans"`
 	Default                  bool                `json:"default"`
 }
@@ -79,6 +80,11 @@ type DerivativesInfo struct {
 	IncludeFunding bool `json:"include_funding"`
 }
 
+type LeverageInfo struct {
+	Enabled bool `json:"enabled"`
+	Max     int  `json:"max"`
+}
+
 type ExitPlansInfo struct {
 	Combos []string `json:"combos"`
 }
@@ -97,6 +103,7 @@ type ProfileUpdateRequest struct {
 	Prompts                  PromptsInfo       `json:"prompts"`
 	ExitPlans                ExitPlansInfo     `json:"exit_plans"`
 	Derivatives              DerivativesInfo   `json:"derivatives"`
+	Leverage                 *LeverageInfo     `json:"leverage,omitempty"`
 	Default                  bool              `json:"default"`
 }
 
@@ -184,6 +191,10 @@ func (r *Router) handleUpdate(c *gin.Context) {
 	existing.Derivatives.Enabled = req.Derivatives.Enabled
 	existing.Derivatives.IncludeOI = req.Derivatives.IncludeOI
 	existing.Derivatives.IncludeFunding = req.Derivatives.IncludeFunding
+	if req.Leverage != nil {
+		existing.Leverage.Enabled = req.Leverage.Enabled
+		existing.Leverage.Max = req.Leverage.Max
+	}
 	existing.Default = req.Default
 
 	if err := r.writer.UpdateProfile(name, *existing); err != nil {
@@ -293,6 +304,10 @@ func (r *Router) handleCreate(c *gin.Context) {
 	if len(req.ExitPlans.Combos) > 0 {
 		newEntry.ExitPlans.Combos = req.ExitPlans.Combos
 	}
+	if req.Leverage != nil {
+		newEntry.Leverage.Enabled = req.Leverage.Enabled
+		newEntry.Leverage.Max = req.Leverage.Max
+	}
 	newEntry.Default = req.Default
 
 	if err := r.writer.UpdateProfile(name, newEntry); err != nil {
@@ -373,6 +388,10 @@ func entryToResponse(name string, entry writer.ProfileEntry) ProfileResponse {
 			Enabled:        entry.Derivatives.Enabled,
 			IncludeOI:      entry.Derivatives.IncludeOI,
 			IncludeFunding: entry.Derivatives.IncludeFunding,
+		},
+		Leverage: LeverageInfo{
+			Enabled: entry.Leverage.Enabled,
+			Max:     entry.Leverage.Max,
 		},
 		ExitPlans: ExitPlansInfo{
 			Combos: entry.ExitPlans.Combos,

@@ -34,6 +34,7 @@ type ProfileDefinition struct {
 	Prompts                  PromptRefs         `mapstructure:"prompts"`
 	ExitPlans                ExitPlanBinding    `mapstructure:"exit_plans"`
 	Derivatives              DerivativesConfig  `mapstructure:"derivatives"`
+	Leverage                 LeverageConfig     `mapstructure:"leverage"`
 	KlineWindows             KlineWindowConfig  `mapstructure:"kline_windows"`
 	Default                  bool               `mapstructure:"default"`
 
@@ -50,7 +51,10 @@ type PromptRefs struct {
 	User          string            `mapstructure:"user"`
 }
 
-const defaultExitPlanID = "plan_combo_main"
+const (
+	defaultExitPlanID          = "plan_combo_main"
+	defaultProfileLeverageMax = 25
+)
 
 type ExitPlanBinding struct {
 	Allowed []string `mapstructure:"-"`
@@ -98,6 +102,24 @@ func (d *DerivativesConfig) normalize() {
 	if !d.IncludeOI && !d.IncludeFunding && !d.IncludeFearGreed {
 		d.IncludeOI = true
 		d.IncludeFunding = true
+	}
+}
+
+type LeverageConfig struct {
+	Enabled bool `mapstructure:"enabled"`
+	Max     int  `mapstructure:"max"`
+}
+
+func (l *LeverageConfig) normalize() {
+	if l == nil {
+		return
+	}
+	if !l.Enabled {
+		l.Max = 0
+		return
+	}
+	if l.Max <= 0 {
+		l.Max = defaultProfileLeverageMax
 	}
 }
 
@@ -261,6 +283,7 @@ func normalizeProfileDefinition(name string, def ProfileDefinition) ProfileDefin
 	def.Middlewares = expandMiddlewareConfigs(def.Middlewares)
 	def.ExitPlans.normalize()
 	def.Derivatives.normalize()
+	def.Leverage.normalize()
 	def.KlineWindows.normalize()
 	return def
 }

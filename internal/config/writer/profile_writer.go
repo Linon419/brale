@@ -33,6 +33,7 @@ type ProfileEntry struct {
 	Middlewares              []MiddlewareEntry   `yaml:"middlewares,omitempty"`
 	Prompts                  PromptsEntry        `yaml:"prompts,omitempty"`
 	Derivatives              DerivativesEntry    `yaml:"derivatives,omitempty"`
+	Leverage                 LeverageEntry       `yaml:"leverage,omitempty"`
 	ExitPlans                ExitPlansEntry      `yaml:"exit_plans,omitempty"`
 	Default                  bool                `yaml:"default,omitempty"`
 }
@@ -55,6 +56,11 @@ type DerivativesEntry struct {
 	Enabled        bool `yaml:"enabled,omitempty"`
 	IncludeOI      bool `yaml:"include_oi,omitempty"`
 	IncludeFunding bool `yaml:"include_funding,omitempty"`
+}
+
+type LeverageEntry struct {
+	Enabled bool `yaml:"enabled,omitempty"`
+	Max     int  `yaml:"max,omitempty"`
 }
 
 type ExitPlansEntry struct {

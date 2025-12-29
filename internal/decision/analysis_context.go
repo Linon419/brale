@@ -40,6 +40,8 @@ type AnalysisBuildInput struct {
 	SliceDrop         int
 	HorizonName       string
 	IndicatorLookback int
+	EMAByInterval     map[string]indicator.EMASettings
+	WTMFIByInterval   map[string]indicator.WTMFISettings
 	WithImages        bool
 	DisableIndicators bool
 	RequireATR        bool
@@ -69,6 +71,8 @@ type analysisBuildConfig struct {
 	sliceDrop         int
 	horizonName       string
 	indicatorLookback int
+	emaByInterval     map[string]indicator.EMASettings
+	wtmfiByInterval   map[string]indicator.WTMFISettings
 	withImages        bool
 	disableIndicators bool
 	requireATR        bool
@@ -104,6 +108,8 @@ func normalizeAnalysisBuildInput(input AnalysisBuildInput) (analysisBuildConfig,
 		sliceDrop:         input.SliceDrop,
 		horizonName:       input.HorizonName,
 		indicatorLookback: indicatorLookback,
+		emaByInterval:     input.EMAByInterval,
+		wtmfiByInterval:   input.WTMFIByInterval,
 		withImages:        input.WithImages,
 		disableIndicators: input.DisableIndicators,
 		requireATR:        input.RequireATR,
@@ -163,7 +169,7 @@ func buildAnalysisContextForSymbolInterval(cfg analysisBuildConfig, sym string, 
 		ForecastHorizon: cfg.horizonName,
 	}
 	if cfg.withImages && calculated && indErr == nil {
-		ac.ImageB64, ac.ImageNote = renderComposite(cfg.ctx, sym, iv, cfg.horizonName, shortCandles, fullCandles, rep, pat)
+		ac.ImageB64, ac.ImageNote = renderComposite(cfg.ctx, sym, iv, cfg.horizonName, shortCandles, fullCandles, rep, pat, cfg.wtmfiByInterval)
 	}
 	return ac, true
 }
@@ -227,7 +233,14 @@ func buildIndicatorPayload(cfg analysisBuildConfig, sym, iv string, fullCandles,
 	}
 
 	indJSON := ""
-	if payload, snapErr := BuildIndicatorSnapshot(fullCandles, rep); snapErr == nil {
+	wtmfiSettings := indicator.WTMFISettings{}
+	if cfg.wtmfiByInterval != nil {
+		key := strings.ToLower(strings.TrimSpace(iv))
+		if wtmfi, ok := cfg.wtmfiByInterval[key]; ok {
+			wtmfiSettings = wtmfi
+		}
+	}
+	if payload, snapErr := BuildIndicatorSnapshot(fullCandles, rep, wtmfiSettings); snapErr == nil {
 		indJSON = string(payload)
 	} else {
 		logger.Warnf("indicator snapshot 构建失败 %s %s: %v", sym, iv, snapErr)
@@ -246,7 +259,20 @@ func computeIndicators(cfg analysisBuildConfig, sym, iv string, fullCandles []ma
 			logger.Debugf("analysis %s %s 指标历史不足，需要 %d 根，当前仅 %d 根", sym, iv, cfg.indicatorLookback, len(fullCandles))
 			return indicator.Report{}, true, err
 		}
-		rep, err := indicator.ComputeAll(fullCandles, indicator.Settings{Symbol: sym, Interval: iv})
+		settings := indicator.Settings{Symbol: sym, Interval: iv}
+		if cfg.emaByInterval != nil {
+			key := strings.ToLower(strings.TrimSpace(iv))
+			if ema, ok := cfg.emaByInterval[key]; ok {
+				settings.EMA = ema
+			}
+		}
+		if cfg.wtmfiByInterval != nil {
+			key := strings.ToLower(strings.TrimSpace(iv))
+			if wtmfi, ok := cfg.wtmfiByInterval[key]; ok {
+				settings.WTMFI = wtmfi
+			}
+		}
+		rep, err := indicator.ComputeAll(fullCandles, settings)
 		return rep, true, err
 	case cfg.requireATR:
 		series, err := indicator.ComputeATRSeries(fullCandles, 14)
@@ -276,7 +302,7 @@ func formatTrendReport(pat pattern.Result) string {
 	return pat.TrendSummary
 }
 
-func renderComposite(ctx context.Context, sym, iv, horizon string, candles []market.Candle, history []market.Candle, rep indicator.Report, pat pattern.Result) (string, string) {
+func renderComposite(ctx context.Context, sym, iv, horizon string, candles []market.Candle, history []market.Candle, rep indicator.Report, pat pattern.Result, wtmfiByInterval map[string]indicator.WTMFISettings) (string, string) {
 	imgInput := visual.CompositeInput{
 		Context:    ctx,
 		Symbol:     sym,
@@ -285,6 +311,7 @@ func renderComposite(ctx context.Context, sym, iv, horizon string, candles []mar
 		Candles:    map[string][]market.Candle{iv: candles},
 		History:    map[string][]market.Candle{iv: history},
 		Indicators: map[string]indicator.Report{iv: rep},
+		WTMFIByInterval: wtmfiByInterval,
 		Patterns:   map[string]pattern.Result{iv: pat},
 	}
 	img, err := visual.RenderComposite(imgInput)

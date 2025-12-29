@@ -78,8 +78,9 @@ func (f *Factory) buildEMATrend(cfg loader.MiddlewareConfig, profile loader.Prof
 	fast := intFromCfg(cfg.Params, "fast")
 	mid := intFromCfg(cfg.Params, "mid")
 	slow := intFromCfg(cfg.Params, "slow")
-	if fast <= 0 || mid <= 0 || slow <= 0 {
-		return nil, fmt.Errorf("ema_trend 需设置 fast/mid/slow")
+	long := intFromCfg(cfg.Params, "long")
+	if fast <= 0 || mid <= 0 || slow <= 0 || long <= 0 {
+		return nil, fmt.Errorf("ema_trend 需设置 fast/mid/slow/long")
 	}
 	mw := middlewares.NewEMATrend(middlewares.EMATrendConfig{
 		Name:     cfg.Name,
@@ -90,6 +91,7 @@ func (f *Factory) buildEMATrend(cfg loader.MiddlewareConfig, profile loader.Prof
 		Fast:     fast,
 		Mid:      mid,
 		Slow:     slow,
+		Long:     long,
 	})
 	return mw, nil
 }

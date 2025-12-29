@@ -21,8 +21,9 @@ type TrendCompressOptions struct {
 	ATRPeriod           int
 	RecentCandles       int
 	VolumeMAPeriod      int
-	EMA20Period         int
-	EMA50Period         int
+	EMA21Period         int
+	EMA55Period         int
+	EMA100Period        int
 	EMA200Period        int
 	Pretty              bool
 	IncludeCurrentRSI   bool
@@ -39,8 +40,9 @@ func DefaultTrendCompressOptions() TrendCompressOptions {
 		ATRPeriod:           14,
 		RecentCandles:       7,
 		VolumeMAPeriod:      20,
-		EMA20Period:         20,
-		EMA50Period:         50,
+		EMA21Period:         21,
+		EMA55Period:         55,
+		EMA100Period:        100,
 		EMA200Period:        200,
 		Pretty:              false,
 		IncludeCurrentRSI:   true,
@@ -86,8 +88,9 @@ type TrendGlobalContext struct {
 	SlopeState      string   `json:"slope_state,omitempty"`
 	Window          int      `json:"window,omitempty"`
 	VolRatio        float64  `json:"vol_ratio"`
-	EMA20           *float64 `json:"ema20,omitempty"`
-	EMA50           *float64 `json:"ema50,omitempty"`
+	EMA21           *float64 `json:"ema21,omitempty"`
+	EMA55           *float64 `json:"ema55,omitempty"`
+	EMA100          *float64 `json:"ema100,omitempty"`
 	EMA200          *float64 `json:"ema200,omitempty"`
 }
 
@@ -159,13 +162,17 @@ func BuildTrendCompressedInput(symbol, interval string, candles []market.Candle,
 	}
 	gc.NormalizedSlope = roundFloat(normalizedSlope(closes), 4)
 	gc.SlopeState = trendSlopeState(gc.NormalizedSlope)
-	if v := lastNonZero(talib.Ema(closes, opts.EMA20Period)); v > 0 {
+	if v := lastNonZero(talib.Ema(closes, opts.EMA21Period)); v > 0 {
 		v = roundFloat(v, 4)
-		gc.EMA20 = &v
+		gc.EMA21 = &v
 	}
-	if v := lastNonZero(talib.Ema(closes, opts.EMA50Period)); v > 0 {
+	if v := lastNonZero(talib.Ema(closes, opts.EMA55Period)); v > 0 {
 		v = roundFloat(v, 4)
-		gc.EMA50 = &v
+		gc.EMA55 = &v
+	}
+	if v := lastNonZero(talib.Ema(closes, opts.EMA100Period)); v > 0 {
+		v = roundFloat(v, 4)
+		gc.EMA100 = &v
 	}
 	if v := lastNonZero(talib.Ema(closes, opts.EMA200Period)); v > 0 {
 		v = roundFloat(v, 4)
@@ -211,11 +218,14 @@ func normalizeTrendCompressOptions(opts TrendCompressOptions) TrendCompressOptio
 	if opts.VolumeMAPeriod <= 0 {
 		opts.VolumeMAPeriod = def.VolumeMAPeriod
 	}
-	if opts.EMA20Period <= 0 {
-		opts.EMA20Period = def.EMA20Period
+	if opts.EMA21Period <= 0 {
+		opts.EMA21Period = def.EMA21Period
 	}
-	if opts.EMA50Period <= 0 {
-		opts.EMA50Period = def.EMA50Period
+	if opts.EMA55Period <= 0 {
+		opts.EMA55Period = def.EMA55Period
+	}
+	if opts.EMA100Period <= 0 {
+		opts.EMA100Period = def.EMA100Period
 	}
 	if opts.EMA200Period <= 0 {
 		opts.EMA200Period = def.EMA200Period
@@ -515,8 +525,9 @@ func buildStructureCandidates(candles []market.Candle, highs, lows, atr []float6
 			Window: window,
 		})
 	}
-	addEMA(gc.EMA20, "ema20", opts.EMA20Period)
-	addEMA(gc.EMA50, "ema50", opts.EMA50Period)
+	addEMA(gc.EMA21, "ema21", opts.EMA21Period)
+	addEMA(gc.EMA55, "ema55", opts.EMA55Period)
+	addEMA(gc.EMA100, "ema100", opts.EMA100Period)
 	addEMA(gc.EMA200, "ema200", opts.EMA200Period)
 
 	// 布林带上下轨
