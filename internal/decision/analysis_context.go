@@ -234,13 +234,15 @@ func buildIndicatorPayload(cfg analysisBuildConfig, sym, iv string, fullCandles,
 
 	indJSON := ""
 	wtmfiSettings := indicator.WTMFISettings{}
+	disableRSI := false
 	if cfg.wtmfiByInterval != nil {
 		key := strings.ToLower(strings.TrimSpace(iv))
 		if wtmfi, ok := cfg.wtmfiByInterval[key]; ok {
 			wtmfiSettings = wtmfi
+			disableRSI = true
 		}
 	}
-	if payload, snapErr := BuildIndicatorSnapshot(fullCandles, rep, wtmfiSettings); snapErr == nil {
+	if payload, snapErr := BuildIndicatorSnapshot(fullCandles, rep, wtmfiSettings, disableRSI); snapErr == nil {
 		indJSON = string(payload)
 	} else {
 		logger.Warnf("indicator snapshot 构建失败 %s %s: %v", sym, iv, snapErr)
@@ -260,6 +262,7 @@ func computeIndicators(cfg analysisBuildConfig, sym, iv string, fullCandles []ma
 			return indicator.Report{}, true, err
 		}
 		settings := indicator.Settings{Symbol: sym, Interval: iv}
+		wtmfiEnabled := false
 		if cfg.emaByInterval != nil {
 			key := strings.ToLower(strings.TrimSpace(iv))
 			if ema, ok := cfg.emaByInterval[key]; ok {
@@ -270,8 +273,10 @@ func computeIndicators(cfg analysisBuildConfig, sym, iv string, fullCandles []ma
 			key := strings.ToLower(strings.TrimSpace(iv))
 			if wtmfi, ok := cfg.wtmfiByInterval[key]; ok {
 				settings.WTMFI = wtmfi
+				wtmfiEnabled = true
 			}
 		}
+		settings.DisableRSI = wtmfiEnabled
 		rep, err := indicator.ComputeAll(fullCandles, settings)
 		return rep, true, err
 	case cfg.requireATR:

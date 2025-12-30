@@ -14,5 +14,8 @@
 
 === 决策规则 ===
 - 指标若混杂、平淡或无力 → Action 必须为 hold
+- 只有当 wt_mfi_hybrid + MACD histogram + EMA 方向一致时，才允许给出 open_long/open_short
+- wt_mfi_hybrid 处于中性区或 MACD histogram 近零/反复 → 必须 hold
+- 若用户 prompt 明确提示 R/R 不达标或无法计算 → 必须 hold
 - 不得推断更高周期的偏向或结构延续
 - 不得进行主观的图表形态解读

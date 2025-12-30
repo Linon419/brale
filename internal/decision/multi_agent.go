@@ -62,7 +62,7 @@ func buildIndicatorAgentPrompt(ctxs []AnalysisContext, cfg brcfg.MultiAgentConfi
 	if count == 0 {
 		return ""
 	}
-	b.WriteString("请总结动能、量价与波动率（引用字段名，如 rsi.last_n / macd.histogram.last_n / atr.change_pct），禁止方向词与交易建议。\n")
+	b.WriteString("请总结动能、量价与波动率（引用字段名，如 wt_mfi_hybrid.last_n / macd.histogram.last_n / atr.change_pct），禁止方向词与交易建议。\n")
 	return b.String()
 }
 

@@ -20,7 +20,7 @@ type ProfileDefinition struct {
 	Targets    []string `mapstructure:"targets"`
 	Intervals  []string `mapstructure:"intervals"`
 
-	// 动态 targets API 配置
+	// 动�?targets API 配置
 	TargetsAPIURL            string `mapstructure:"targets_api_url"`
 	TargetsAPIOverride       bool   `mapstructure:"targets_api_override"`
 	TargetsAPIQuote          string `mapstructure:"targets_api_quote"`
@@ -108,6 +108,11 @@ func (d *DerivativesConfig) normalize() {
 type LeverageConfig struct {
 	Enabled bool `mapstructure:"enabled"`
 	Max     int  `mapstructure:"max"`
+	// ATR-based leverage calculation
+	ATREnabled      bool    `mapstructure:"atr_enabled"`        // Enable ATR-based leverage: leverage = close / max_atr_24h
+	ATRPeriod       int     `mapstructure:"atr_period"`         // ATR calculation period (default: 14)
+	ATRTimeframe    string  `mapstructure:"atr_timeframe"`      // Timeframe for ATR (default: "1d")
+	StopLossRiskPct float64 `mapstructure:"stop_loss_risk_pct"` // Risk per trade as % of capital for position sizing (default: 5.0)
 }
 
 func (l *LeverageConfig) normalize() {
@@ -120,6 +125,16 @@ func (l *LeverageConfig) normalize() {
 	}
 	if l.Max <= 0 {
 		l.Max = defaultProfileLeverageMax
+	}
+	// ATR defaults
+	if l.ATRPeriod <= 0 {
+		l.ATRPeriod = 14
+	}
+	if l.ATRTimeframe == "" {
+		l.ATRTimeframe = "1d"
+	}
+	if l.StopLossRiskPct <= 0 {
+		l.StopLossRiskPct = 5.0
 	}
 }
 
@@ -281,6 +296,7 @@ func normalizeProfileDefinition(name string, def ProfileDefinition) ProfileDefin
 		}}
 	}
 	def.Middlewares = expandMiddlewareConfigs(def.Middlewares)
+	def.Middlewares = filterRSIForWTMFI(def.Middlewares)
 	def.ExitPlans.normalize()
 	def.Derivatives.normalize()
 	def.Leverage.normalize()
@@ -458,4 +474,28 @@ func isAgentMiddleware(name string) bool {
 	default:
 		return false
 	}
+}
+
+func filterRSIForWTMFI(list []MiddlewareConfig) []MiddlewareConfig {
+	if len(list) == 0 {
+		return list
+	}
+	hasWTMFI := false
+	for _, mw := range list {
+		if strings.EqualFold(strings.TrimSpace(mw.Name), "wt_mfi_hybrid") {
+			hasWTMFI = true
+			break
+		}
+	}
+	if !hasWTMFI {
+		return list
+	}
+	out := make([]MiddlewareConfig, 0, len(list))
+	for _, mw := range list {
+		if strings.EqualFold(strings.TrimSpace(mw.Name), "rsi_extreme") {
+			continue
+		}
+		out = append(out, mw)
+	}
+	return out
 }

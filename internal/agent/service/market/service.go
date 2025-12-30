@@ -270,3 +270,23 @@ func containsATRKeyword(val string) bool {
 	val = strings.ToLower(strings.TrimSpace(val))
 	return strings.Contains(val, "atr")
 }
+
+// GetCandles returns candles for a symbol and interval. Used for ATR-based leverage calculation.
+func (s *Service) GetCandles(ctx context.Context, symbol, interval string, limit int) ([]market.Candle, error) {
+	if s.ks == nil {
+		return nil, nil
+	}
+	exporter, ok := s.ks.(store.SnapshotExporter)
+	if !ok {
+		return nil, nil
+	}
+	sym := strings.ToUpper(strings.TrimSpace(symbol))
+	iv := strings.ToLower(strings.TrimSpace(interval))
+	if sym == "" || iv == "" {
+		return nil, nil
+	}
+	if limit <= 0 {
+		limit = 100
+	}
+	return exporter.Export(ctx, sym, iv, limit)
+}

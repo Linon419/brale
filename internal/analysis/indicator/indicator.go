@@ -15,6 +15,7 @@ type Settings struct {
 	EMA      EMASettings
 	RSI      RSISettings
 	WTMFI    WTMFISettings
+	DisableRSI bool
 }
 
 type EMASettings struct {
@@ -119,29 +120,31 @@ func ComputeAll(candles []market.Candle, cfg Settings) (Report, error) {
 		Note:   fmt.Sprintf("EMA%d vs price", cfg.EMA.Long),
 	}
 
-	if cfg.RSI.Period <= 0 {
-		cfg.RSI.Period = 14
-	}
-	if cfg.RSI.Overbought == 0 {
-		cfg.RSI.Overbought = 70
-	}
-	if cfg.RSI.Oversold == 0 {
-		cfg.RSI.Oversold = 30
-	}
-	rsiSeries := sanitizeSeries(talib.Rsi(closes, cfg.RSI.Period))
-	rsiVal := lastValid(rsiSeries)
-	state := "neutral"
-	switch {
-	case rsiVal >= cfg.RSI.Overbought:
-		state = "overbought"
-	case rsiVal <= cfg.RSI.Oversold:
-		state = "oversold"
-	}
-	rep.Values["rsi"] = IndicatorValue{
-		Latest: rsiVal,
-		Series: rsiSeries,
-		State:  state,
-		Note:   fmt.Sprintf("period=%d thresholds=%.1f/%.1f", cfg.RSI.Period, cfg.RSI.Oversold, cfg.RSI.Overbought),
+	if !cfg.DisableRSI {
+		if cfg.RSI.Period <= 0 {
+			cfg.RSI.Period = 14
+		}
+		if cfg.RSI.Overbought == 0 {
+			cfg.RSI.Overbought = 70
+		}
+		if cfg.RSI.Oversold == 0 {
+			cfg.RSI.Oversold = 30
+		}
+		rsiSeries := sanitizeSeries(talib.Rsi(closes, cfg.RSI.Period))
+		rsiVal := lastValid(rsiSeries)
+		state := "neutral"
+		switch {
+		case rsiVal >= cfg.RSI.Overbought:
+			state = "overbought"
+		case rsiVal <= cfg.RSI.Oversold:
+			state = "oversold"
+		}
+		rep.Values["rsi"] = IndicatorValue{
+			Latest: rsiVal,
+			Series: rsiSeries,
+			State:  state,
+			Note:   fmt.Sprintf("period=%d thresholds=%.1f/%.1f", cfg.RSI.Period, cfg.RSI.Oversold, cfg.RSI.Overbought),
+		}
 	}
 
 	macd, signal, hist := talib.Macd(closes, 12, 26, 9)

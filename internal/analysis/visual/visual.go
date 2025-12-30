@@ -290,10 +290,17 @@ func buildIntervalSummary(interval string, pat pattern.Result, rep indicator.Rep
 	if trend == "" {
 		trend = "无趋势描述"
 	}
-	rsi := rep.Values["rsi"].Latest
+	rsiVal, rsiOk := rep.Values["rsi"]
+	wtmfiVal, wtmfiOk := rep.Values["wt_mfi_hybrid"]
 	macd := rep.Values["macd"].State
 	info.Summary = fmt.Sprintf("%s / %s", summary, trend)
-	info.Subtitle = fmt.Sprintf("RSI %.1f | MACD %s", rsi, macd)
+	if rsiOk {
+		info.Subtitle = fmt.Sprintf("RSI %.1f | MACD %s", rsiVal.Latest, macd)
+	} else if wtmfiOk {
+		info.Subtitle = fmt.Sprintf("WTMFI %.1f | MACD %s", wtmfiVal.Latest, macd)
+	} else {
+		info.Subtitle = fmt.Sprintf("MACD %s", macd)
+	}
 	return
 }
 

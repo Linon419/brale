@@ -164,7 +164,7 @@ type multiDivSignal struct {
 	Distance  int    `json:"distance"`
 }
 
-func BuildIndicatorSnapshot(candles []market.Candle, rep indicator.Report, wtmfiSettings indicator.WTMFISettings) ([]byte, error) {
+func BuildIndicatorSnapshot(candles []market.Candle, rep indicator.Report, wtmfiSettings indicator.WTMFISettings, disableRSI bool) ([]byte, error) {
 	if len(candles) == 0 {
 		return nil, fmt.Errorf("indicator snapshot: no candles")
 	}
@@ -214,8 +214,10 @@ func BuildIndicatorSnapshot(candles []market.Candle, rep indicator.Report, wtmfi
 			data.MACD = snap
 		}
 	}
-	if val, ok := rep.Values["rsi"]; ok {
-		data.RSI = buildRSISnapshot(val)
+	if !disableRSI {
+		if val, ok := rep.Values["rsi"]; ok {
+			data.RSI = buildRSISnapshot(val)
+		}
 	}
 	if val, ok := rep.Values["obv"]; ok {
 		data.OBV = buildOBVSnapshot(val)
@@ -230,7 +232,7 @@ func BuildIndicatorSnapshot(candles []market.Candle, rep indicator.Report, wtmfi
 		normalized := indicator.NormalizeWTMFISettings(wtmfiSettings)
 		data.WTMFI = buildWTMFISnapshot(val, normalized.Overbought, normalized.Oversold)
 	}
-	if snap := buildMultiDivSnapshot(candles); snap != nil {
+	if snap := buildMultiDivSnapshot(candles, !disableRSI); snap != nil {
 		data.DivMulti = snap
 	}
 	snapshot.Data = data
@@ -374,7 +376,7 @@ func buildWTMFISnapshot(val indicator.IndicatorValue, overbought, oversold float
 }
 
 // Multi-indicator divergence snapshot (regular + hidden).
-func buildMultiDivSnapshot(candles []market.Candle) *multiDivSnapshot {
+func buildMultiDivSnapshot(candles []market.Candle, useRSI bool) *multiDivSnapshot {
 	if len(candles) < multiDivPivotPeriod*2+2 {
 		return nil
 	}
@@ -402,7 +404,10 @@ func buildMultiDivSnapshot(candles []market.Candle) *multiDivSnapshot {
 	}
 
 	macd, _, macdHist := talib.Macd(closes, 12, 26, 9)
-	rsi := talib.Rsi(closes, 14)
+	var rsi []float64
+	if useRSI {
+		rsi = talib.Rsi(closes, 14)
+	}
 	stoch := smaSeries(stochFastK(closes, highs, lows, 14), 3)
 	cci := talib.Cci(highs, lows, closes, 10)
 	mom := talib.Mom(closes, 10)
@@ -411,22 +416,67 @@ func buildMultiDivSnapshot(candles []market.Candle) *multiDivSnapshot {
 	cmf := cmfSeries(highs, lows, closes, volumes, 21)
 	mfi := talib.Mfi(highs, lows, closes, volumes, 14)
 
-	seriesList := []struct {
+	seriesList := make([]struct {
 		name   string
 		label  string
 		series []float64
-	}{
-		{name: "macd", label: "MACD", series: macd},
-		{name: "macd_hist", label: "Hist", series: macdHist},
-		{name: "rsi", label: "RSI", series: rsi},
-		{name: "stoch", label: "Stoch", series: stoch},
-		{name: "cci", label: "CCI", series: cci},
-		{name: "mom", label: "MOM", series: mom},
-		{name: "obv", label: "OBV", series: obv},
-		{name: "vwmacd", label: "VWMACD", series: vwmacd},
-		{name: "cmf", label: "CMF", series: cmf},
-		{name: "mfi", label: "MFI", series: mfi},
+	}, 0, 10)
+	seriesList = append(seriesList,
+		struct {
+			name   string
+			label  string
+			series []float64
+		}{name: "macd", label: "MACD", series: macd},
+		struct {
+			name   string
+			label  string
+			series []float64
+		}{name: "macd_hist", label: "Hist", series: macdHist},
+	)
+	if useRSI {
+		seriesList = append(seriesList, struct {
+			name   string
+			label  string
+			series []float64
+		}{name: "rsi", label: "RSI", series: rsi})
 	}
+	seriesList = append(seriesList,
+		struct {
+			name   string
+			label  string
+			series []float64
+		}{name: "stoch", label: "Stoch", series: stoch},
+		struct {
+			name   string
+			label  string
+			series []float64
+		}{name: "cci", label: "CCI", series: cci},
+		struct {
+			name   string
+			label  string
+			series []float64
+		}{name: "mom", label: "MOM", series: mom},
+		struct {
+			name   string
+			label  string
+			series []float64
+		}{name: "obv", label: "OBV", series: obv},
+		struct {
+			name   string
+			label  string
+			series []float64
+		}{name: "vwmacd", label: "VWMACD", series: vwmacd},
+		struct {
+			name   string
+			label  string
+			series []float64
+		}{name: "cmf", label: "CMF", series: cmf},
+		struct {
+			name   string
+			label  string
+			series []float64
+		}{name: "mfi", label: "MFI", series: mfi},
+	)
 
 	allowRegular := multiDivSearchMode == "regular" || multiDivSearchMode == "regular_hidden"
 	allowHidden := multiDivSearchMode == "hidden" || multiDivSearchMode == "regular_hidden"

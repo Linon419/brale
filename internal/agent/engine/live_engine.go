@@ -365,16 +365,27 @@ func (e *LiveEngine) applyTradingDefaults(d *decision.Decision) {
 	if d.Action != "open_long" && d.Action != "open_short" {
 		return
 	}
+
+	// Try ATR-based leverage calculation first
 	if d.Leverage <= 0 {
-		if def := e.Config.Trading.DefaultLeverage; def > 0 {
+		if atrLev := e.calcATRLeverage(d.Symbol); atrLev > 0 {
+			d.Leverage = atrLev
+			logger.Debugf("ATR leverage for %s: %d", d.Symbol, atrLev)
+		} else if def := e.Config.Trading.DefaultLeverage; def > 0 {
 			d.Leverage = def
 		}
 	}
+
+	// Try position sizing by stop-loss (以损订仓)
 	if d.PositionSizeUSD <= 0 {
-		if size := e.Config.Trading.PositionSizeUSD(); size > 0 {
+		if posSize := e.calcPositionSizeByStopLoss(d); posSize > 0 {
+			d.PositionSizeUSD = posSize
+			logger.Debugf("Position size by SL for %s: %.2f", d.Symbol, posSize)
+		} else if size := e.Config.Trading.PositionSizeUSD(); size > 0 {
 			d.PositionSizeUSD = size
 		}
 	}
+
 	e.applyLeverageCap(d)
 }
 
@@ -544,4 +555,149 @@ func (e *LiveEngine) buildProfileDirectives(symbols []string) map[string]decisio
 		}
 	}
 	return directives
+}
+
+// calcATRLeverage calculates leverage based on ATR: leverage = close / max_atr_24h
+func (e *LiveEngine) calcATRLeverage(symbol string) int {
+	if e == nil || e.MktService == nil || e.ProfileMgr == nil {
+		return 0
+	}
+
+	// Check if ATR leverage is enabled for this profile
+	rt, ok := e.ProfileMgr.Resolve(symbol)
+	if !ok || rt == nil {
+		return 0
+	}
+	levCfg := rt.Definition.Leverage
+	if !levCfg.Enabled || !levCfg.ATREnabled {
+		return 0
+	}
+
+	// Get candles for ATR calculation
+	type candleGetter interface {
+		GetCandles(ctx context.Context, symbol, interval string, limit int) ([]market.Candle, error)
+	}
+	getter, ok := e.MktService.(candleGetter)
+	if !ok {
+		return 0
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	interval := levCfg.ATRTimeframe
+	if interval == "" {
+		interval = "1d"
+	}
+	period := levCfg.ATRPeriod
+	if period <= 0 {
+		period = 14
+	}
+
+	// Need enough candles for ATR calculation + 24h lookback
+	candles, err := getter.GetCandles(ctx, symbol, interval, 100)
+	if err != nil || len(candles) < period+1 {
+		return 0
+	}
+
+	cfg := decision.LeverageConfig{
+		ATRPeriod:    period,
+		ATRTimeframe: interval,
+		MaxLeverage:  levCfg.Max,
+		MinLeverage:  1,
+	}
+	result, err := decision.CalcATRLeverage(candles, cfg)
+	if err != nil {
+		return 0
+	}
+	return result.Leverage
+}
+
+// calcPositionSizeByStopLoss calculates position size using "以损订仓" (position sizing by stop loss).
+// Risk per trade = 5% of capital (configurable via StopLossRiskPct).
+func (e *LiveEngine) calcPositionSizeByStopLoss(d *decision.Decision) float64 {
+	if e == nil || d == nil || e.PosService == nil || e.ProfileMgr == nil {
+		return 0
+	}
+
+	// Check if ATR leverage is enabled
+	rt, ok := e.ProfileMgr.Resolve(d.Symbol)
+	if !ok || rt == nil {
+		return 0
+	}
+	levCfg := rt.Definition.Leverage
+	if !levCfg.Enabled || !levCfg.ATREnabled {
+		return 0
+	}
+
+	// Get account equity
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	acct, err := e.PosService.GetAccountSnapshot(ctx)
+	if err != nil || acct.Total <= 0 {
+		return 0
+	}
+
+	// Get stop loss distance from exit plan
+	stopDistPct := extractStopDistancePct(d)
+	if stopDistPct <= 0 {
+		return 0
+	}
+
+	riskPct := levCfg.StopLossRiskPct
+	if riskPct <= 0 {
+		riskPct = 5.0
+	}
+
+	return decision.CalcPositionSizeByStopLoss(acct.Total, riskPct, stopDistPct, d.Leverage)
+}
+
+// extractStopDistancePct extracts stop loss distance percentage from decision's exit plan.
+func extractStopDistancePct(d *decision.Decision) float64 {
+	if d == nil || d.ExitPlan == nil || d.ExitPlan.Params == nil {
+		return 0
+	}
+
+	params := d.ExitPlan.Params
+	rawChildren, ok := params["children"]
+	if !ok {
+		return 0
+	}
+	children, ok := rawChildren.([]any)
+	if !ok || len(children) == 0 {
+		return 0
+	}
+
+	// Find stop loss component and get the nearest stop distance
+	for _, raw := range children {
+		child, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		component, _ := child["component"].(string)
+		if component != "sl_single" && component != "sl_tiers" {
+			continue
+		}
+		childParams, ok := child["params"].(map[string]any)
+		if !ok {
+			continue
+		}
+		rawTiers, ok := childParams["tiers"]
+		if !ok {
+			continue
+		}
+		tiers, ok := rawTiers.([]any)
+		if !ok || len(tiers) == 0 {
+			continue
+		}
+
+		// Get first tier's target price to calculate distance
+		// We can't calculate exact distance without entry price here,
+		// so we'll use stop_loss_pct if available
+		if pct, ok := childParams["stop_loss_pct"].(float64); ok && pct > 0 {
+			return pct * 100 // Convert to percentage
+		}
+	}
+	return 0
 }

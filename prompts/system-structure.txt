@@ -11,7 +11,7 @@
     - 形态与结构的一致性
 
 === 禁用证据（禁止使用） ===
-- Indicator Agent 输出（RSI、MACD、EMA、ATR、动量）
+- Indicator Agent 输出（wt_mfi_hybrid、MACD、EMA、ATR、动量）
 - Mechanics Agent 输出（OI、资金费率、CVD、情绪）
 - 任何衍生品、成交量或持仓类逻辑
 
