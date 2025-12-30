@@ -31,6 +31,7 @@
    - 分批止盈加权 R/R：对每段止盈 reward = |target - entry|
      WeightedRR = Σ( reward_i * ratio_i ) / risk
    - ratio 来自 exit_plan 的 tp_tiers；若未给 ratio 则等权
+   - 仓位必须按止损距离计算（以损订仓，优先使用系统计算的 position_size_usd）
    - 只有 WeightedRR >= 2 才允许正常出手
    - 1.5 <= WeightedRR < 2：允许，但必须标注“低置信/轻仓”
    - WeightedRR < 1.5 或无法计算：必须 HOLD（同时给出 watch_levels）
