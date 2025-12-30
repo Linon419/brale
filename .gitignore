@@ -9,6 +9,8 @@ desc.org
 config.yaml
 configs/config.yaml
 configs/user_data/freqtrade-config.json
+data/freqtrade_data/freqtrade-config.json
+data/freqtrade_data/logs/
 
 *_test
 *_test.go
